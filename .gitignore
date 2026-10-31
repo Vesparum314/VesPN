@@ -1,0 +1,36 @@
+# --- secrets / local state (NEVER commit) ---
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.sqlite*
+*.log
+
+# local-only working files (secrets / planning / scratch notes) — never publish
+*.local.md
+*.local.txt
+TODO.md
+
+# Real exported VPN configs contain live private keys / PSK / server host.
+# Keep them out of the repo (the format is documented in app/awg.py).
+examples/
+*.vpn
+*.conf
+id_rsa*
+*.pem
+*.key
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

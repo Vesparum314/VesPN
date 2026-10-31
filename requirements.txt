@@ -1,0 +1,12 @@
+# VPN self-service panel (server A)
+fastapi
+uvicorn[standard]
+paramiko            # SSH to nodes + local port-forward tunnels
+requests            # 3x-ui API over the tunnel
+SQLAlchemy          # panel DB (users, devices, nodes, issued configs)
+Jinja2              # server-rendered UI
+itsdangerous        # signs session cookies (Starlette SessionMiddleware)
+bcrypt              # client password hashing
+python-multipart    # form posts
+qrcode[pil]         # QR images for configs/links
+cryptography        # WG/Reality key generation + Fernet encryption of stored secrets

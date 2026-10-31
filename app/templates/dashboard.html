@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Мои устройства — VesPN{% endblock %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>Мои устройства</h1>
+    <div class="sub">Добавьте устройство, откройте его и получите конфиг — приложение, QR и инструкция внутри.</div>
+  </div>
+</div>
+
+{% if not service_ready %}
+  <div class="flash flash-info">Сервис ещё настраивается — создание конфигов появится чуть позже.</div>
+{% endif %}
+
+{% if devices %}
+<div class="grid">
+  {% for d in devices %}
+  <div class="card">
+    <div class="dev-top">
+      <span class="badge b-{{ d.protocol }} b-dot">{{ 'VLESS' if d.protocol == 'vless' else 'AmneziaWG' }}</span>
+      <b>{{ d.name }}</b>
+    </div>
+    <div class="dev-actions">
+      <a class="btn btn-primary btn-sm" href="/devices/{{ d.id }}">Получить конфиг</a>
+      <form method="post" action="/devices/{{ d.id }}/delete" onsubmit="return confirm('Удалить устройство «{{ d.name }}»?')">
+        <button class="btn btn-ghost btn-sm btn-danger" type="submit">Удалить</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card"><div class="empty">Пока нет устройств — добавьте первое ниже.</div></div>
+{% endif %}
+
+{% if service_ready %}
+<div class="panel">
+  <div class="panel-h"><h2>Добавить устройство</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/devices" class="form-row">
+      <label>Имя<input name="name" placeholder="например, Телефон" required></label>
+      <label>Протокол
+        <select name="protocol">
+          <option value="vless">VLESS</option>
+          <option value="awg">AmneziaWG</option>
+        </select>
+      </label>
+      <button class="btn btn-primary" type="submit">Добавить</button>
+    </form>
+    <p class="hint">VLESS — для v2rayNG / Hiddify / Streisand. AmneziaWG — для приложения AmneziaVPN.</p>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,34 @@
+# HTTPS via Caddy + DuckDNS (DNS-01), serving the panel on :8443.
+# fictorium keeps 80/443 untouched.
+#
+# In .env add:   PANEL_DOMAIN=<name>.duckdns.org   and   DUCKDNS_TOKEN=<token>
+# Run from the project root (paths below are resolved relative to it):
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.duckdns.yml up -d --build
+services:
+  panel:
+    # Caddy reaches the panel at panel:8000 over the compose network (no need to
+    # publish it). The base file's localhost:8080 binding stays — harmless, and
+    # avoids relying on the `!reset` YAML tag across compose versions.
+    environment:
+      - DATABASE_URL=sqlite:////data/panel.db
+      - SESSION_HTTPS_ONLY=true
+
+  caddy:
+    build:
+      context: ./deploy/duckdns
+    container_name: vpn-panel-caddy
+    restart: unless-stopped
+    depends_on: [panel]
+    environment:
+      - PANEL_DOMAIN=${PANEL_DOMAIN}
+      - DUCKDNS_TOKEN=${DUCKDNS_TOKEN}
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./deploy/duckdns/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

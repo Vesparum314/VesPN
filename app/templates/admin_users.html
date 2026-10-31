@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Пользователи — VesPN{% endblock %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>Пользователи</h1>
+    <div class="sub">Логины для друзей и родни. Новым выдаётся временный пароль — они меняют его при первом входе.</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Объявление для всех</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/admin/announcement">
+      <label>Текст плашки (виден всем вошедшим на всех страницах; закрыть её нельзя)
+        <textarea name="text" rows="3" placeholder="Напр.: Профилактика 30.10 с 02:00 до 04:00 МСК — возможны перебои.">{{ announcement }}</textarea>
+      </label>
+      <div class="dev-actions" style="margin-top:12px">
+        <button class="btn btn-primary" type="submit">Сохранить</button>
+      </div>
+      <p class="hint">Пустое поле + «Сохранить» — убрать плашку.</p>
+    </form>
+  </div>
+</div>
+
+<div class="panel"><div class="tbl-wrap"><table>
+  <thead><tr><th>Логин</th><th>Роль</th><th>Устройств</th><th>Пароль</th><th></th></tr></thead>
+  <tbody>
+  {% for u in users %}
+    <tr>
+      <td data-label="Логин"><b>{{ u.username }}</b></td>
+      <td data-label="Роль"><span class="badge {{ 'b-gate' if u.is_admin else 'b-exit' }}">{{ 'админ' if u.is_admin else 'клиент' }}</span></td>
+      <td data-label="Устройств">{{ u.devices | length }}</td>
+      <td data-label="Пароль">{% if u.must_change_password %}<span class="badge b-warn">временный</span>{% else %}задан{% endif %}</td>
+      <td data-label="Действия" class="full"><div class="row-actions">
+        <form method="post" action="/admin/users/{{ u.id }}/delete" onsubmit="return confirm('Удалить {{ u.username }}?')">
+          <button class="btn btn-ghost btn-sm btn-danger">Удалить</button>
+        </form>
+      </div></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div></div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Создать пользователя</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/admin/users" class="form-row">
+      <label style="flex:2">Логин <input name="username" required placeholder="имя друга"></label>
+      <label class="check"><input type="checkbox" name="is_admin" value="1"> админ</label>
+      <button class="btn btn-primary" type="submit">Создать</button>
+    </form>
+    <p class="hint">Пароль по умолчанию — <code>change-me-123</code>, пользователь сменит его при первом входе.</p>
+  </div>
+</div>
+{% endblock %}

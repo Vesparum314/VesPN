@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Мониторинг — VesPN{% endblock %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>Мониторинг</h1>
+    <div class="sub">Доступность выходов <b>с их гейтов</b> (то, что реально важно клиентам) и всех серверов <b>с Hub</b> (управление). Проверка раз в час + по кнопке.</div>
+  </div>
+  <form method="post" action="/admin/monitor/check"><button class="btn btn-primary">Проверить сейчас</button></form>
+</div>
+
+{% if not snap %}
+  <div class="flash flash-info">Проверок ещё не было — нажмите «Проверить сейчас».</div>
+{% else %}
+  <div class="sub" style="margin-bottom:12px">Последняя проверка: <span class="mono">{{ snap.at }}</span> UTC</div>
+
+  {% if snap.problems %}
+    <div class="flash flash-error"><b>⚠️ Проблемы:</b><ul style="margin:6px 0 0 18px">{% for p in snap.problems %}<li>{{ p }}</li>{% endfor %}</ul></div>
+  {% else %}
+    <div class="flash flash-success">Проблем нет — всё работает.</div>
+  {% endif %}
+
+  <div class="panel">
+    <div class="panel-h"><h2>Маршруты · выходы с гейтов</h2></div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>Маршрут</th><th>Гейт / демон</th><th>Активный выход</th><th>Пул (виден гейту)</th><th>Флаппинг/ч</th></tr></thead>
+      <tbody>
+      {% for r in snap.routes %}
+        <tr>
+          <td data-label="Маршрут"><span class="cell-name">{{ r.route }}</span>{% if r.default %} <span class="badge b-ok">основной</span>{% endif %}</td>
+          <td data-label="Гейт">{{ r.gate }} {% if r.gate_up %}<span class="badge b-ok b-dot">демон ok</span>{% else %}<span class="badge b-bad b-dot">недоступен</span>{% endif %}</td>
+          <td data-label="Активный">{% if r.active %}<span class="badge b-ok">{{ r.active|join(', ') }}</span>{% else %}<span class="badge b-bad">НЕТ</span>{% endif %}</td>
+          <td data-label="Пул">
+            {% for e in r.pool_exits %}
+              {% if e in r.healthy %}<span class="badge b-ok">{{ e }}</span>{% else %}<span class="badge b-bad" title="не виден гейту">{{ e }}</span>{% endif %}
+            {% endfor %}
+          </td>
+          <td data-label="Флаппинг">{% if (r.flaps_1h or 0) >= 4 %}<span class="badge b-warn b-dot">{{ r.flaps_1h }}</span>{% else %}{{ r.flaps_1h if r.flaps_1h is not none else '—' }}{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td class="full muted">Маршрутов нет.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-h"><h2>Серверы · доступность с Hub</h2></div>
+    <div class="sub" style="padding:0 16px 8px">Это управляющий канал. На клиентов он не влияет (их трафик идёт через гейт), но полезно видеть здоровье нод.</div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>Сервер</th><th>Роль / пул</th><th>SSH</th><th>Сервис :{{ snap.nodes[0].service_port if snap.nodes }}</th><th>Синхр.</th><th>Задержка</th></tr></thead>
+      <tbody>
+      {% for n in snap.nodes %}
+        <tr>
+          <td data-label="Сервер"><span class="cell-name">{{ n.name }}</span></td>
+          <td data-label="Роль">{{ n.role }}{% if n.pool %} · {{ n.pool }}{% endif %}</td>
+          <td data-label="SSH">{% if n.hub_ssh %}<span class="badge b-ok b-dot">ok</span>{% else %}<span class="badge b-bad b-dot">нет</span>{% endif %}</td>
+          <td data-label="Сервис">{% if n.hub_service %}<span class="badge b-ok b-dot">ok</span>{% else %}<span class="badge b-bad b-dot">нет</span>{% endif %} <span class="muted">:{{ n.service_port }}</span></td>
+          <td data-label="Синхр.">{% if n.sync == 'synced' %}<span class="badge b-ok">синхрон</span>{% elif n.sync == 'unreachable' %}<span class="badge b-bad">недоступен</span>{% elif n.sync %}<span class="badge b-warn">{{ n.sync }}</span>{% else %}—{% endif %}</td>
+          <td data-label="Задержка">{{ (n.latency_ms ~ ' мс') if n.latency_ms is not none else '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </div>
+{% endif %}
+
+<div class="panel">
+  <div class="panel-h"><h2>Telegram-бот
+    {% if tg.enabled %}<span class="badge b-ok b-dot">активен</span>{% else %}<span class="badge b-warn b-dot">выключен</span>{% endif %}
+  </h2></div>
+  <div class="panel-b">
+    <p class="hint">Бот присылает ежедневный бэкап+сводку, алерты при проблемах и отвечает на <span class="mono">/check /status /backup</span>. Создайте бота у <span class="mono">@BotFather</span>, свой chat id узнайте у <span class="mono">@userinfobot</span>.</p>
+    <p class="hint">⚠️ Telegram API недоступен из РФ (Hub в Москве). Нужен прокси в поле «API-прокси» — например Cloudflare Worker, который форвардит на <span class="mono">api.telegram.org</span>. С дефолтным адресом бот работать не будет.</p>
+    <form method="post" action="/admin/monitor/settings">
+      <div class="form-grid">
+        <fieldset>
+          <legend>Бот</legend>
+          <label>Токен бота
+            <input name="token" type="password" placeholder="{{ 'задан — оставьте пустым, чтобы не менять' if tg.token_set else '12345:AA...' }}">
+          </label>
+          {% if tg.token_set %}<label class="check"><input type="checkbox" name="clear_token" value="1"> очистить токен (выключить)</label>{% endif %}
+          <label>Chat id админов (через запятую)
+            <input name="chats" value="{{ tg.chat_raw }}" placeholder="123456789, 987654321">
+          </label>
+          <label>API-прокси (Telegram заблокирован из РФ)
+            <input name="api_base" value="{{ tg.api_base }}" placeholder="https://api.telegram.org">
+          </label>
+        </fieldset>
+        <fieldset>
+          <legend>Расписание</legend>
+          <label>Час бэкапа (UTC, 0–23) <input name="backup_hour" type="number" min="0" max="23" value="{{ tg.backup_hour }}"></label>
+          <label>Период проверок (минут) <input name="monitor_minutes" type="number" min="1" value="{{ tg.monitor_minutes }}"></label>
+        </fieldset>
+      </div>
+      <div class="dev-actions" style="margin-top:12px"><button class="btn btn-primary" type="submit">Сохранить</button></div>
+      <p class="hint">Мониторинг (страница) работает и без бота. Бот активируется автоматически, как задашь токен + chat id — перезапуск не нужен.</p>
+    </form>
+  </div>
+</div>
+{% endblock %}

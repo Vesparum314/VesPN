@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}{{ device.name }} — VesPN{% endblock %}
+{% block content %}
+<a class="back" href="/">← К устройствам</a>
+<div class="head">
+  <div>
+    <h1>{{ device.name }} <span class="badge b-{{ device.protocol }}" style="vertical-align:middle">{{ 'VLESS' if device.protocol == 'vless' else 'AmneziaWG' }}</span></h1>
+  </div>
+</div>
+
+{% if error %}
+  <div class="flash flash-error">{{ error }}</div>
+{% elif cfg %}
+  <div class="panel"><div class="panel-b">
+    <div class="cfg">
+      <div class="qr"><img src="{{ qr }}" alt="QR" width="200" height="200"></div>
+      <div style="min-width:0">
+        <ol class="steps">
+          {% if is_awg %}
+            <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.</li>
+          {% else %}
+            <li>Приложение (v2rayNG, Hiddify, Streisand, NekoBox…) → добавить из буфера или по QR.</li>
+          {% endif %}
+          <li>Готово — включите в приложении. Если перестанет работать, просто переоткройте эту страницу и получите конфиг заново.</li>
+        </ol>
+        <code class="payload" id="payload">{{ cfg.payload }}</code>
+        <div class="dev-actions">
+          <button class="btn btn-primary btn-sm" type="button" onclick="copyText('payload', this)">Копировать</button>
+          <a class="btn btn-ghost btn-sm" href="/devices/{{ device.id }}/download">Скачать</a>
+        </div>
+      </div>
+    </div>
+  </div></div>
+
+  {% if is_awg and ios_conf %}
+  <div class="panel"><div class="panel-b">
+    <h2 style="margin:0 0 .5rem">Для iPhone / iOS</h2>
+    <div class="cfg">
+      <div class="qr"><img src="{{ ios_qr }}" alt="QR" width="200" height="200"></div>
+      <div style="min-width:0">
+        <ol class="steps">
+          <li>Приложение <b>AmneziaWG</b> для iOS → <b>+</b> → добавить туннель из QR или из файла <code>.conf</code>.</li>
+          <li>Отсканируйте этот QR (или скачайте <code>.conf</code> и откройте в приложении) — это формат WireGuard с параметрами AmneziaWG.</li>
+        </ol>
+        <code class="payload" id="ios_payload">{{ ios_conf }}</code>
+        <div class="dev-actions">
+          <button class="btn btn-primary btn-sm" type="button" onclick="copyText('ios_payload', this)">Копировать</button>
+          <a class="btn btn-ghost btn-sm" href="/devices/{{ device.id }}/download?fmt=ios">Скачать .conf</a>
+        </div>
+      </div>
+    </div>
+  </div></div>
+  {% endif %}
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function copyText(id, btn){
+  var el=document.getElementById(id); if(!el) return;
+  var done=function(){var t=btn.innerText;btn.innerText='Скопировано ✓';setTimeout(function(){btn.innerText=t;},1300);};
+  try{navigator.clipboard.writeText(el.innerText).then(done,function(){
+    var r=document.createRange();r.selectNode(el);getSelection().removeAllRanges();getSelection().addRange(r);done();
+  });}catch(e){done();}
+}
+</script>
+{% endblock %}

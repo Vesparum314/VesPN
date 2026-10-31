@@ -1,0 +1,6 @@
+# Automatic HTTPS (Let's Encrypt) in front of the panel.
+# DOMAIN must resolve to this server (A) and ports 80/443 must be open.
+{$DOMAIN} {
+    reverse_proxy panel:8000
+    encode gzip
+}

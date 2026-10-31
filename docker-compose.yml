@@ -1,0 +1,18 @@
+services:
+  panel:
+    build: .
+    image: vpn-panel
+    container_name: vpn-panel
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DATABASE_URL=sqlite:////data/panel.db
+    volumes:
+      - paneldata:/data
+    ports:
+      # bind spec is configurable; default is localhost-only (reach via SSH
+      # tunnel or a reverse proxy). Set PANEL_BIND=0.0.0.0:8443 to expose.
+      - "${PANEL_BIND:-127.0.0.1:8080}:8000"
+
+volumes:
+  paneldata:

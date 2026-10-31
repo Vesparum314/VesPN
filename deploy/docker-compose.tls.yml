@@ -1,0 +1,28 @@
+# Optional overlay that puts Caddy (automatic HTTPS) in front of the panel.
+# Usage (from the project root, after DNS for $DOMAIN points at this server):
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.tls.yml up -d --build
+services:
+  panel:
+    # don't expose the panel directly; only Caddy reaches it over the compose network
+    ports: !reset []
+    environment:
+      - DATABASE_URL=sqlite:////data/panel.db
+      - SESSION_HTTPS_ONLY=true
+
+  caddy:
+    image: caddy:2
+    container_name: vpn-panel-caddy
+    restart: unless-stopped
+    env_file: ../.env
+    depends_on: [panel]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
