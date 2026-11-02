@@ -4,28 +4,37 @@
 <div class="head">
   <div>
     <h1>Маршруты</h1>
-    <div class="sub">Маршрут = гейт (вход, RU) + пул выходов. Гейт сам переключается между живыми выходами. Пользователи маршрут не выбирают — все новые конфиги идут через «основной».</div>
+    <div class="sub">Маршрут = гейт (вход, RU) + пул выходов. Гейт сам переключается между живыми выходами. Клиент выбирает маршрут сам — из тех, к которым ему открыт доступ по группе. Маршрут без групп недоступен никому.</div>
   </div>
 </div>
 
 <div class="panel"><div class="tbl-wrap"><table>
-  <thead><tr><th>Имя</th><th>Путь</th><th>Состояние</th><th></th></tr></thead>
+  <thead><tr><th>Имя</th><th>Путь</th><th>Доступ (группы)</th><th>Состояние</th><th></th></tr></thead>
   <tbody>
   {% for r in routes %}
     <tr>
       <td data-label="Имя"><span class="cell-name">{{ r.name }}</span></td>
       <td data-label="Путь"><span class="mono">{{ r.hops }}</span>{% if r.gate_node %} <span class="muted">· адрес {{ r.host }}</span>{% endif %}</td>
+      <td data-label="Доступ (группы)">
+        {% if groups %}
+        <form method="post" action="/admin/routes/{{ r.id }}/groups" class="status-form">
+          <div class="chk-list">
+          {% for g in groups %}
+            <label class="check"><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g in r.groups }}> {{ g.name }}</label>
+          {% endfor %}
+          </div>
+          <button class="btn btn-ghost btn-sm">Сохранить доступ</button>
+        </form>
+        {% else %}<span class="muted">групп нет — вкладка «Группы»</span>{% endif %}
+        {% if not r.groups %}<span class="badge b-warn" title="маршрут недоступен клиентам">без групп → никому</span>{% endif %}
+      </td>
       <td data-label="Состояние">
-        {% if r.is_default %}<span class="badge b-ok b-dot">основной</span>{% endif %}
         {% if r.enabled %}<span class="badge b-ok">включён</span>{% else %}<span class="badge b-exit">выключен</span>{% endif %}
         {% if r.is_blocked %}<span class="badge b-bad" title="{{ r.block_reason }}">заблокирован</span>{% endif %}
       </td>
       <td data-label="Действия" class="full"><div class="row-actions">
         {% if r.gate_node and r.pool %}
         <form method="post" action="/admin/routes/{{ r.id }}/provision_relay" onsubmit="return confirm('Поднять/обновить релей на {{ r.gate_node.name }} → пул {{ r.pool.name }}?')"><button class="btn btn-sm">Поднять релей</button></form>
-        {% endif %}
-        {% if not r.is_default %}
-        <form method="post" action="/admin/routes/{{ r.id }}/default"><button class="btn btn-ghost btn-sm">Сделать основным</button></form>
         {% endif %}
         <form method="post" action="/admin/routes/{{ r.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Выключить' if r.enabled else 'Включить' }}</button></form>
         <form method="post" action="/admin/routes/{{ r.id }}/delete" onsubmit="return confirm('Удалить маршрут «{{ r.name }}»? Устройства на нём останутся без маршрута.')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>

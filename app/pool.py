@@ -42,7 +42,7 @@ from .models import (
     Node,
     Route,
 )
-from .nodes import NodeOpError, _rewrite_vless_host, connect
+from .nodes import NodeOpError, _gate_creds_for, _rewrite_vless_host, connect
 from .xui import XUIClient
 
 log = logging.getLogger("vpnpanel.pool")
@@ -61,13 +61,17 @@ def _link_uuid(payload: str) -> str | None:
     return m.group(1) if m else None
 
 
-def default_route(db: Session) -> Route | None:
-    """The route new/unpinned devices are issued against — the one the admin
-    marked default, else the first enabled route. Users never pick one."""
-    return (
-        db.query(Route).filter_by(is_default=True, enabled=True).first()
-        or db.query(Route).filter_by(enabled=True).order_by(Route.id).first()
-    )
+def accessible_routes(db: Session, user) -> list[Route]:
+    """Routes the user may make configs on. Staff (admin/operator) see EVERY enabled
+    route; a client only enabled routes sharing >=1 access group (a route with no
+    groups is accessible to no client)."""
+    enabled = db.query(Route).filter_by(enabled=True).order_by(Route.name).all()
+    if user.is_staff:
+        return enabled
+    gids = user.group_ids
+    if not gids:
+        return []
+    return [r for r in enabled if gids & {g.id for g in r.groups}]
 
 
 # --- identity -----------------------------------------------------------
@@ -146,6 +150,13 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
     pool = db.get(ExitPool, node.pool_id)
     if pool is None:
         raise NodeOpError("пул не найден")
+    # Model A: a pooled exit is always managed THROUGH its gate (RU DPI drops the
+    # direct Hub→exit handshake). Require a resolvable gate before we start, so
+    # rollout never silently depends on a direct connection that dies on DPI.
+    if _gate_creds_for(node) is None:
+        raise NodeOpError(
+            "у пула нет гейта: заведите gate-ноду и маршрут (пул→гейт) до раскатки выхода"
+        )
 
     with connect(node) as n:
         provisioning.ensure_base(n)  # fresh Debian lacks curl, which the installers need
@@ -293,13 +304,13 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
     ready member (identical link everywhere); the link is fetched from the first
     member that answers. AmneziaWG: generate the peer locally, build the vpn://
     from the POOL identity (no live node needed), and push the peer to all members."""
-    # Users don't pick a route: resolve to the device's route if still valid,
-    # otherwise the admin's default. Re-pin the device to whatever we resolved.
-    route = device.route if (device.route and device.route.enabled) else default_route(db)
-    if route is None:
-        raise NodeOpError("маршрут ещё не настроен администратором")
-    if device.route_id != route.id:
-        device.route_id = route.id
+    # The client picks the route; honour exactly what the device is pinned to and
+    # re-check access at issue time (so a revoked group stops working). No fallback.
+    route = device.route
+    if route is None or not route.enabled:
+        raise NodeOpError("маршрут устройства не выбран или отключён — выберите доступный маршрут")
+    if not route.allows(device.user):
+        raise NodeOpError("этот маршрут вам недоступен — выберите другой")
     pool = route.pool
     gate = route.gate_node
     if pool is None:

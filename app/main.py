@@ -28,12 +28,17 @@ from .models import (
     PROTO_AWG,
     PROTO_VLESS,
     PROTOCOLS,
+    ROLE_ADMIN,
+    ROLE_CLIENT,
     ROLE_EXIT,
     ROLE_GATE,
+    ROLE_OPERATOR,
     ROLES,
+    USER_ROLES,
     ANNOUNCEMENT_KEY,
     Device,
     ExitPool,
+    Group,
     IssuedConfig,
     Node,
     Route,
@@ -148,7 +153,7 @@ def _startup() -> None:
                 pw = _s.token_urlsafe(12)
                 log.warning("No ADMIN_PASSWORD set. Created admin %r with password: %s",
                             settings.admin_username, pw)
-            db.add(User(username=settings.admin_username, password_hash=hash_password(pw), is_admin=True))
+            db.add(User(username=settings.admin_username, password_hash=hash_password(pw), role=ROLE_ADMIN))
             db.commit()
             log.info("Bootstrapped admin user %r", settings.admin_username)
     finally:
@@ -236,11 +241,12 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
-    route = pool_ops.default_route(db)
-    service_ready = route is not None and not route.is_blocked
+    routes = pool_ops.accessible_routes(db, user)  # routes this client may use
+    usable = [r for r in routes if not r.is_blocked]
     return render(
         request, "dashboard.html",
-        user=user, devices=user.devices, protocols=PROTOCOLS, service_ready=service_ready,
+        user=user, devices=user.devices, protocols=PROTOCOLS,
+        service_ready=bool(usable), routes=routes,
     )
 
 
@@ -249,6 +255,7 @@ def create_device(
     request: Request,
     name: str = Form(...),
     protocol: str = Form(...),
+    route_id: str = Form(""),
     db: Session = Depends(get_db),
 ):
     user = current_user(request, db)
@@ -258,13 +265,13 @@ def create_device(
     if not name or protocol not in PROTOCOLS:
         flash(request, "Укажите имя и протокол", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    # No user-facing route choice: devices bind to the admin's default route.
-    route = pool_ops.default_route(db)
-    if not route:
-        flash(request, "Сервис ещё настраивается — попробуйте позже", "error")
+    # The client picks a route among those their groups grant access to.
+    route = db.get(Route, int(route_id)) if route_id.strip().isdigit() else None
+    if not route or not route.allows(user):
+        flash(request, "Выберите доступный вам маршрут", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     if route.is_blocked:
-        flash(request, "Сервис временно недоступен — попробуйте позже", "error")
+        flash(request, "Маршрут временно недоступен — попробуйте позже", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     exists = db.query(Device).filter_by(user_id=user.id, name=name, protocol=protocol).first()
     if exists:
@@ -364,14 +371,22 @@ def device_download(request: Request, device_id: int, fmt: str = "", db: Session
 
 
 # --- admin --------------------------------------------------------------
+def _require_staff(request: Request, db: Session) -> User | None:
+    """admin|operator — may access the admin area and manage the fleet, clients,
+    groups and routes."""
+    user = current_user(request, db)
+    return user if (user and user.is_staff) else None
+
+
 def _require_admin(request: Request, db: Session) -> User | None:
+    """admin only — the one power an operator lacks: managing people's roles."""
     user = current_user(request, db)
     return user if (user and user.is_admin) else None
 
 
 @app.get("/admin/nodes", response_class=HTMLResponse)
 def admin_nodes(request: Request, db: Session = Depends(get_db)):
-    admin = _require_admin(request, db)
+    admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     nodes = db.query(Node).order_by(Node.id).all()
@@ -398,7 +413,7 @@ def admin_add_node(
     awg_port: str = Form(""),  # blank -> provisioning picks a fresh port
     db: Session = Depends(get_db),
 ):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     role = role if role in ROLES else ROLE_EXIT
     pid = int(pool_id) if (role == ROLE_EXIT and pool_id.strip().isdigit()) else None
@@ -429,7 +444,7 @@ def admin_add_node(
 def admin_set_node_pool(
     request: Request, node_id: int, pool_id: str = Form(""), db: Session = Depends(get_db)
 ):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
@@ -448,7 +463,7 @@ def admin_set_node_pool(
 
 @app.post("/admin/nodes/{node_id}/activate")
 def admin_activate_node(request: Request, node_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
@@ -460,18 +475,22 @@ def admin_activate_node(request: Request, node_id: int, db: Session = Depends(ge
 
 
 @app.post("/admin/nodes/{node_id}/test")
-def admin_test_node(request: Request, node_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+def admin_test_node(
+    request: Request, node_id: int, direct: bool = Form(False), db: Session = Depends(get_db)
+):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
-        request.session["_test"] = {"node": node.name, **node_ops.test_node(node)}
+        # `direct` is the explicit «connect directly» override: bypass the gate for
+        # a one-off reachability probe (Hub→exit directly). Normal checks go via gate.
+        request.session["_test"] = {"node": node.name, **node_ops.test_node(node, allow_direct=direct)}
     return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes/{node_id}/provision")
 def admin_provision_node(request: Request, node_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
@@ -494,7 +513,7 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
 
 @app.post("/admin/nodes/{node_id}/delete")
 def admin_delete_node(request: Request, node_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
@@ -508,7 +527,7 @@ def admin_delete_node(request: Request, node_id: int, db: Session = Depends(get_
 def admin_set_node_status(
     request: Request, node_id: int, status: str = Form("ok"), db: Session = Depends(get_db)
 ):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node and status in NODE_STATUSES:
@@ -521,13 +540,15 @@ def admin_set_node_status(
 # --- admin: routes ------------------------------------------------------
 @app.get("/admin/routes", response_class=HTMLResponse)
 def admin_routes(request: Request, db: Session = Depends(get_db)):
-    admin = _require_admin(request, db)
+    admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     routes = db.query(Route).order_by(Route.name).all()
     pools = db.query(ExitPool).order_by(ExitPool.name).all()
     gates = db.query(Node).filter_by(role=ROLE_GATE).order_by(Node.name).all()
-    return render(request, "admin_routes.html", user=admin, routes=routes, pools=pools, gates=gates)
+    groups = db.query(Group).order_by(Group.name).all()
+    return render(request, "admin_routes.html", user=admin, routes=routes, pools=pools,
+                  gates=gates, groups=groups)
 
 
 @app.post("/admin/routes")
@@ -538,7 +559,7 @@ def admin_add_route(
     pool_id: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
     gate_node = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
@@ -560,7 +581,7 @@ def admin_add_route(
 
 @app.post("/admin/routes/{route_id}/toggle")
 def admin_toggle_route(request: Request, route_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route:
@@ -570,24 +591,26 @@ def admin_toggle_route(request: Request, route_id: int, db: Session = Depends(ge
     return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
 
 
-@app.post("/admin/routes/{route_id}/default")
-def admin_set_default_route(request: Request, route_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+@app.post("/admin/routes/{route_id}/groups")
+def admin_set_route_groups(
+    request: Request, route_id: int,
+    group_ids: list[int] = Form(default=[]),
+    db: Session = Depends(get_db),
+):
+    """Set which access groups may use this route (empty = nobody)."""
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route:
-        db.query(Route).update({Route.is_default: False})
-        route.is_default = True
-        if not route.enabled:
-            route.enabled = True
+        route.groups = db.query(Group).filter(Group.id.in_(group_ids)).all() if group_ids else []
         db.commit()
-        flash(request, f"Основной маршрут: «{route.name}»", "success")
+        flash(request, f"Доступ к «{route.name}»: групп — {len(route.groups)}", "success")
     return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/routes/{route_id}/delete")
 def admin_delete_route(request: Request, route_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route:
@@ -599,7 +622,7 @@ def admin_delete_route(request: Request, route_id: int, db: Session = Depends(ge
 
 @app.post("/admin/routes/{route_id}/provision_relay")
 def admin_provision_relay(request: Request, route_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route and route.gate_node and route.pool:
@@ -615,10 +638,66 @@ def admin_provision_relay(request: Request, route_id: int, db: Session = Depends
     return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
 
 
+# --- admin: groups ------------------------------------------------------
+@app.get("/admin/groups", response_class=HTMLResponse)
+def admin_groups(request: Request, db: Session = Depends(get_db)):
+    admin = _require_staff(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    groups = db.query(Group).order_by(Group.name).all()
+    users = db.query(User).order_by(User.username).all()
+    return render(request, "admin_groups.html", user=admin, groups=groups, users=users)
+
+
+@app.post("/admin/groups")
+def admin_add_group(request: Request, name: str = Form(...), db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    name = name.strip()
+    if not name:
+        flash(request, "Укажите имя группы", "error")
+    elif db.query(Group).filter_by(name=name).first():
+        flash(request, "Группа с таким именем уже есть", "error")
+    else:
+        db.add(Group(name=name))
+        db.commit()
+        flash(request, f"Группа «{name}» создана", "success")
+    return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/groups/{group_id}/members")
+def admin_set_group_members(
+    request: Request, group_id: int,
+    user_ids: list[int] = Form(default=[]),
+    db: Session = Depends(get_db),
+):
+    """Set the members of a group (which accounts belong to it)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    group = db.get(Group, group_id)
+    if group:
+        group.users = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
+        db.commit()
+        flash(request, f"В группе «{group.name}»: участников — {len(group.users)}", "success")
+    return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/groups/{group_id}/delete")
+def admin_delete_group(request: Request, group_id: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    group = db.get(Group, group_id)
+    if group:
+        db.delete(group)
+        db.commit()
+        flash(request, "Группа удалена", "success")
+    return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
+
+
 # --- admin: pools -------------------------------------------------------
 @app.get("/admin/pools", response_class=HTMLResponse)
 def admin_pools(request: Request, db: Session = Depends(get_db)):
-    admin = _require_admin(request, db)
+    admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     pools = db.query(ExitPool).order_by(ExitPool.name).all()
@@ -633,7 +712,7 @@ def admin_add_pool(
     awg_port: int = Form(17772),
     db: Session = Depends(get_db),
 ):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
     if not name:
@@ -648,7 +727,7 @@ def admin_add_pool(
 
 @app.post("/admin/pools/{pool_id}/reconcile")
 def admin_reconcile_pool(request: Request, pool_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     pool = db.get(ExitPool, pool_id)
     if pool:
@@ -664,7 +743,7 @@ def admin_reconcile_pool(request: Request, pool_id: int, db: Session = Depends(g
 
 @app.post("/admin/pools/{pool_id}/delete")
 def admin_delete_pool(request: Request, pool_id: int, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     pool = db.get(ExitPool, pool_id)
     if pool:
@@ -688,7 +767,7 @@ def admin_delete_pool(request: Request, pool_id: int, db: Session = Depends(get_
 # --- admin: monitoring --------------------------------------------------
 @app.get("/admin/monitor", response_class=HTMLResponse)
 def admin_monitor(request: Request, db: Session = Depends(get_db)):
-    admin = _require_admin(request, db)
+    admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     return render(request, "admin_monitor.html", user=admin,
@@ -697,7 +776,7 @@ def admin_monitor(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/admin/monitor/check")
 def admin_monitor_check(request: Request, db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     try:
         monitor.run_checks(db)
@@ -719,7 +798,7 @@ def admin_monitor_settings(
     clear_token: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     # Blank token field keeps the current token; the "очистить" checkbox clears it.
     tok: str | None
@@ -738,7 +817,7 @@ def admin_monitor_settings(
 
 @app.get("/admin/users", response_class=HTMLResponse)
 def admin_users(request: Request, db: Session = Depends(get_db)):
-    admin = _require_admin(request, db)
+    admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     users = db.query(User).order_by(User.id).all()
@@ -747,7 +826,7 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/admin/announcement")
 def admin_set_announcement(request: Request, text: str = Form(""), db: Session = Depends(get_db)):
-    if not _require_admin(request, db):
+    if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     text = text.strip()
     s = db.get(Setting, ANNOUNCEMENT_KEY)
@@ -764,13 +843,17 @@ def admin_set_announcement(request: Request, text: str = Form(""), db: Session =
 def admin_add_user(
     request: Request,
     username: str = Form(...),
-    is_admin: str = Form(""),
+    role: str = Form(ROLE_CLIENT),
     db: Session = Depends(get_db),
 ):
-    if not _require_admin(request, db):
+    staff = _require_staff(request, db)
+    if not staff:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     username = username.strip()
-    if not username:
+    role = role if role in USER_ROLES else ROLE_CLIENT
+    if role in (ROLE_ADMIN, ROLE_OPERATOR) and not staff.is_admin:
+        flash(request, "Заводить операторов/админов может только админ", "error")
+    elif not username:
         flash(request, "Укажите логин", "error")
     elif db.query(User).filter_by(username=username).first():
         flash(request, "Пользователь уже существует", "error")
@@ -778,26 +861,57 @@ def admin_add_user(
         db.add(User(
             username=username,
             password_hash=hash_password(settings.default_user_password),
-            is_admin=bool(is_admin),
+            role=role,
+            created_by=staff.id,
             must_change_password=True,
         ))
         db.commit()
         flash(request,
-              f"Пользователь «{username}» создан. Временный пароль: "
+              f"Пользователь «{username}» (роль: {role}) создан. Временный пароль: "
               f"{settings.default_user_password} — сменит при первом входе.", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
-@app.post("/admin/users/{user_id}/delete")
-def admin_delete_user(request: Request, user_id: int, db: Session = Depends(get_db)):
+@app.post("/admin/users/{user_id}/role")
+def admin_set_user_role(
+    request: Request, user_id: int, role: str = Form(...), db: Session = Depends(get_db)
+):
+    """Change a user's role — admin only (the one power operators lack)."""
     admin = _require_admin(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     target = db.get(User, user_id)
-    if target and target.id != admin.id:
+    if not target or role not in USER_ROLES:
+        flash(request, "Пользователь не найден или роль неверна", "error")
+    elif target.role == ROLE_ADMIN and role != ROLE_ADMIN and _admin_count(db) <= 1:
+        flash(request, "Нельзя снять последнего админа", "error")
+    else:
+        target.role = role
+        db.commit()
+        flash(request, f"Роль «{target.username}»: {role}", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+def _admin_count(db: Session) -> int:
+    return db.query(User).filter_by(role=ROLE_ADMIN).count()
+
+
+@app.post("/admin/users/{user_id}/delete")
+def admin_delete_user(request: Request, user_id: int, db: Session = Depends(get_db)):
+    staff = _require_staff(request, db)
+    if not staff:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    target = db.get(User, user_id)
+    if not target:
+        flash(request, "Пользователь не найден", "error")
+    elif target.id == staff.id:
+        flash(request, "Нельзя удалить самого себя", "error")
+    elif target.is_staff and not staff.is_admin:
+        flash(request, "Удалять операторов/админов может только админ", "error")
+    elif target.role == ROLE_ADMIN and _admin_count(db) <= 1:
+        flash(request, "Нельзя удалить последнего админа", "error")
+    else:
         db.delete(target)
         db.commit()
         flash(request, "Пользователь удалён", "success")
-    else:
-        flash(request, "Нельзя удалить самого себя", "error")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)

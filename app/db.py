@@ -40,6 +40,7 @@ def init_db() -> None:
     _rebuild_changed_tables()
     Base.metadata.create_all(bind=engine)
     _add_columns()
+    _seed_default_group()
 
 
 def _rebuild_changed_tables() -> None:
@@ -95,9 +96,44 @@ def _add_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN priority INTEGER NOT NULL DEFAULT 100")
         if "route_id" not in cols("devices"):
             conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN route_id INTEGER")
-        # routes.is_default may be absent on a DB migrated to Model A by an
-        # earlier deploy (routes table not rebuilt since).
-        if "is_default" not in cols("routes"):
+        # users.role (Этап 2): roles admin|operator|client; carry over old is_admin.
+        ucols = cols("users")
+        if "role" not in ucols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'client'")
+            if "is_admin" in ucols:
+                conn.exec_driver_sql(
+                    "UPDATE users SET role = CASE WHEN is_admin=1 THEN 'admin' ELSE 'client' END"
+                )
+        if "created_by" not in cols("users"):
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN created_by INTEGER")
+
+
+def _seed_default_group() -> None:
+    """One-time (Этап 2): put every existing client + every enabled route into a
+    single «Общая» group so access carries over when groups are introduced. Guarded
+    by a settings flag so it never re-creates the group after an admin removes it."""
+    with engine.begin() as conn:
+        def table_exists(name: str) -> bool:
+            row = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=:n", {"n": name}
+            ).fetchone()
+            return row is not None
+
+        if not (table_exists("groups") and table_exists("settings")):
+            return
+        done = conn.exec_driver_sql("SELECT value FROM settings WHERE key='grp_seed_done'").fetchone()
+        if done:
+            return
+        conn.exec_driver_sql("INSERT INTO groups (name) VALUES ('Общая')")
+        gid = conn.exec_driver_sql("SELECT id FROM groups WHERE name='Общая'").fetchone()[0]
+        for (uid,) in conn.exec_driver_sql("SELECT id FROM users WHERE role='client'").fetchall():
             conn.exec_driver_sql(
-                "ALTER TABLE routes ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT 0"
+                "INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (:u, :g)",
+                {"u": uid, "g": gid},
             )
+        for (rid,) in conn.exec_driver_sql("SELECT id FROM routes WHERE enabled=1").fetchall():
+            conn.exec_driver_sql(
+                "INSERT OR IGNORE INTO route_groups (route_id, group_id) VALUES (:r, :g)",
+                {"r": rid, "g": gid},
+            )
+        conn.exec_driver_sql("INSERT INTO settings (key, value) VALUES ('grp_seed_done', '1')")

@@ -23,10 +23,11 @@
       {% if not user.must_change_password %}
       <nav>
         <a class="tab" href="/" aria-current="{{ 'true' if request.url.path == '/' else 'false' }}">Устройства</a>
-        {% if user.is_admin %}
+        {% if user.is_staff %}
           <a class="tab" href="/admin/nodes" aria-current="{{ 'true' if request.url.path == '/admin/nodes' else 'false' }}">Серверы</a>
           <a class="tab" href="/admin/pools" aria-current="{{ 'true' if request.url.path == '/admin/pools' else 'false' }}">Пулы</a>
           <a class="tab" href="/admin/routes" aria-current="{{ 'true' if request.url.path == '/admin/routes' else 'false' }}">Маршруты</a>
+          <a class="tab" href="/admin/groups" aria-current="{{ 'true' if request.url.path == '/admin/groups' else 'false' }}">Группы</a>
           <a class="tab" href="/admin/monitor" aria-current="{{ 'true' if request.url.path == '/admin/monitor' else 'false' }}">Мониторинг</a>
           <a class="tab" href="/admin/users" aria-current="{{ 'true' if request.url.path == '/admin/users' else 'false' }}">Пользователи</a>
         {% endif %}

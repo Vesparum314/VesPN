@@ -61,7 +61,7 @@ def _gate_creds_for(node: Node) -> NodeCredentials | None:
         route = (
             sess.query(Route)
             .filter(Route.pool_id == node.pool_id, Route.gate_id.isnot(None))
-            .order_by(Route.is_default.desc(), Route.id)
+            .order_by(Route.id)
             .first()
         )
         gate = route.gate_node if route else None
@@ -82,17 +82,31 @@ def _gate_creds_for(node: Node) -> NodeCredentials | None:
         return None
 
 
+def _exit_needs_gate(node: Node) -> bool:
+    """Every pooled exit is managed STRICTLY through its gate: the panel never opens
+    a direct Hub→exit connection on its own, so no such link exists for RU DPI to
+    flag. (Gates and nodes with no pool have no gate fronting them.)"""
+    return node.role == ROLE_EXIT and node.pool_id is not None
+
+
 @contextmanager
-def connect(node: Node):
-    """SSH to a node. For a pooled exit, tunnel through its gate (ProxyJump); fall
-    back to a direct connection if the gate path can't be established."""
-    jump = _gate_creds_for(node)
-    try:
-        n = SSHNode(_creds(node), jump=jump).connect()
-    except Exception:
+def connect(node: Node, allow_direct: bool = False):
+    """SSH to a node. A pooled exit is reached ONLY through its gate (ProxyJump):
+    there is no automatic direct fallback, so the panel never opens a Hub→exit
+    connection by itself — if the gate path can't be established we raise (instead
+    of hanging on DPI). The sole exception is `allow_direct=True`, an explicit admin
+    override (the «connect directly» button) that bypasses the gate to diagnose an
+    exit unreachable through it, at the cost of a visible Hub→exit connection. Gates
+    and gateless nodes have no fronting gate and are connected to directly."""
+    if _exit_needs_gate(node) and not allow_direct:
+        jump = _gate_creds_for(node)
         if jump is None:
-            raise
-        log.warning("gate-jump SSH to %s failed; trying direct", node.name)
+            raise NodeOpError(
+                f"выход «{node.name}»: панель управляет выходом только через гейт, но "
+                f"гейт не определён — сначала раскатайте гейт и свяжите его с пулом"
+            )
+        n = SSHNode(_creds(node), jump=jump).connect()
+    else:
         n = SSHNode(_creds(node)).connect()
     try:
         yield n
@@ -101,11 +115,12 @@ def connect(node: Node):
 
 
 # --- diagnostics --------------------------------------------------------
-def test_node(node: Node) -> dict:
-    """Probe SSH, the AmneziaWG container, and the 3x-ui API. Never raises."""
-    result = {"ssh": False, "awg": False, "xui": False, "detail": ""}
+def test_node(node: Node, allow_direct: bool = False) -> dict:
+    """Probe SSH, the AmneziaWG container, and the 3x-ui API. Never raises.
+    `allow_direct` bypasses the gate — the admin «connect directly» override."""
+    result = {"ssh": False, "awg": False, "xui": False, "direct": allow_direct, "detail": ""}
     try:
-        with connect(node) as n:
+        with connect(node, allow_direct=allow_direct) as n:
             rc, out, _ = n.run("echo ok")
             result["ssh"] = rc == 0 and out.strip() == "ok"
             rc, dps, _ = n.run("docker ps --format '{{.Names}} {{.Image}}'")

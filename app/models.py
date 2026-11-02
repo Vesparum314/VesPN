@@ -14,10 +14,12 @@ import time
 
 from sqlalchemy import (
     Boolean,
+    Column,
     DateTime,
     ForeignKey,
     Integer,
     String,
+    Table,
     Text,
     UniqueConstraint,
     func,
@@ -64,6 +66,31 @@ _SYNC_LABEL = {
 }
 
 
+# A user's access role (distinct from a node's role above). `admin` = full control
+# INCLUDING managing people's roles; `operator` = same powers over the fleet,
+# clients, groups and routes but CANNOT manage roles; `client` = end user.
+ROLE_ADMIN = "admin"
+ROLE_OPERATOR = "operator"
+ROLE_CLIENT = "client"
+USER_ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_CLIENT)
+STAFF_ROLES = (ROLE_ADMIN, ROLE_OPERATOR)
+_USER_ROLE_LABEL = {ROLE_ADMIN: "админ", ROLE_OPERATOR: "оператор", ROLE_CLIENT: "клиент"}
+
+
+# Access groups (many-to-many). A client may use a route only if they share at
+# least one group with it; a route with no groups is accessible to no client.
+user_groups = Table(
+    "user_groups", Base.metadata,
+    Column("user_id", ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
+)
+route_groups = Table(
+    "route_groups", Base.metadata,
+    Column("route_id", ForeignKey("routes.id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
 def slugify(value: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return s or "x"
@@ -74,13 +101,42 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    role: Mapped[str] = mapped_column(String(16), default=ROLE_CLIENT, server_default=ROLE_CLIENT)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # The staff account (admin/operator) that created this user; NULL for the
+    # bootstrap admin or if the creator was later deleted.
+    created_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     devices: Mapped[list["Device"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    groups: Mapped[list["Group"]] = relationship(secondary=user_groups, back_populates="users")
+    creator: Mapped["User | None"] = relationship(
+        "User", remote_side=[id], foreign_keys=[created_by]
+    )
+
+    @property
+    def is_staff(self) -> bool:
+        """admin or operator — may access the admin area and manage the fleet,
+        clients, groups and routes."""
+        return self.role in STAFF_ROLES
+
+    @property
+    def is_admin(self) -> bool:
+        """Only the top role — the single thing an operator can't do is manage
+        people's roles (create operators/admins, change roles, delete staff)."""
+        return self.role == ROLE_ADMIN
+
+    @property
+    def role_label(self) -> str:
+        return _USER_ROLE_LABEL.get(self.role, self.role)
+
+    @property
+    def group_ids(self) -> set[int]:
+        return {g.id for g in self.groups}
 
 
 class Node(Base):
@@ -286,14 +342,21 @@ class Route(Base):
         ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True
     )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
-    # The single route new devices are issued against. Users don't pick a route;
-    # the admin marks one "основной". (Kept as a model concept so multiple gates
-    # can later be offered as a minimal choice, but hidden from clients for now.)
-    is_default: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     pool: Mapped["ExitPool | None"] = relationship("ExitPool")
     gate_node: Mapped["Node | None"] = relationship("Node", foreign_keys=[gate_id])
+    # Access groups allowed to use this route. Empty = no client may use it.
+    groups: Mapped[list["Group"]] = relationship(secondary=route_groups, back_populates="routes")
+
+    def allows(self, user) -> bool:
+        """True if the user may make a config on this route. Staff (admin/operator)
+        may use ANY enabled route; a client only one sharing an access group."""
+        if not self.enabled:
+            return False
+        if user.is_staff:
+            return True
+        return bool({g.id for g in self.groups} & set(user.group_ids))
 
     @property
     def host(self) -> str:
@@ -331,6 +394,19 @@ class Route(Base):
         if not self.pool.synced_exits:
             return "в пуле нет синхронизированных выходов"
         return ""
+
+
+class Group(Base):
+    """A named access group. A user can be in several; a route can allow several.
+    A client may use a route only if they share at least one group with it."""
+
+    __tablename__ = "groups"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    users: Mapped[list["User"]] = relationship(secondary=user_groups, back_populates="groups")
+    routes: Mapped[list["Route"]] = relationship(secondary=route_groups, back_populates="groups")
 
 
 class Setting(Base):

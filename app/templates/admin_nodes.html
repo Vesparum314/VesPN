@@ -10,7 +10,7 @@
 
 {% if test_result %}
   <div class="flash flash-info">
-    Проверка «{{ test_result.node }}»:
+    Проверка «{{ test_result.node }}»{% if test_result.direct %} <span class="badge b-warn b-dot">напрямую, в обход гейта</span>{% endif %}:
     SSH {{ '✓' if test_result.ssh else '✗' }} ·
     AmneziaWG {{ '✓' if test_result.awg else '✗' }} ·
     3x-ui {{ '✓' if test_result.xui else '✗' }}
@@ -66,6 +66,12 @@
         <form method="post" action="/admin/nodes/{{ n.id }}/provision" onsubmit="return confirm('Развернуть {{ n.name }} как клон пула (3x-ui + AmneziaWG)? Несколько минут.')"><button class="btn btn-sm">{{ 'Переразвернуть' if n.has_xui else 'Развернуть' }}</button></form>
         {% endif %}
         <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
+        {% if not n.is_gate and n.pool_id %}
+        <form method="post" action="/admin/nodes/{{ n.id }}/test" onsubmit="return confirm('Подключиться к {{ n.name }} НАПРЯМУЮ, в обход гейта?\n\nУправляющее соединение пойдёт Хаб→выход напрямик — это видимое подключение, минующее защиту гейта. Только для диагностики, когда выход недоступен через гейт.')">
+          <input type="hidden" name="direct" value="1">
+          <button class="btn btn-ghost btn-sm btn-danger">Напрямую ⚠</button>
+        </form>
+        {% endif %}
         <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
       </div></td>
     </tr>
