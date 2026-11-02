@@ -491,3 +491,36 @@ class IssuedConfig(Base):
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     device: Mapped[Device] = relationship(back_populates="configs")
+
+
+class TrafficStat(Base):
+    """Per-device traffic accounting, collected periodically THROUGH THE GATE (never
+    a direct Hub→exit). Node counters (3x-ui usedTraffic / `awg show transfer`) are
+    cumulative and reset on node restart, so we store per-(device,node) last-seen
+    values in `seen_json` and accumulate deltas into total + today (UTC). `up` =
+    client→server, `down` = server→client; summed across the pool's members."""
+
+    __tablename__ = "traffic_stats"
+    device_id: Mapped[int] = mapped_column(
+        ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True
+    )
+    up_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    down_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    up_today: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    down_today: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    day: Mapped[str] = mapped_column(String(10), default="", server_default="")  # YYYY-MM-DD UTC
+    seen_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    updated_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    device: Mapped["Device"] = relationship("Device")
+
+    @property
+    def seen(self) -> dict:
+        try:
+            return json.loads(self.seen_json or "{}")
+        except ValueError:
+            return {}
+
+    @seen.setter
+    def seen(self, value: dict) -> None:
+        self.seen_json = json.dumps(value)

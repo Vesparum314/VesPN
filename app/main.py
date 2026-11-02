@@ -21,6 +21,7 @@ from . import appconfig
 from . import monitor
 from . import nodes as node_ops
 from . import pool as pool_ops
+from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
 from .models import (
@@ -43,6 +44,7 @@ from .models import (
     Node,
     Route,
     Setting,
+    TrafficStat,
     User,
 )
 from .security import current_user, hash_password, login_session, logout_session, verify_password
@@ -90,6 +92,22 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def _hbytes(n) -> str:
+    """Human-readable byte size for templates (1536 -> '1.5 KB')."""
+    try:
+        v = float(n or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            return f"{v:.0f} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+    return f"{v:.1f} TB"
+
+
+templates.env.filters["hbytes"] = _hbytes
 
 
 # --- flash helpers ------------------------------------------------------
@@ -813,6 +831,31 @@ def admin_monitor_settings(
                             api_base=api_base.strip() or "https://api.telegram.org")
     flash(request, "Настройки бота сохранены (применятся в течение минуты)", "success")
     return RedirectResponse("/admin/monitor", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: traffic -----------------------------------------------------
+@app.get("/admin/traffic", response_class=HTMLResponse)
+def admin_traffic(request: Request, db: Session = Depends(get_db)):
+    admin = _require_staff(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    users = db.query(User).order_by(User.username).all()
+    stats = {s.device_id: s for s in db.query(TrafficStat).all()}
+    return render(request, "admin_traffic.html", user=admin, users=users, stats=stats,
+                  updated=traffic_ops.last_updated(db))
+
+
+@app.post("/admin/traffic/collect")
+def admin_traffic_collect(request: Request, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    try:
+        info = traffic_ops.collect_traffic(db)
+        flash(request, f"Трафик собран (ноды: ok {info['members_ok']}, ошибок {info['members_fail']})", "success")
+    except Exception as e:
+        log.exception("traffic collect failed")
+        flash(request, f"Сбор трафика не удался: {e}", "error")
+    return RedirectResponse("/admin/traffic", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.get("/admin/users", response_class=HTMLResponse)

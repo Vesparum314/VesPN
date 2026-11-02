@@ -26,7 +26,10 @@ from datetime import datetime, timezone
 import requests
 
 from . import monitor
+from . import nodes as node_ops
+from . import traffic
 from .config import settings
+from .provisioning import TG_PROXY_PORT
 
 log = logging.getLogger("vpnpanel.tgbot")
 
@@ -50,20 +53,104 @@ def _refresh_cfg() -> None:
         db.close()
 
 
+# --- Telegram transport: a gate SSH tunnel to an exit's localhost proxy --------
+# The bot never reaches Telegram directly (RU blocks it) nor an exit directly (no
+# direct Hub→exit). It tunnels Hub→gate→exit (ProxyJump) to the exit's 127.0.0.1
+# Caddy proxy. Exits are tried in priority order; the first reachable one is kept,
+# with failover to the next on error.
+_proxy: dict = {"ssh": None, "fwd": None, "port": None, "exit_id": None, "exit_name": None}
+_proxy_lock = threading.Lock()
+
+
+def _candidate_exits(db):
+    from .models import Node, ROLE_EXIT
+    return (
+        db.query(Node)
+        .filter(Node.role == ROLE_EXIT, Node.pool_id.isnot(None))
+        .order_by(Node.priority, Node.id)
+        .all()
+    )
+
+
+def _probe_proxy(port: int) -> bool:
+    try:
+        r = requests.get(f"http://127.0.0.1:{port}/bot{_cfg['token']}/getMe", timeout=15)
+        return bool(r.json().get("ok"))
+    except Exception:
+        return False
+
+
+def _drop_proxy() -> None:
+    with _proxy_lock:
+        fwd, ssh = _proxy.get("fwd"), _proxy.get("ssh")
+        if fwd is not None:
+            try:
+                fwd.stop()
+            except Exception:
+                pass
+        if ssh is not None:
+            try:
+                ssh.close()
+            except Exception:
+                pass
+        _proxy.update(ssh=None, fwd=None, port=None, exit_id=None, exit_name=None)
+
+
+def _ensure_proxy() -> str | None:
+    """Local base URL of a live gate→exit TG tunnel, establishing one by exit
+    priority if needed. None if no exit is reachable."""
+    with _proxy_lock:
+        if _proxy["ssh"] is not None and _proxy["port"]:
+            return f"http://127.0.0.1:{_proxy['port']}"
+    from .db import SessionLocal
+    db = SessionLocal()
+    try:
+        exits = _candidate_exits(db)
+    finally:
+        db.close()
+    for ex in exits:
+        try:
+            n, port, fwd = node_ops.open_proxy_tunnel(ex, TG_PROXY_PORT)
+        except Exception as e:
+            log.warning("tg: tunnel to %s failed: %s", ex.name, e)
+            continue
+        if _probe_proxy(port):
+            with _proxy_lock:
+                _proxy.update(ssh=n, fwd=fwd, port=port, exit_id=ex.id, exit_name=ex.name)
+            log.info("tg: proxying via exit %s", ex.name)
+            return f"http://127.0.0.1:{port}"
+        try:
+            fwd.stop()
+        finally:
+            n.close()
+    log.warning("tg: no reachable exit proxy")
+    return None
+
+
 # --- Telegram API -------------------------------------------------------
 def _api(method: str, retries: int = 4, **kw):
-    """Call the Telegram API through the configured base, with retries — the RU
-    path to proxies like *.workers.dev is DPI-flaky (TLS resets), so a few tries
-    usually get through. Returns the parsed JSON, or {} if all attempts failed."""
-    base = (_cfg.get("api_base") or "https://api.telegram.org").rstrip("/")
-    url = f"{base}/bot{_cfg['token']}/{method}"
+    """Call the Telegram API, with retries. Default path: through a gate→exit tunnel
+    (exits tried by priority, failover on error). If `api_base` is set to an explicit
+    non-default URL it is used directly (manual override). Returns parsed JSON or {}."""
+    manual = (_cfg.get("api_base") or "").strip().rstrip("/")
+    direct = bool(manual and manual != "https://api.telegram.org")
     last = None
-    for attempt in range(max(1, retries)):
+    for _attempt in range(max(1, retries)):
+        if direct:
+            base = manual
+        else:
+            base = _ensure_proxy()
+            if base is None:
+                last = "no reachable exit proxy"
+                time.sleep(1.5)
+                continue
         try:
-            r = requests.post(url, timeout=40, **kw)
+            r = requests.post(f"{base}/bot{_cfg['token']}/{method}", timeout=40, **kw)
             return r.json()
         except Exception as e:
             last = e
+            if not direct:
+                _drop_proxy()  # next attempt re-selects an exit (failover)
             time.sleep(1.5)
     log.warning("tg %s failed after %d tries: %s", method, retries, last)
     return {}
@@ -186,6 +273,19 @@ def _monitor_cycle(alert: bool) -> None:
         db.close()
 
 
+def _traffic_cycle() -> None:
+    """Collect per-device traffic from the pool (through the gate). Runs regardless
+    of whether the bot is enabled — the admin wants the numbers either way."""
+    from .db import SessionLocal
+    db = SessionLocal()
+    try:
+        traffic.collect_traffic(db)
+    except Exception as e:
+        log.warning("traffic cycle failed: %s", e)
+    finally:
+        db.close()
+
+
 # --- command handling ---------------------------------------------------
 _HELP = (
     "VesPN бот:\n"
@@ -261,6 +361,7 @@ def _scheduler() -> None:
             if time.monotonic() - last_monitor >= max(60, _cfg["monitor_minutes"] * 60):
                 last_monitor = time.monotonic()
                 _monitor_cycle(alert=_cfg["enabled"])
+                _traffic_cycle()
             if _cfg["enabled"] and now.hour == _cfg["backup_hour"] and last_backup_day != now.date():
                 last_backup_day = now.date()
                 _send_backup()

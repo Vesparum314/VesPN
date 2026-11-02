@@ -225,24 +225,48 @@ def get_state(db: Session) -> dict | None:
         return None
 
 
+def _mgmt_mark(n: dict) -> str:
+    if n.get("mgmt_ok") is True:
+        return "✅"
+    if n.get("mgmt_ok") is None:
+        return "❔"
+    return "⛔"
+
+
 def summarize(snap: dict | None) -> str:
-    """One compact text block (for Telegram / logs)."""
+    """Compact text block for Telegram / logs — two clearly separated sections:
+    (б) client path (gate→exits) and (а) management reachability (Hub→nodes)."""
     if not snap:
         return "Мониторинг ещё не запускался."
-    lines = [f"🩺 Статус на {snap.get('at','?')} UTC"]
-    # client path (б)
-    for r in snap.get("routes", []):
-        mark = "✅" if (r.get("gate_up") and r.get("active")) else "⛔"
-        act = ", ".join(r.get("active") or []) or "—"
-        flaps = r.get("flaps_1h")
-        extra = f" · флаппинг {flaps}/ч" if (flaps or 0) >= FLAP_ALERT else ""
-        down = r.get("down") or []
-        downs = f" · не видны гейту: {', '.join(down)}" if down else ""
-        lines.append(f"{mark} {r['route']}: активен {act}{extra}{downs}")
-    # management reachability (а)
-    mgmt_bad = [n["name"] for n in snap.get("nodes", []) if n.get("mgmt_ok") is False]
-    if mgmt_bad:
-        lines.append("Управление недоступно: " + ", ".join(mgmt_bad))
+    lines = [f"🩺 VesPN · {snap.get('at','?')} UTC"]
+
+    # --- (б) client path: gate → exits ---
+    lines.append("\n📡 Клиентский путь (гейт → выходы):")
+    routes = snap.get("routes", [])
+    if routes:
+        for r in routes:
+            mark = "✅" if (r.get("gate_up") and r.get("active")) else "⛔"
+            act = ", ".join(r.get("active") or []) or "—"
+            flaps = r.get("flaps_1h")
+            extra = f" · флаппинг {flaps}/ч" if (flaps or 0) >= FLAP_ALERT else ""
+            down = r.get("down") or []
+            downs = f" · не видны гейту: {', '.join(down)}" if down else ""
+            lines.append(f"{mark} {r['route']}: активен {act}{extra}{downs}")
+    else:
+        lines.append("— маршрутов нет")
+
+    # --- (а) management reachability: Hub → nodes ---
+    lines.append("\n🛠 Управляемость (Хаб → ноды):")
+    nodes = snap.get("nodes", [])
+    gates = [n for n in nodes if n.get("role") == "gate"]
+    exits = [n for n in nodes if n.get("role") == "exit"]
+    for n in gates:
+        lines.append(f"{_mgmt_mark(n)} {n['name']} — гейт, напрямую")
+    for n in exits:
+        lines.append(f"{_mgmt_mark(n)} {n['name']} — {n.get('via') or 'выход'}")
+    if not nodes:
+        lines.append("— нод нет")
+
     probs = snap.get("problems") or []
     if probs:
         lines.append("\n⚠️ Проблемы:\n" + "\n".join("• " + p for p in probs))

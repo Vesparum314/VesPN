@@ -131,6 +131,23 @@ class XUIClient:
     def client_exists(self, email: str) -> bool:
         return self.get_client(email) is not None
 
+    def get_client_traffic(self, email: str) -> tuple[int, int]:
+        """(up, down) bytes for a client, cumulative since the last counter reset.
+        Read from the fork's clients/get (obj.usedTraffic, with a fallback to up/down
+        on the client object). (0, 0) if unknown. up = client→server, down = server→client."""
+        try:
+            obj = self._get(f"/panel/api/clients/get/{email}")["obj"]
+        except XUIError:
+            return (0, 0)
+        if not obj:
+            return (0, 0)
+        ut = obj.get("usedTraffic") if isinstance(obj, dict) else None
+        src = ut if isinstance(ut, dict) else (obj.get("client", obj) if isinstance(obj, dict) else {})
+        try:
+            return (int(src.get("up", 0) or 0), int(src.get("down", 0) or 0))
+        except (TypeError, ValueError):
+            return (0, 0)
+
     def add_client(
         self,
         email: str,

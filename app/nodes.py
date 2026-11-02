@@ -114,6 +114,26 @@ def connect(node: Node, allow_direct: bool = False):
         n.close()
 
 
+def open_proxy_tunnel(node: Node, remote_port: int, remote_host: str = "127.0.0.1"):
+    """Open a PERSISTENT SSH connection to a pooled exit THROUGH its gate plus a local
+    forward to (remote_host, remote_port) on the exit. Returns (SSHNode, local_port,
+    forward). Same gate-only rule as connect() — no direct Hub→exit. The caller owns
+    all three: call forward.stop() then node.close() when done. Used by the Telegram
+    bot to reach an exit's localhost TG proxy via the gate."""
+    from .node_ssh import _LocalForward
+
+    if _exit_needs_gate(node):
+        jump = _gate_creds_for(node)
+        if jump is None:
+            raise NodeOpError(f"выход «{node.name}»: гейт не определён — туннель невозможен")
+        n = SSHNode(_creds(node), jump=jump).connect()
+    else:
+        n = SSHNode(_creds(node)).connect()
+    fwd = _LocalForward(n.transport, remote_host, remote_port)
+    port = fwd.start()
+    return n, port, fwd
+
+
 # --- diagnostics --------------------------------------------------------
 def test_node(node: Node, allow_direct: bool = False) -> dict:
     """Probe SSH, the AmneziaWG container, and the 3x-ui API. Never raises.

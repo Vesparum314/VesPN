@@ -175,6 +175,10 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
         )
         provisioning.harden_subscription(n)  # no public :2096 sub server
         provisioning.disable_fail2ban(n)      # never ban the gate/panel
+        try:
+            provisioning.install_telegram_proxy(n)  # localhost TG proxy; bot reaches it via gate
+        except Exception as e:
+            log.warning("tg-proxy install on %s skipped: %s", node.name, e)
 
     node.xui_path = info["xui_path"]
     node.xui_port = info["xui_port"]
