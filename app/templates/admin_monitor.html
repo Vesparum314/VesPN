@@ -69,6 +69,28 @@
 {% endif %}
 
 <div class="panel">
+  <div class="panel-h"><h2>История достижимости</h2></div>
+  <div class="sub" style="padding:0 16px 8px">Когда нода меняла доступность — управление (Хаб→нода) и клиентский путь (гейт→выход). Пишется при каждой проверке, только на смену состояния.</div>
+  <div class="panel-b">
+    {% set ns = namespace(any=false) %}
+    {% for node, rows in history %}
+      {% if rows %}
+        {% set ns.any = true %}
+        <div style="margin-bottom:10px">
+          <b>{{ node.name }}</b> <span class="badge {{ 'b-gate' if node.is_gate else 'b-exit' }}">{{ 'gate' if node.is_gate else 'exit' }}</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:5px">
+          {% for row in rows %}
+            <span class="badge {{ 'b-ok' if row.up else 'b-bad' }} b-dot" title="{{ row.at.strftime('%Y-%m-%d %H:%M') }} UTC">{{ 'упр' if row.kind == 'mgmt' else 'клиент' }} {{ '↑ доступен' if row.up else '↓ нет' }} · {{ row.at.strftime('%m-%d %H:%M') }}</span>
+          {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+    {% endfor %}
+    {% if not ns.any %}<span class="muted">Пока нет записей — появятся после первых проверок при смене состояния ноды.</span>{% endif %}
+  </div>
+</div>
+
+<div class="panel">
   <div class="panel-h"><h2>Telegram-бот
     {% if tg.enabled %}<span class="badge b-ok b-dot">активен</span>{% else %}<span class="badge b-warn b-dot">выключен</span>{% endif %}
   </h2></div>

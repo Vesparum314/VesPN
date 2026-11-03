@@ -39,16 +39,6 @@ ROLE_EXIT = "exit"
 ROLE_GATE = "gate"
 ROLES = (ROLE_EXIT, ROLE_GATE)
 
-# A node's reachability status (set by the admin). `ok` = normal; `blocked` =
-# fully blocked/dead (not reachable even via a gate); `gate_only` = blocked for
-# direct access but still reachable through a clean gate on high ports (so it
-# works as an exit behind a gate, just not directly).
-STATUS_OK = "ok"
-STATUS_BLOCKED = "blocked"
-STATUS_GATE_ONLY = "gate_only"
-NODE_STATUSES = (STATUS_OK, STATUS_BLOCKED, STATUS_GATE_ONLY)
-_STATUS_LABEL = {STATUS_OK: "", STATUS_BLOCKED: "Заблокирован", STATUS_GATE_ONLY: "Только через гейт"}
-
 # An exit node's sync state within its pool. `pending` = provisioned/added but
 # not yet converged to the pool's client set; `synced` = holds all current
 # clients/peers; `drifted` = a reconcile found/left a mismatch; `unreachable` =
@@ -64,6 +54,10 @@ _SYNC_LABEL = {
     SYNC_DRIFTED: "рассинхрон",
     SYNC_UNREACHABLE: "недоступен",
 }
+
+# Monitoring reachability-history kinds (see NodeStatusHistory).
+HIST_MGMT = "mgmt"      # Hub → node management reachability (Hub→gate, Hub→exit via gate)
+HIST_CLIENT = "client"  # gate → exit client path (VLESS traffic port)
 
 
 # A user's access role (distinct from a node's role above). `admin` = full control
@@ -87,6 +81,12 @@ user_groups = Table(
 route_groups = Table(
     "route_groups", Base.metadata,
     Column("route_id", ForeignKey("routes.id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
+)
+# Target groups for an announcement. Empty = shown to ALL clients (not nobody).
+announcement_groups = Table(
+    "announcement_groups", Base.metadata,
+    Column("announcement_id", ForeignKey("announcements.id", ondelete="CASCADE"), primary_key=True),
     Column("group_id", ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
 )
 
@@ -165,9 +165,6 @@ class Node(Base):
     # Role: 'exit' (runs VPN, leaves to the internet) or 'gate' (RU relay).
     role: Mapped[str] = mapped_column(String(16), default=ROLE_EXIT, server_default=ROLE_EXIT)
 
-    # Reachability status (admin-set): ok | blocked | gate_only.
-    status: Mapped[str] = mapped_column(String(16), default=STATUS_OK, server_default=STATUS_OK)
-
     # Pool membership (exit nodes only). An exit in a pool is a cryptographic
     # CLONE of its siblings (shares the pool's Reality/AWG identity); the gate
     # fails over across the pool's synced members.
@@ -215,14 +212,6 @@ class Node(Base):
         return self.role == ROLE_GATE
 
     @property
-    def status_label(self) -> str:
-        return _STATUS_LABEL.get(self.status, "")
-
-    @property
-    def is_blocked(self) -> bool:
-        return self.status == STATUS_BLOCKED
-
-    @property
     def sync_label(self) -> str:
         return _SYNC_LABEL.get(self.sync_state, self.sync_state)
 
@@ -244,7 +233,6 @@ class ExitPool(Base):
     __tablename__ = "exit_pools"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
-    status: Mapped[str] = mapped_column(String(16), default=STATUS_OK, server_default=STATUS_OK)
 
     # --- VLESS Reality identity (shared across members) ---
     vless_port: Mapped[int] = mapped_column(Integer, default=17771)
@@ -373,11 +361,8 @@ class Route(Base):
 
     @property
     def is_blocked(self) -> bool:
-        """Unusable if there is no gate/pool, the gate is blocked, or the pool has
-        no synced exit to route to."""
+        """Unusable if there is no gate/pool, or the pool has no synced exit."""
         if self.gate_node is None or self.pool is None:
-            return True
-        if self.gate_node.status == STATUS_BLOCKED:
             return True
         if not self.pool.synced_exits:
             return True
@@ -389,8 +374,6 @@ class Route(Base):
             return "нет гейта"
         if self.pool is None:
             return "нет пула выходов"
-        if self.gate_node.status == STATUS_BLOCKED:
-            return f"гейт {self.gate_node.name} заблокирован"
         if not self.pool.synced_exits:
             return "в пуле нет синхронизированных выходов"
         return ""
@@ -418,7 +401,33 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(Text, default="")
 
 
-ANNOUNCEMENT_KEY = "announcement"
+ANNOUNCEMENT_KEY = "announcement"  # legacy single-banner setting (migrated to Announcement)
+
+
+class Announcement(Base):
+    """An admin→clients message. Active ones show as a banner to every logged-in
+    client; all are kept as a journal on the admin «Уведомления» page."""
+
+    __tablename__ = "announcements"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", index=True)
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    author: Mapped["User | None"] = relationship("User", foreign_keys=[created_by])
+    # Target groups; empty = shown to every client.
+    groups: Mapped[list["Group"]] = relationship("Group", secondary=announcement_groups)
+
+    def visible_to(self, user) -> bool:
+        """A client sees this active announcement if it targets no group (everyone)
+        or shares at least one target group with the user."""
+        tg = self.groups
+        if not tg:
+            return True
+        return bool({g.id for g in tg} & set(user.group_ids))
 
 
 class Device(Base):
@@ -524,3 +533,20 @@ class TrafficStat(Base):
     @seen.setter
     def seen(self, value: dict) -> None:
         self.seen_json = json.dumps(value)
+
+
+class NodeStatusHistory(Base):
+    """Reachability transitions per node — one row per up<->down flip, so the panel
+    keeps a timeline of when a node was reachable and when not. `kind`: `mgmt`
+    (Hub→node management) or `client` (gate→exit traffic path); `up` = reachable."""
+
+    __tablename__ = "node_status_history"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[int] = mapped_column(
+        ForeignKey("nodes.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(8), index=True)
+    up: Mapped[bool] = mapped_column(Boolean)
+    at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    node: Mapped["Node"] = relationship("Node")

@@ -49,16 +49,20 @@ def _apply_delta(db: Session, device_id: int, node_id: int, cur_up: int, cur_dow
     key = str(node_id)
     prev = seen.get(key)
     if prev is None:
-        # First observation on this node: set a baseline, don't back-count history.
-        d_up = d_down = 0
+        # First observation on this node: adopt its current cumulative into the TOTAL
+        # (so "всего" reflects real usage at once) but NOT into "today" — pre-tracking
+        # history can't be attributed to the current day.
+        d_up = d_down = 0                       # today
+        d_up_total, d_down_total = cur_up, cur_down
     else:
-        d_up = cur_up - int(prev[0]) if cur_up >= int(prev[0]) else cur_up  # reset -> treat current as delta
+        d_up = cur_up - int(prev[0]) if cur_up >= int(prev[0]) else cur_up  # reset -> current is the delta
         d_down = cur_down - int(prev[1]) if cur_down >= int(prev[1]) else cur_down
+        d_up_total, d_down_total = d_up, d_down
     seen[key] = [cur_up, cur_down]
     stat.seen = seen
 
-    stat.up_total += d_up
-    stat.down_total += d_down
+    stat.up_total += d_up_total
+    stat.down_total += d_down_total
     stat.up_today += d_up
     stat.down_today += d_down
     stat.updated_at = datetime.now(timezone.utc)

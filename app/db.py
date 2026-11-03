@@ -41,6 +41,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _add_columns()
     _seed_default_group()
+    _migrate_announcement()
 
 
 def _rebuild_changed_tables() -> None:
@@ -137,3 +138,25 @@ def _seed_default_group() -> None:
                 {"r": rid, "g": gid},
             )
         conn.exec_driver_sql("INSERT INTO settings (key, value) VALUES ('grp_seed_done', '1')")
+
+
+def _migrate_announcement() -> None:
+    """One-time: move the legacy single-banner Setting('announcement') into an
+    Announcement row, then blank the setting so this runs exactly once."""
+    with engine.begin() as conn:
+        def table_exists(name: str) -> bool:
+            return conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=:n", {"n": name}
+            ).fetchone() is not None
+
+        if not (table_exists("announcements") and table_exists("settings")):
+            return
+        row = conn.exec_driver_sql("SELECT value FROM settings WHERE key='announcement'").fetchone()
+        if not row or not (row[0] or "").strip():
+            return
+        cnt = conn.exec_driver_sql("SELECT count(*) FROM announcements").fetchone()[0]
+        if cnt == 0:
+            conn.exec_driver_sql(
+                "INSERT INTO announcements (text, active) VALUES (:t, 1)", {"t": row[0].strip()}
+            )
+        conn.exec_driver_sql("UPDATE settings SET value='' WHERE key='announcement'")

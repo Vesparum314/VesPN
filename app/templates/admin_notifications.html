@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Уведомления — VesPN{% endblock %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>Уведомления</h1>
+    <div class="sub">Сообщения клиентам от админа. Активные показываются баннером всем вошедшим клиентам. Ниже — журнал всех прошлых.</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Новое уведомление</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/admin/notifications">
+      <label>Текст
+        <textarea name="text" rows="3" required placeholder="Напр.: Профилактика 05.11 с 02:00 до 04:00 МСК — возможны перебои."></textarea>
+      </label>
+      <label>Кому — пусто = всем клиентам; иначе только выбранным группам
+        <div class="chk-list">
+        {% for g in groups %}
+          <label class="check"><input type="checkbox" name="group_ids" value="{{ g.id }}"> {{ g.name }}</label>
+        {% else %}
+          <span class="muted">групп нет — будет видно всем</span>
+        {% endfor %}
+        </div>
+      </label>
+      <div class="dev-actions" style="margin-top:12px"><button class="btn btn-primary" type="submit">Опубликовать</button></div>
+      <p class="hint">Опубликованное сразу видно клиентам. Снять с показа можно в журнале — оно останется в истории.</p>
+    </form>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Журнал уведомлений</h2></div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Когда (UTC)</th><th>Автор</th><th>Кому</th><th>Текст</th><th>Статус</th><th></th></tr></thead>
+    <tbody>
+    {% for a in items %}
+      <tr>
+        <td data-label="Когда"><span class="mono">{{ a.created_at.strftime('%Y-%m-%d %H:%M') if a.created_at else '—' }}</span></td>
+        <td data-label="Автор">{{ a.author.username if a.author else '—' }}</td>
+        <td data-label="Кому">{% if a.groups %}{% for g in a.groups %}<span class="badge b-exit">{{ g.name }}</span> {% endfor %}{% else %}<span class="muted">всем</span>{% endif %}</td>
+        <td data-label="Текст">{{ a.text }}</td>
+        <td data-label="Статус">{% if a.active %}<span class="badge b-ok b-dot">показано</span>{% else %}<span class="badge b-exit">в журнале</span>{% endif %}</td>
+        <td data-label="Действия" class="full"><div class="row-actions">
+          <form method="post" action="/admin/notifications/{{ a.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Снять' if a.active else 'Показать' }}</button></form>
+          <form method="post" action="/admin/notifications/{{ a.id }}/delete" onsubmit="return confirm('Удалить уведомление из журнала?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
+        </div></td>
+      </tr>
+    {% else %}
+      <tr><td class="full muted">Уведомлений пока нет.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% endblock %}

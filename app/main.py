@@ -25,7 +25,6 @@ from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
 from .models import (
-    NODE_STATUSES,
     PROTO_AWG,
     PROTO_VLESS,
     PROTOCOLS,
@@ -36,7 +35,7 @@ from .models import (
     ROLE_OPERATOR,
     ROLES,
     USER_ROLES,
-    ANNOUNCEMENT_KEY,
+    Announcement,
     Device,
     ExitPool,
     Group,
@@ -119,24 +118,38 @@ def pop_flash(request: Request) -> list[dict]:
     return request.session.pop("_flash", [])
 
 
-def get_announcement() -> str:
-    """The global admin announcement (empty if none). Read on every render so the
-    banner shows on all pages; its own short session keeps render() db-free."""
+def active_announcements(request: Request) -> list:
+    """Active admin→client announcements this viewer should see (newest first):
+    untargeted ones (for everybody) plus ones targeting a group the viewer is in."""
     from .db import SessionLocal
 
+    try:
+        uid = request.session.get("uid")
+    except Exception:
+        uid = None
+    if not uid:
+        return []
     db = SessionLocal()
     try:
-        s = db.get(Setting, ANNOUNCEMENT_KEY)
-        return s.value if s else ""
+        user = db.get(User, uid)
+        if not user:
+            return []
+        rows = (
+            db.query(Announcement)
+            .filter_by(active=True)
+            .order_by(Announcement.created_at.desc())
+            .all()
+        )
+        return [a for a in rows if a.visible_to(user)]
     except Exception:
-        return ""
+        return []
     finally:
         db.close()
 
 
 def render(request: Request, name: str, **ctx) -> HTMLResponse:
     ctx.setdefault("flashes", pop_flash(request))
-    ctx.setdefault("announcement", get_announcement())
+    ctx.setdefault("announcements", active_announcements(request))
     # Starlette's current API wants `request` as the first positional arg.
     return templates.TemplateResponse(request, name, ctx)
 
@@ -404,13 +417,8 @@ def _require_admin(request: Request, db: Session) -> User | None:
 
 @app.get("/admin/nodes", response_class=HTMLResponse)
 def admin_nodes(request: Request, db: Session = Depends(get_db)):
-    admin = _require_staff(request, db)
-    if not admin:
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    nodes = db.query(Node).order_by(Node.id).all()
-    pools = db.query(ExitPool).order_by(ExitPool.name).all()
-    return render(request, "admin_nodes.html", user=admin, nodes=nodes, pools=pools,
-                  test_result=request.session.pop("_test", None))
+    # merged into «Парк»
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes")
@@ -455,7 +463,7 @@ def admin_add_node(
     db.add(node)
     db.commit()
     flash(request, f"Нода «{node.name}» добавлена", "success")
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes/{node_id}/pool")
@@ -476,7 +484,7 @@ def admin_set_node_pool(
         db.commit()
         pool = db.get(ExitPool, pid) if pid else None
         flash(request, f"«{node.name}» → пул {pool.name if pool else '— снят'}", "success")
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes/{node_id}/activate")
@@ -489,7 +497,7 @@ def admin_activate_node(request: Request, node_id: int, db: Session = Depends(ge
         node.is_active = True
         db.commit()
         flash(request, f"Активна нода «{node.name}»", "success")
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes/{node_id}/test")
@@ -503,7 +511,7 @@ def admin_test_node(
         # `direct` is the explicit «connect directly» override: bypass the gate for
         # a one-off reachability probe (Hub→exit directly). Normal checks go via gate.
         request.session["_test"] = {"node": node.name, **node_ops.test_node(node, allow_direct=direct)}
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes/{node_id}/provision")
@@ -526,7 +534,7 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
         except Exception as e:
             log.exception("provision failed")
             flash(request, f"Провижининг не удался: {e}", "error")
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/nodes/{node_id}/delete")
@@ -538,35 +546,29 @@ def admin_delete_node(request: Request, node_id: int, db: Session = Depends(get_
         db.delete(node)
         db.commit()
         flash(request, "Нода удалена", "success")
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
-@app.post("/admin/nodes/{node_id}/status")
-def admin_set_node_status(
-    request: Request, node_id: int, status: str = Form("ok"), db: Session = Depends(get_db)
+@app.post("/admin/nodes/{node_id}/priority")
+def admin_set_node_priority(
+    request: Request, node_id: int, priority: int = Form(100), db: Session = Depends(get_db)
 ):
+    """Failover priority of an exit within its pool (lower = preferred)."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
-    if node and status in NODE_STATUSES:
-        node.status = status
+    if node:
+        node.priority = max(0, int(priority))
         db.commit()
-        flash(request, f"Статус «{node.name}»: {node.status_label or 'ok'}", "success")
-    return RedirectResponse("/admin/nodes", status_code=HTTP_303_SEE_OTHER)
+        flash(request, f"Приоритет «{node.name}»: {node.priority}", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 # --- admin: routes ------------------------------------------------------
 @app.get("/admin/routes", response_class=HTMLResponse)
 def admin_routes(request: Request, db: Session = Depends(get_db)):
-    admin = _require_staff(request, db)
-    if not admin:
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    routes = db.query(Route).order_by(Route.name).all()
-    pools = db.query(ExitPool).order_by(ExitPool.name).all()
-    gates = db.query(Node).filter_by(role=ROLE_GATE).order_by(Node.name).all()
-    groups = db.query(Group).order_by(Group.name).all()
-    return render(request, "admin_routes.html", user=admin, routes=routes, pools=pools,
-                  gates=gates, groups=groups)
+    # merged into «Парк»
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/routes")
@@ -594,7 +596,7 @@ def admin_add_route(
         db.add(Route(name=name, gate_id=gate_node.id, pool_id=pool.id))
         db.commit()
         flash(request, f"Маршрут «{name}» создан", "success")
-    return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/routes/{route_id}/toggle")
@@ -606,7 +608,7 @@ def admin_toggle_route(request: Request, route_id: int, db: Session = Depends(ge
         route.enabled = not route.enabled
         db.commit()
         flash(request, f"Маршрут «{route.name}» {'включён' if route.enabled else 'выключен'}", "success")
-    return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/routes/{route_id}/groups")
@@ -623,7 +625,7 @@ def admin_set_route_groups(
         route.groups = db.query(Group).filter(Group.id.in_(group_ids)).all() if group_ids else []
         db.commit()
         flash(request, f"Доступ к «{route.name}»: групп — {len(route.groups)}", "success")
-    return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/routes/{route_id}/delete")
@@ -635,7 +637,7 @@ def admin_delete_route(request: Request, route_id: int, db: Session = Depends(ge
         db.delete(route)
         db.commit()
         flash(request, "Маршрут удалён", "success")
-    return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/routes/{route_id}/provision_relay")
@@ -653,7 +655,7 @@ def admin_provision_relay(request: Request, route_id: int, db: Session = Depends
             flash(request, f"Релей не поднялся: {e}", "error")
     elif route:
         flash(request, "У маршрута должны быть и gate, и пул выходов", "error")
-    return RedirectResponse("/admin/routes", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 # --- admin: groups ------------------------------------------------------
@@ -712,14 +714,57 @@ def admin_delete_group(request: Request, group_id: int, db: Session = Depends(ge
     return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
 
 
-# --- admin: pools -------------------------------------------------------
-@app.get("/admin/pools", response_class=HTMLResponse)
-def admin_pools(request: Request, db: Session = Depends(get_db)):
+# --- admin: park (gates + exits + routes, merged into one page) ---------
+@app.get("/admin/park", response_class=HTMLResponse)
+def admin_park(request: Request, db: Session = Depends(get_db)):
     admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    pools = db.query(ExitPool).order_by(ExitPool.name).all()
-    return render(request, "admin_pools.html", user=admin, pools=pools)
+    routes = db.query(Route).order_by(Route.name).all()
+    all_nodes = db.query(Node).order_by(Node.id).all()
+    route_gate_ids = {r.gate_id for r in routes if r.gate_id}
+    orphans = [
+        n for n in all_nodes
+        if (n.role == ROLE_EXIT and n.pool_id is None)
+        or (n.role == ROLE_GATE and n.id not in route_gate_ids)
+    ]
+    free_gates = [n for n in all_nodes if n.role == ROLE_GATE and n.id not in route_gate_ids]
+    groups = db.query(Group).order_by(Group.name).all()
+    return render(request, "admin_park.html", user=admin, routes=routes, orphans=orphans,
+                  free_gates=free_gates, groups=groups,
+                  test_result=request.session.pop("_test", None))
+
+
+@app.post("/admin/park/route")
+def admin_park_create_route(
+    request: Request, name: str = Form(...), gate_id: str = Form(""),
+    vless_port: int = Form(17771), awg_port: int = Form(17772),
+    db: Session = Depends(get_db),
+):
+    """Create a route = gate + a fresh pool (its shared identity). Exits are added after."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    name = name.strip()
+    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if not name:
+        flash(request, "Укажите имя маршрута", "error")
+    elif db.query(Route).filter_by(name=name).first() or db.query(ExitPool).filter_by(name=name).first():
+        flash(request, "Имя уже занято", "error")
+    elif not gate or gate.role != ROLE_GATE:
+        flash(request, "Выберите gate-сервер", "error")
+    else:
+        pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
+        db.add(Route(name=name, gate_id=gate.id, pool_id=pool.id))
+        db.commit()
+        flash(request, f"Маршрут «{name}» создан. Добавьте выходы и «Поднимите релей».", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: pools -------------------------------------------------------
+@app.get("/admin/pools", response_class=HTMLResponse)
+def admin_pools(request: Request, db: Session = Depends(get_db)):
+    # merged into «Парк»
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/pools")
@@ -740,7 +785,7 @@ def admin_add_pool(
     else:
         pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
         flash(request, f"Пул «{pool.name}» создан (идентичность сгенерирована)", "success")
-    return RedirectResponse("/admin/pools", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/pools/{pool_id}/reconcile")
@@ -756,7 +801,7 @@ def admin_reconcile_pool(request: Request, pool_id: int, db: Session = Depends(g
         except Exception as e:
             log.exception("reconcile failed")
             flash(request, f"Синхронизация не удалась: {e}", "error")
-    return RedirectResponse("/admin/pools", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/pools/{pool_id}/delete")
@@ -779,7 +824,7 @@ def admin_delete_pool(request: Request, pool_id: int, db: Session = Depends(get_
         db.delete(pool)
         db.commit()
         flash(request, "Пул удалён", "success")
-    return RedirectResponse("/admin/pools", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 # --- admin: monitoring --------------------------------------------------
@@ -788,8 +833,10 @@ def admin_monitor(request: Request, db: Session = Depends(get_db)):
     admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    nodes_all = db.query(Node).order_by(Node.id).all()
+    history = [(n, monitor.node_history(db, n.id, limit=12)) for n in nodes_all]
     return render(request, "admin_monitor.html", user=admin,
-                  snap=monitor.get_state(db), tg=appconfig.tg_config(db))
+                  snap=monitor.get_state(db), tg=appconfig.tg_config(db), history=history)
 
 
 @app.post("/admin/monitor/check")
@@ -867,19 +914,62 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
     return render(request, "admin_users.html", user=admin, users=users)
 
 
-@app.post("/admin/announcement")
-def admin_set_announcement(request: Request, text: str = Form(""), db: Session = Depends(get_db)):
-    if not _require_staff(request, db):
+# --- admin: notifications (admin -> clients) ----------------------------
+@app.get("/admin/notifications", response_class=HTMLResponse)
+def admin_notifications(request: Request, db: Session = Depends(get_db)):
+    admin = _require_staff(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    items = db.query(Announcement).order_by(Announcement.created_at.desc()).all()
+    groups = db.query(Group).order_by(Group.name).all()
+    return render(request, "admin_notifications.html", user=admin, items=items, groups=groups)
+
+
+@app.post("/admin/notifications")
+def admin_add_notification(
+    request: Request, text: str = Form(""),
+    group_ids: list[int] = Form(default=[]),
+    db: Session = Depends(get_db),
+):
+    staff = _require_staff(request, db)
+    if not staff:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     text = text.strip()
-    s = db.get(Setting, ANNOUNCEMENT_KEY)
-    if s is None:
-        db.add(Setting(key=ANNOUNCEMENT_KEY, value=text))
+    if not text:
+        flash(request, "Пустое уведомление", "error")
     else:
-        s.value = text
-    db.commit()
-    flash(request, "Объявление обновлено" if text else "Объявление убрано", "success")
-    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+        a = Announcement(text=text, active=True, created_by=staff.id)
+        if group_ids:
+            a.groups = db.query(Group).filter(Group.id.in_(group_ids)).all()
+        db.add(a)
+        db.commit()
+        target = "всем клиентам" if not group_ids else f"группам: {', '.join(g.name for g in a.groups)}"
+        flash(request, f"Уведомление опубликовано — {target}", "success")
+    return RedirectResponse("/admin/notifications", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/notifications/{item_id}/toggle")
+def admin_toggle_notification(request: Request, item_id: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    a = db.get(Announcement, item_id)
+    if a:
+        a.active = not a.active
+        db.commit()
+        flash(request, "Показано клиентам" if a.active else "Снято с показа (осталось в журнале)", "success")
+    return RedirectResponse("/admin/notifications", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/notifications/{item_id}/delete")
+def admin_delete_notification(request: Request, item_id: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    a = db.get(Announcement, item_id)
+    if a:
+        db.delete(a)
+        db.commit()
+        flash(request, "Уведомление удалено из журнала", "success")
+    return RedirectResponse("/admin/notifications", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/users")

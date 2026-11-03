@@ -24,7 +24,17 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from .models import ExitPool, Node, ROLE_EXIT, ROLE_GATE, Route, Setting
+from .models import (
+    ExitPool,
+    HIST_CLIENT,
+    HIST_MGMT,
+    Node,
+    NodeStatusHistory,
+    ROLE_EXIT,
+    ROLE_GATE,
+    Route,
+    Setting,
+)
 from .nodes import connect
 
 MONITOR_KEY = "monitor_state"
@@ -120,6 +130,9 @@ def run_checks(db: Session) -> dict:
             for m in r.pool.members:
                 gate_for_exit.setdefault(m.id, r.gate_node)
 
+    mgmt_state: dict[int, bool] = {}    # node_id -> Hub→node management reachable
+    client_state: dict[int, bool] = {}  # exit node_id -> gate→exit (VLESS) reachable
+
     with ExitStack() as stack:
         gsess: dict[int, object | None] = {}  # gate.id -> open session (reused) or None
 
@@ -134,9 +147,11 @@ def run_checks(db: Session) -> dict:
         # --- view (а): management reachability -----------------------------
         for n in all_nodes:
             if n.role == ROLE_GATE:
+                g_ok = gate_g(n) is not None
+                mgmt_state[n.id] = g_ok
                 snap["nodes"].append({
                     "name": n.name, "role": "gate",
-                    "mgmt_ok": gate_g(n) is not None, "via": "Хаб→гейт напрямую",
+                    "mgmt_ok": g_ok, "via": "Хаб→гейт напрямую",
                 })
             else:
                 gate = gate_for_exit.get(n.id)
@@ -152,11 +167,12 @@ def run_checks(db: Session) -> dict:
                         )
                 else:
                     g = gate_g(gate)
-                    mgmt = (g is not None) and _probe_tcp(g, n.ssh_host, n.ssh_port or 22)
+                    mgmt = bool((g is not None) and _probe_tcp(g, n.ssh_host, n.ssh_port or 22))
+                    mgmt_state[n.id] = mgmt
                     snap["nodes"].append({
                         "name": n.name, "role": "exit",
                         "pool": _pool_name(n), "sync": n.sync_state,
-                        "gate": gate.name, "mgmt_ok": bool(mgmt), "via": f"через {gate.name}",
+                        "gate": gate.name, "mgmt_ok": mgmt, "via": f"через {gate.name}",
                     })
 
         # --- view (б): client path (gate → pool exits on traffic ports) ----
@@ -172,6 +188,7 @@ def run_checks(db: Session) -> dict:
                 if g is not None:
                     vless_ok: bool | None = _probe_tcp(g, m.public_host, pool.vless_port)
                     awg = _probe_udp(g, m.public_host, pool.awg_port)
+                    client_state[m.id] = bool(vless_ok)
                 else:
                     vless_ok, awg = None, None
                 exits.append({
@@ -206,6 +223,9 @@ def run_checks(db: Session) -> dict:
                     f"маршрут «{r.name}»: флаппинг выхода ({view['flaps_1h']} переключений/час)"
                 )
 
+    _record_transitions(db, mgmt_state, HIST_MGMT)
+    _record_transitions(db, client_state, HIST_CLIENT)
+
     s = db.get(Setting, MONITOR_KEY)
     if s is None:
         db.add(Setting(key=MONITOR_KEY, value=json.dumps(snap)))
@@ -213,6 +233,31 @@ def run_checks(db: Session) -> dict:
         s.value = json.dumps(snap)
     db.commit()
     return snap
+
+
+def _record_transitions(db: Session, states: dict[int, bool], kind: str) -> None:
+    """Append a history row only when a node's reachability FLIPPED since the last
+    recorded value for this kind (keeps the log compact — transitions, not samples)."""
+    for nid, up in states.items():
+        last = (
+            db.query(NodeStatusHistory)
+            .filter_by(node_id=nid, kind=kind)
+            .order_by(NodeStatusHistory.at.desc(), NodeStatusHistory.id.desc())
+            .first()
+        )
+        if last is None or bool(last.up) != bool(up):
+            db.add(NodeStatusHistory(node_id=nid, kind=kind, up=bool(up)))
+
+
+def node_history(db: Session, node_id: int, limit: int = 20) -> list[NodeStatusHistory]:
+    """Recent reachability transitions for a node (newest first), for the UI."""
+    return (
+        db.query(NodeStatusHistory)
+        .filter_by(node_id=node_id)
+        .order_by(NodeStatusHistory.at.desc(), NodeStatusHistory.id.desc())
+        .limit(limit)
+        .all()
+    )
 
 
 def get_state(db: Session) -> dict | None:
