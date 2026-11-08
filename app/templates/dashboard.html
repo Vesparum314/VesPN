@@ -9,7 +9,7 @@
 </div>
 
 {% if not service_ready %}
-  <div class="flash flash-info">Сервис ещё настраивается — создание конфигов появится чуть позже.</div>
+  <div class="flash flash-info">Вам пока не доступен ни один маршрут — попросите администратора выдать доступ (добавить вас в группу с маршрутом).</div>
 {% endif %}
 
 {% if devices %}
@@ -20,6 +20,7 @@
       <span class="badge b-{{ d.protocol }} b-dot">{{ 'VLESS' if d.protocol == 'vless' else 'AmneziaWG' }}</span>
       <b>{{ d.name }}</b>
     </div>
+    <small class="muted">Маршрут: {{ d.route.name if d.route else '— не выбран' }}</small>
     <div class="dev-actions">
       <a class="btn btn-primary btn-sm" href="/devices/{{ d.id }}">Получить конфиг</a>
       <form method="post" action="/devices/{{ d.id }}/delete" onsubmit="return confirm('Удалить устройство «{{ d.name }}»?')">
@@ -43,6 +44,13 @@
         <select name="protocol">
           <option value="vless">VLESS</option>
           <option value="awg">AmneziaWG</option>
+        </select>
+      </label>
+      <label>Маршрут
+        <select name="route_id" required>
+          {% for r in routes if not r.is_blocked %}
+            <option value="{{ r.id }}">{{ r.name }}</option>
+          {% endfor %}
         </select>
       </label>
       <button class="btn btn-primary" type="submit">Добавить</button>

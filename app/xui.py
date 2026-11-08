@@ -131,6 +131,22 @@ class XUIClient:
     def client_exists(self, email: str) -> bool:
         return self.get_client(email) is not None
 
+    def get_client_traffic(self, email: str) -> tuple[int, int]:
+        """(up, down) bytes for a client, cumulative since the last counter reset.
+        The fork exposes split up/down at clients/traffic/<email> (obj.up / obj.down);
+        `clients/get` only carries a combined `usedTraffic` int. (0, 0) if unknown.
+        up = client→server, down = server→client."""
+        try:
+            obj = self._get(f"/panel/api/clients/traffic/{email}")["obj"]
+        except Exception:
+            return (0, 0)
+        if not isinstance(obj, dict):
+            return (0, 0)
+        try:
+            return (int(obj.get("up", 0) or 0), int(obj.get("down", 0) or 0))
+        except (TypeError, ValueError):
+            return (0, 0)
+
     def add_client(
         self,
         email: str,

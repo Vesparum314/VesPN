@@ -502,13 +502,17 @@ def push_gate_members(node: SSHNode, exits, tcp_ports, udp_ports, probe_port=Non
     return members
 
 
-def install_telegram_proxy(node: SSHNode, hostname: str, upstream: str = "https://api.telegram.org",
+TG_PROXY_PORT = 8666  # localhost-only Telegram reverse-proxy port on each exit
+
+
+def install_telegram_proxy(node: SSHNode, port: int = TG_PROXY_PORT,
+                           upstream: str = "https://api.telegram.org",
                            container: str = "vespn-tgproxy") -> dict:
-    """Run a Caddy reverse proxy (official docker image) on a node so the RU-based
-    Hub can reach Telegram through it. `hostname` is a public DNS name pointing at
-    this node (e.g. a DuckDNS subdomain) — Caddy auto-obtains a Let's Encrypt cert
-    for it and forwards to api.telegram.org. Needs :80 + :443 free on the node.
-    The bot then uses https://<hostname> as its API base."""
+    """Run a Caddy reverse-proxy on the exit bound to 127.0.0.1:<port> → Telegram.
+    The panel reaches it ONLY over the gate SSH tunnel (Hub→gate→exit), so there is
+    no public endpoint, no DNS and no TLS cert to manage — SSH already secures the
+    hop, and Caddy originates TLS to api.telegram.org. This is what lets the RU-based
+    Hub reach Telegram through ANY exit (bot picks one by priority). Idempotent."""
     install_docker(node)
     rc, out, err = node.run("docker pull caddy:2", timeout=600)
     if rc != 0:
@@ -516,8 +520,8 @@ def install_telegram_proxy(node: SSHNode, hostname: str, upstream: str = "https:
     node.run(f"docker rm -f {shlex.quote(container)} 2>/dev/null; true", timeout=30)
     run_cmd = (
         f"docker run -d --name {shlex.quote(container)} --restart always "
-        f"-p 80:80 -p 443:443 -v vespn_caddy_data:/data -v vespn_caddy_cfg:/config "
-        f"caddy:2 caddy reverse-proxy --from {shlex.quote(hostname)} "
+        f"-p 127.0.0.1:{int(port)}:{int(port)} "
+        f"caddy:2 caddy reverse-proxy --from http://:{int(port)} "
         f"--to {shlex.quote(upstream)} --change-host-header"
     )
     rc, out, err = node.run(run_cmd, timeout=120)
@@ -525,7 +529,7 @@ def install_telegram_proxy(node: SSHNode, hostname: str, upstream: str = "https:
         raise ProvisionError(f"docker run (tgproxy) failed:\n{(err or out)[-500:]}")
     node.run("sleep 3", timeout=10)
     _rc, st, _ = node.run(f"docker ps --filter name={shlex.quote(container)} --format '{{{{.Status}}}}'", timeout=15)
-    return {"container": container, "hostname": hostname, "status": st.strip()}
+    return {"container": container, "port": int(port), "status": st.strip()}
 
 
 def install_gate_relay(node: SSHNode, exits, tcp_ports, udp_ports, probe_port=None, interval=5) -> dict:

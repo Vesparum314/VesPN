@@ -4,7 +4,7 @@
 <div class="head">
   <div>
     <h1>Мониторинг</h1>
-    <div class="sub">Доступность выходов <b>с их гейтов</b> (то, что реально важно клиентам) и всех серверов <b>с Hub</b> (управление). Проверка раз в час + по кнопке.</div>
+    <div class="sub">Клиентский путь — доступность выходов <b>с их гейтов</b> (важно клиентам) и управляемость нод <b>с Hub</b> (до гейтов напрямую, до выходов через гейт). Проверка раз в час + по кнопке.</div>
   </div>
   <form method="post" action="/admin/monitor/check"><button class="btn btn-primary">Проверить сейчас</button></form>
 </div>
@@ -21,19 +21,23 @@
   {% endif %}
 
   <div class="panel">
-    <div class="panel-h"><h2>Маршруты · выходы с гейтов</h2></div>
+    <div class="panel-h"><h2>Клиентский путь · гейт → выходы</h2></div>
+    <div class="sub" style="padding:0 16px 8px">Достижимость выходов <b>с их гейта</b> по портам трафика (VLESS/AWG) + живое состояние релей-демона. Это то, что реально важно клиентам.</div>
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Маршрут</th><th>Гейт / демон</th><th>Активный выход</th><th>Пул (виден гейту)</th><th>Флаппинг/ч</th></tr></thead>
+      <thead><tr><th>Маршрут</th><th>Гейт / демон</th><th>Активный</th><th>Выходы пула (гейт → порт)</th><th>Флаппинг/ч</th></tr></thead>
       <tbody>
       {% for r in snap.routes %}
         <tr>
-          <td data-label="Маршрут"><span class="cell-name">{{ r.route }}</span>{% if r.default %} <span class="badge b-ok">основной</span>{% endif %}</td>
-          <td data-label="Гейт">{{ r.gate }} {% if r.gate_up %}<span class="badge b-ok b-dot">демон ok</span>{% else %}<span class="badge b-bad b-dot">недоступен</span>{% endif %}</td>
+          <td data-label="Маршрут"><span class="cell-name">{{ r.route }}</span></td>
+          <td data-label="Гейт / демон">{{ r.gate }} {% if r.gate_up %}<span class="badge b-ok b-dot">демон ok</span>{% elif r.daemon %}<span class="badge b-bad b-dot">{{ r.daemon }}</span>{% else %}<span class="badge b-bad b-dot">недоступен</span>{% endif %}</td>
           <td data-label="Активный">{% if r.active %}<span class="badge b-ok">{{ r.active|join(', ') }}</span>{% else %}<span class="badge b-bad">НЕТ</span>{% endif %}</td>
-          <td data-label="Пул">
-            {% for e in r.pool_exits %}
-              {% if e in r.healthy %}<span class="badge b-ok">{{ e }}</span>{% else %}<span class="badge b-bad" title="не виден гейту">{{ e }}</span>{% endif %}
-            {% endfor %}
+          <td data-label="Выходы пула">
+            {% for e in r.exits %}
+              <div style="margin-bottom:4px">
+                {% if e.vless_ok %}<span class="badge b-ok b-dot">{{ e.name }}</span>{% elif e.vless_ok is none %}<span class="badge b-warn" title="гейт недоступен">{{ e.name }}</span>{% else %}<span class="badge b-bad b-dot" title="гейт не достаёт по VLESS-порту">{{ e.name }}</span>{% endif %}
+                <small class="muted">VLESS :{{ e.vless_port }} {{ '✓' if e.vless_ok else ('—' if e.vless_ok is none else '✗') }} · AWG :{{ e.awg_port }} {{ {'OPEN':'✓','DOWN':'✗','NA':'n/a'}.get(e.awg, '—') }}</small>
+              </div>
+            {% else %}<span class="muted">в пуле нет выходов</span>{% endfor %}
           </td>
           <td data-label="Флаппинг">{% if (r.flaps_1h or 0) >= 4 %}<span class="badge b-warn b-dot">{{ r.flaps_1h }}</span>{% else %}{{ r.flaps_1h if r.flaps_1h is not none else '—' }}{% endif %}</td>
         </tr>
@@ -45,19 +49,18 @@
   </div>
 
   <div class="panel">
-    <div class="panel-h"><h2>Серверы · доступность с Hub</h2></div>
-    <div class="sub" style="padding:0 16px 8px">Это управляющий канал. На клиентов он не влияет (их трафик идёт через гейт), но полезно видеть здоровье нод.</div>
+    <div class="panel-h"><h2>Управляемость · Хаб → ноды</h2></div>
+    <div class="sub" style="padding:0 16px 8px">Может ли панель управлять нодой своим реальным путём: до гейтов — напрямую, до выходов — через их гейт. На клиентов не влияет.</div>
     <div class="tbl-wrap"><table>
-      <thead><tr><th>Сервер</th><th>Роль / пул</th><th>SSH</th><th>Сервис :{{ snap.nodes[0].service_port if snap.nodes }}</th><th>Синхр.</th><th>Задержка</th></tr></thead>
+      <thead><tr><th>Сервер</th><th>Роль / пул</th><th>Управление</th><th>Путь</th><th>Синхр.</th></tr></thead>
       <tbody>
       {% for n in snap.nodes %}
         <tr>
           <td data-label="Сервер"><span class="cell-name">{{ n.name }}</span></td>
           <td data-label="Роль">{{ n.role }}{% if n.pool %} · {{ n.pool }}{% endif %}</td>
-          <td data-label="SSH">{% if n.hub_ssh %}<span class="badge b-ok b-dot">ok</span>{% else %}<span class="badge b-bad b-dot">нет</span>{% endif %}</td>
-          <td data-label="Сервис">{% if n.hub_service %}<span class="badge b-ok b-dot">ok</span>{% else %}<span class="badge b-bad b-dot">нет</span>{% endif %} <span class="muted">:{{ n.service_port }}</span></td>
+          <td data-label="Управление">{% if n.mgmt_ok %}<span class="badge b-ok b-dot">ok</span>{% elif n.mgmt_ok is none %}<span class="badge b-warn b-dot">нет гейта</span>{% else %}<span class="badge b-bad b-dot">нет</span>{% endif %}</td>
+          <td data-label="Путь"><span class="muted">{{ n.via }}</span></td>
           <td data-label="Синхр.">{% if n.sync == 'synced' %}<span class="badge b-ok">синхрон</span>{% elif n.sync == 'unreachable' %}<span class="badge b-bad">недоступен</span>{% elif n.sync %}<span class="badge b-warn">{{ n.sync }}</span>{% else %}—{% endif %}</td>
-          <td data-label="Задержка">{{ (n.latency_ms ~ ' мс') if n.latency_ms is not none else '—' }}</td>
         </tr>
       {% endfor %}
       </tbody>
@@ -66,12 +69,34 @@
 {% endif %}
 
 <div class="panel">
+  <div class="panel-h"><h2>История достижимости</h2></div>
+  <div class="sub" style="padding:0 16px 8px">Когда нода меняла доступность — управление (Хаб→нода) и клиентский путь (гейт→выход). Пишется при каждой проверке, только на смену состояния.</div>
+  <div class="panel-b">
+    {% set ns = namespace(any=false) %}
+    {% for node, rows in history %}
+      {% if rows %}
+        {% set ns.any = true %}
+        <div style="margin-bottom:10px">
+          <b>{{ node.name }}</b> <span class="badge {{ 'b-gate' if node.is_gate else 'b-exit' }}">{{ 'gate' if node.is_gate else 'exit' }}</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:5px">
+          {% for row in rows %}
+            <span class="badge {{ 'b-ok' if row.up else 'b-bad' }} b-dot" title="{{ row.at.strftime('%Y-%m-%d %H:%M') }} UTC">{{ 'упр' if row.kind == 'mgmt' else 'клиент' }} {{ '↑ доступен' if row.up else '↓ нет' }} · {{ row.at.strftime('%m-%d %H:%M') }}</span>
+          {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+    {% endfor %}
+    {% if not ns.any %}<span class="muted">Пока нет записей — появятся после первых проверок при смене состояния ноды.</span>{% endif %}
+  </div>
+</div>
+
+<div class="panel">
   <div class="panel-h"><h2>Telegram-бот
     {% if tg.enabled %}<span class="badge b-ok b-dot">активен</span>{% else %}<span class="badge b-warn b-dot">выключен</span>{% endif %}
   </h2></div>
   <div class="panel-b">
     <p class="hint">Бот присылает ежедневный бэкап+сводку, алерты при проблемах и отвечает на <span class="mono">/check /status /backup</span>. Создайте бота у <span class="mono">@BotFather</span>, свой chat id узнайте у <span class="mono">@userinfobot</span>.</p>
-    <p class="hint">⚠️ Telegram API недоступен из РФ (Hub в Москве). Нужен прокси в поле «API-прокси» — например Cloudflare Worker, который форвардит на <span class="mono">api.telegram.org</span>. С дефолтным адресом бот работать не будет.</p>
+    <p class="hint">⚠️ Telegram API недоступен из РФ (Hub в Москве) — нужен прокси в поле «API-прокси». Важно: прокси <b>не должен быть выходом, к которому Хаб ходит напрямую</b> — прямых Хаб→выход в системе быть не должно. Надёжный вариант — реверс-прокси Caddy на зарубежной ноде за поддоменом DuckDNS, пущенный <b>через гейт</b> (маршрутизация прокси через гейт — в планах, Этап&nbsp;3). С дефолтным адресом бот работать не будет.</p>
     <form method="post" action="/admin/monitor/settings">
       <div class="form-grid">
         <fieldset>

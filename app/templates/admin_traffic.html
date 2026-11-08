@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Трафик — VesPN{% endblock %}
+{% block content %}
+<div class="head">
+  <div>
+    <h1>Трафик</h1>
+    <div class="sub">Сколько конфигов у каждого пользователя и трафик по каждому (за день / всего). Сбор — периодически <b>через гейт</b> (не напрямую Хаб→выход).
+      {% if updated %} По состоянию на <span class="mono">{{ updated.strftime('%Y-%m-%d %H:%M') }}</span> UTC.{% else %} Сбор ещё не выполнялся.{% endif %}</div>
+  </div>
+  <form method="post" action="/admin/traffic/collect" onsubmit="return confirm('Собрать трафик со всех выходов сейчас? Может занять до минуты.')"><button class="btn btn-primary">Собрать сейчас</button></form>
+</div>
+
+{% for u in users %}
+  <div class="panel">
+    <div class="panel-h"><h2>{{ u.username }}
+      <span class="badge {{ 'b-gate' if u.role=='admin' else ('b-warn' if u.role=='operator' else 'b-exit') }}">{{ u.role_label }}</span>
+      <span class="muted">· конфигов: {{ u.devices|length }}</span>
+    </h2></div>
+    {% if u.devices %}
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>Конфиг</th><th>Маршрут</th><th>За день (↑ / ↓)</th><th>Всего (↑ / ↓)</th></tr></thead>
+      <tbody>
+      {% for d in u.devices %}
+        {% set s = stats.get(d.id) %}
+        <tr>
+          <td data-label="Конфиг"><span class="badge b-{{ d.protocol }} b-dot">{{ 'VLESS' if d.protocol=='vless' else 'AWG' }}</span> {{ d.name }}</td>
+          <td data-label="Маршрут">{{ d.route.name if d.route else '—' }}</td>
+          <td data-label="За день">{% if s %}{{ s.up_today|hbytes }} / {{ s.down_today|hbytes }}{% else %}<span class="muted">—</span>{% endif %}</td>
+          <td data-label="Всего">{% if s %}{{ s.up_total|hbytes }} / {{ s.down_total|hbytes }}{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% else %}
+    <div class="panel-b"><span class="muted">Нет конфигов.</span></div>
+    {% endif %}
+  </div>
+{% else %}
+  <div class="panel"><div class="panel-b"><span class="muted">Пользователей нет.</span></div></div>
+{% endfor %}
+{% endblock %}

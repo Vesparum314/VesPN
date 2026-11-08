@@ -4,32 +4,31 @@
 <div class="head">
   <div>
     <h1>Пользователи</h1>
-    <div class="sub">Логины для друзей и родни. Новым выдаётся временный пароль — они меняют его при первом входе.</div>
-  </div>
-</div>
-
-<div class="panel">
-  <div class="panel-h"><h2>Объявление для всех</h2></div>
-  <div class="panel-b">
-    <form method="post" action="/admin/announcement">
-      <label>Текст плашки (виден всем вошедшим на всех страницах; закрыть её нельзя)
-        <textarea name="text" rows="3" placeholder="Напр.: Профилактика 30.10 с 02:00 до 04:00 МСК — возможны перебои.">{{ announcement }}</textarea>
-      </label>
-      <div class="dev-actions" style="margin-top:12px">
-        <button class="btn btn-primary" type="submit">Сохранить</button>
-      </div>
-      <p class="hint">Пустое поле + «Сохранить» — убрать плашку.</p>
-    </form>
+    <div class="sub">Учётки и роли. <b>Админ</b> — всё, включая роли людей. <b>Оператор</b> — то же, кроме управления ролями. <b>Клиент</b> — пользуется VPN. Роли меняет только админ.</div>
   </div>
 </div>
 
 <div class="panel"><div class="tbl-wrap"><table>
-  <thead><tr><th>Логин</th><th>Роль</th><th>Устройств</th><th>Пароль</th><th></th></tr></thead>
+  <thead><tr><th>Логин</th><th>Роль</th><th>Кем добавлен</th><th>Группы</th><th>Устройств</th><th>Пароль</th><th></th></tr></thead>
   <tbody>
   {% for u in users %}
     <tr>
       <td data-label="Логин"><b>{{ u.username }}</b></td>
-      <td data-label="Роль"><span class="badge {{ 'b-gate' if u.is_admin else 'b-exit' }}">{{ 'админ' if u.is_admin else 'клиент' }}</span></td>
+      <td data-label="Роль">
+        <span class="badge {{ 'b-gate' if u.role=='admin' else ('b-warn' if u.role=='operator' else 'b-exit') }}">{{ u.role_label }}</span>
+        {% if user.is_admin %}
+        <form method="post" action="/admin/users/{{ u.id }}/role" class="status-form">
+          <select name="role">
+            <option value="client" {{ 'selected' if u.role=='client' }}>клиент</option>
+            <option value="operator" {{ 'selected' if u.role=='operator' }}>оператор</option>
+            <option value="admin" {{ 'selected' if u.role=='admin' }}>админ</option>
+          </select>
+          <button class="btn btn-ghost btn-sm">Сменить</button>
+        </form>
+        {% endif %}
+      </td>
+      <td data-label="Кем добавлен">{% if u.creator %}{{ u.creator.username }} <span class="muted">({{ u.creator.role_label }})</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td data-label="Группы">{% for g in u.groups %}<span class="badge b-exit">{{ g.name }}</span> {% else %}<span class="muted">—</span>{% endfor %}</td>
       <td data-label="Устройств">{{ u.devices | length }}</td>
       <td data-label="Пароль">{% if u.must_change_password %}<span class="badge b-warn">временный</span>{% else %}задан{% endif %}</td>
       <td data-label="Действия" class="full"><div class="row-actions">
@@ -47,10 +46,19 @@
   <div class="panel-b">
     <form method="post" action="/admin/users" class="form-row">
       <label style="flex:2">Логин <input name="username" required placeholder="имя друга"></label>
-      <label class="check"><input type="checkbox" name="is_admin" value="1"> админ</label>
+      <label>Роль
+        <select name="role">
+          <option value="client">клиент</option>
+          {% if user.is_admin %}
+          <option value="operator">оператор</option>
+          <option value="admin">админ</option>
+          {% endif %}
+        </select>
+      </label>
       <button class="btn btn-primary" type="submit">Создать</button>
     </form>
-    <p class="hint">Пароль по умолчанию — <code>change-me-123</code>, пользователь сменит его при первом входе.</p>
+    <p class="hint">Пароль по умолчанию — <code>change-me-123</code>, пользователь сменит его при первом входе.
+      {% if not user.is_admin %}Оператор может заводить только клиентов.{% endif %}</p>
   </div>
 </div>
 {% endblock %}

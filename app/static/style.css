@@ -56,7 +56,9 @@ nav::-webkit-scrollbar{display:none}
 .tab .cnt{font-size:11px;background:var(--panel-3);color:var(--muted);border-radius:999px;padding:1px 7px;font-weight:600}
 .bar-right{display:flex;align-items:center;gap:8px}
 .chip{display:inline-flex;align-items:center;gap:7px;background:var(--panel-2);border:1px solid var(--border);
-  border-radius:999px;padding:5px 11px 5px 8px;font-size:13px;font-weight:500}
+  border-radius:999px;padding:5px 11px 5px 8px;font-size:13px;font-weight:500;color:var(--fg);text-decoration:none}
+a.chip:hover{border-color:var(--border-strong)}
+a.chip[aria-current="true"]{border-color:var(--accent)}
 .chip .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
 .iconbtn{width:34px;height:34px;border:1px solid var(--border);background:var(--panel-2);color:var(--fg-soft);
   border-radius:9px;cursor:pointer;display:grid;place-items:center;text-decoration:none}
@@ -138,6 +140,11 @@ select{padding:7px 8px;font-size:13px}
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}
 label{font-size:13px;color:var(--fg-soft);display:flex;flex-direction:column;gap:5px;font-weight:500}
 label.check{flex-direction:row;align-items:center;gap:8px}
+.chk-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow:auto;margin-bottom:8px;padding:2px 0}
+dialog{border:1px solid var(--border-strong);border-radius:14px;background:var(--panel);color:var(--fg);padding:20px;max-width:min(520px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.4)}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog h2{font-size:17px}
+dialog summary{cursor:pointer}
 .form-row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
 .form-row>label{flex:1;min-width:150px}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}

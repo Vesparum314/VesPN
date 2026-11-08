@@ -489,6 +489,27 @@ class AWGManager:
                 peers.append((pub, addr))
         return peers
 
+    def peer_transfer(self) -> dict[str, tuple[int, int]]:
+        """{public_key: (up, down)} bytes per peer from `awg show <iface> transfer`.
+        The tool prints `<pub>\\t<rx>\\t<tx>`: rx = bytes the server RECEIVED from the
+        peer = client UPLOAD (up); tx = bytes SENT to the peer = client DOWNLOAD (down).
+        Live counters since the interface came up (reset on container/iface restart —
+        the caller does delta accounting). Empty on any error."""
+        try:
+            server = self.read_server()
+            out = self._dexec(f"awg show {server.interface} transfer")
+        except Exception:
+            return {}
+        res: dict[str, tuple[int, int]] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    res[parts[0]] = (int(parts[1]), int(parts[2]))
+                except ValueError:
+                    continue
+        return res
+
     def upsert_peer(self, pub: str, address: str, name: str = "") -> None:
         """Idempotently ensure peer `pub` -> `address` exists on this node: apply
         live (no interface restart) and persist to awg0.conf. Replacing any stale
