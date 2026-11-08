@@ -26,7 +26,7 @@ def _rewrite_vless_host(link: str, host: str) -> str:
     pre, _old, port, rest = m.groups()
     return f"{pre}{host}{port or ''}{rest}"
 
-from . import provisioning
+from . import fleetkey, provisioning
 from .awg import AWGManager
 from .models import PROTO_AWG, PROTO_VLESS, ROLE_EXIT, ROLE_GATE, Device, IssuedConfig, Node, Route
 from .node_ssh import NodeCredentials, SSHNode
@@ -37,12 +37,23 @@ class NodeOpError(RuntimeError):
     pass
 
 
+def _fleet_pkey(node: Node):
+    """The fleet key for authenticating to this node, or None (then password-only).
+    Read-only — never mints the key, so monitor/management stay side-effect free."""
+    try:
+        sess = object_session(node)
+        return fleetkey.pkey(sess) if sess is not None else None
+    except Exception:
+        return None
+
+
 def _creds(node: Node) -> NodeCredentials:
     return NodeCredentials(
         host=node.ssh_host,
         port=node.ssh_port,
         username=node.ssh_username,
         password=node.ssh_password,
+        pkey=_fleet_pkey(node),
     )
 
 
@@ -77,6 +88,7 @@ def _gate_creds_for(node: Node) -> NodeCredentials | None:
         return NodeCredentials(
             host=gate.ssh_host, port=gate.ssh_port,
             username=gate.ssh_username, password=gate.ssh_password,
+            pkey=_fleet_pkey(gate),
         )
     except Exception:
         return None
@@ -191,6 +203,7 @@ def provision_node(db: Session, node: Node) -> dict:
 
     awg_port = _pick_awg_port()  # fresh random port per node (ban lesson)
     with connect(node) as n:
+        provisioning.install_fleet_key(n, fleetkey.public_line(db))  # key-manage from here on
         provisioning.ensure_base(n)  # fresh Debian lacks curl, which the installers need
         info = provisioning.install_3xui(n)
         provisioning.set_panel_localhost(n)  # panel reachable only via SSH tunnel
@@ -205,6 +218,7 @@ def provision_node(db: Session, node: Node) -> dict:
     node.xui_port = info["xui_port"]
     node.xui_token = info["xui_token"]  # encrypted via setter
     node.awg_port = awg_port
+    node.key_installed = True  # fleet key now in authorized_keys → key-managed
     if not node.awg_endpoint_host:
         node.awg_endpoint_host = node.public_host
     db.commit()

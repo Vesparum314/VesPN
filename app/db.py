@@ -42,6 +42,23 @@ def init_db() -> None:
     _add_columns()
     _seed_default_group()
     _migrate_announcement()
+    _ensure_fleet_key()
+
+
+def _ensure_fleet_key() -> None:
+    """Mint the fleet SSH key on first startup (stored encrypted in the DB) so it
+    exists before any node connect. Best-effort — provisioning would create it on
+    demand otherwise."""
+    from . import fleetkey
+
+    db = SessionLocal()
+    try:
+        fleetkey.get_pem(db, create=True)
+    except Exception:  # pragma: no cover - never block startup on this
+        import logging
+        logging.getLogger("vpnpanel.db").warning("fleet key init deferred", exc_info=True)
+    finally:
+        db.close()
 
 
 def _rebuild_changed_tables() -> None:
@@ -95,6 +112,8 @@ def _add_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN last_reconcile_at DATETIME")
         if "priority" not in node_cols:
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN priority INTEGER NOT NULL DEFAULT 100")
+        if "key_installed" not in node_cols:
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN key_installed BOOLEAN NOT NULL DEFAULT 0")
         if "route_id" not in cols("devices"):
             conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN route_id INTEGER")
         # users.role (Этап 2): roles admin|operator|client; carry over old is_admin.

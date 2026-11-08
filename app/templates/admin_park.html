@@ -49,7 +49,9 @@
       {% if r.pool %}
         {% for n in r.pool.members|sort(attribute='priority') %}
         <tr>
-          <td data-label="Выход"><div class="stack"><span class="cell-name">{{ n.name }}</span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
+          <td data-label="Выход"><div class="stack"><span class="cell-name">{{ n.name }}
+            {% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}
+          </span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
           <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
           <td data-label="Приоритет">
             <form method="post" action="/admin/nodes/{{ n.id }}/priority" class="status-form">
@@ -97,7 +99,8 @@
     {% for n in orphans %}
       <tr>
         <td data-label="Имя"><div class="stack"><span class="cell-name">{{ n.name }}</span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
-        <td data-label="Роль"><span class="badge {{ 'b-gate' if n.is_gate else 'b-exit' }}">{{ 'gate' if n.is_gate else 'exit' }}</span></td>
+        <td data-label="Роль"><span class="badge {{ 'b-gate' if n.is_gate else 'b-exit' }}">{{ 'gate' if n.is_gate else 'exit' }}</span>
+          {% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}</td>
         <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
         <td data-label="Действия" class="full"><div class="row-actions">
           {% if not n.is_gate %}
@@ -115,6 +118,18 @@
     {% endfor %}
     </tbody>
   </table></div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2 style="margin:0">Ключ парка</h2></div>
+  <div class="panel-b">
+    <div class="sub" style="margin-bottom:8px">Один SSH-ключ, которым панель управляет всеми нодами. Приватная часть хранится на Хабе (в БД, зашифровано) и наружу не отдаётся. Публичную часть панель сама ставит на ноду при раскатке; её же можно вставить при создании VM, тогда пароль root не понадобится вовсе.</div>
+    <div class="sub">Отпечаток: <span class="mono">{{ fleet_fp }}</span></div>
+    <label style="margin-top:8px">Публичный ключ (для <span class="mono">authorized_keys</span> / вставки при создании VM)
+      <textarea id="fleet-pub" readonly rows="2" class="mono" style="width:100%;resize:vertical">{{ fleet_pub }}</textarea>
+    </label>
+    <button class="btn btn-ghost btn-sm" type="button" onclick="navigator.clipboard.writeText(document.getElementById('fleet-pub').value); this.innerText='Скопировано ✓'">Скопировать публичный ключ</button>
+  </div>
 </div>
 
 <dialog id="dlg-route">
@@ -148,7 +163,9 @@
         <select name="role" id="srv-role"><option value="exit">exit — выход (зарубеж)</option><option value="gate">gate — вход/релей (RU)</option></select>
       </label>
       <label>Публичный IP (для клиентов) <input name="public_host" required placeholder="203.0.113.10"></label>
-      <label>SSH пароль (root) <input name="ssh_password" type="password" placeholder="пароль root"></label>
+      <label>SSH пароль (root) <input name="ssh_password" type="password" placeholder="пароль root — только для первичной раскатки">
+        <small class="muted">Нужен лишь для первого коннекта: при раскатке панель поставит на ноду <b>ключ парка</b> и дальше ходит по ключу. Можно оставить пустым, если ключ парка уже на ноде (напр. вставлен при создании VM).</small>
+      </label>
       <details><summary class="muted">Дополнительно</summary>
         <div style="display:flex;flex-direction:column;gap:12px;margin-top:8px">
           <label>SSH host <input name="ssh_host" placeholder="необязательно, по умолчанию = публичный IP"></label>
