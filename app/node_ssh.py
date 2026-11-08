@@ -29,6 +29,11 @@ class NodeCredentials:
     username: str = "root"
     password: str | None = None
     key_filename: str | None = None
+    # In-memory private key (the fleet key, loaded from the DB). paramiko tries the
+    # key first and falls back to `password`, which gives free bootstrap: a fresh
+    # node (no key yet) authenticates by password, and once provisioning installs
+    # the fleet public key, every later connection uses the key.
+    pkey: "paramiko.PKey | None" = None
 
 
 class _LocalForward:
@@ -146,6 +151,7 @@ class SSHNode:
             port=self.creds.port,
             username=self.creds.username,
             password=self.creds.password,
+            pkey=self.creds.pkey,
             key_filename=self.creds.key_filename,
             timeout=timeout,
             banner_timeout=timeout,

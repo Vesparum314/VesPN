@@ -41,6 +41,19 @@ def _parse_env(text: str) -> dict[str, str]:
     return env
 
 
+def install_fleet_key(node: SSHNode, public_line: str) -> None:
+    """Append the panel's fleet public key to the node's root authorized_keys
+    (idempotent). After this, the panel manages the node by key (no Hub→node
+    password needed). Called first in every provisioning flow, right after the
+    initial — possibly password-based — connect. A no-op if no key is given."""
+    public_line = (public_line or "").strip()
+    if not public_line:
+        return
+    q = shlex.quote(public_line)
+    node.run("install -d -m 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys", timeout=20)
+    node.run(f"grep -qxF {q} ~/.ssh/authorized_keys || echo {q} >> ~/.ssh/authorized_keys", timeout=20)
+
+
 def ensure_base(node: SSHNode) -> None:
     """Install packages a fresh minimal Debian lacks but provisioning needs.
     Notably `curl`: the 3x-ui installer, the Docker install script and the Xray

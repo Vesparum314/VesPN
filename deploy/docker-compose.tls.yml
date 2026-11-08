@@ -14,6 +14,11 @@ services:
     container_name: vpn-panel-caddy
     restart: unless-stopped
     env_file: ../.env
+    # Explicit so the Caddyfile's {$DOMAIN} resolves regardless of how compose
+    # resolves the relative env_file path above (project-dir vs file-dir differ
+    # across versions). ${DOMAIN} comes from the project-root .env compose loads.
+    environment:
+      - DOMAIN=${DOMAIN}
     depends_on: [panel]
     ports:
       - "80:80"

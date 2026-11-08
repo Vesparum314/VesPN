@@ -13,6 +13,11 @@ data/
 TODO.md
 CLAUDE.md
 
+# fleet migration workspace: SSH keys + migration notes for the new servers.
+# Extension-less private keys (e.g. vespn_fleet) and .pub files are NOT caught by
+# the id_rsa*/*.pem/*.key patterns below, so ignore the whole folder.
+migration/
+
 # Real exported VPN configs contain live private keys / PSK / server host.
 # Keep them out of the repo (the format is documented in app/awg.py).
 examples/

@@ -18,6 +18,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.status import HTTP_303_SEE_OTHER
 
 from . import appconfig
+from . import fleetkey
 from . import monitor
 from . import nodes as node_ops
 from . import pool as pool_ops
@@ -732,6 +733,7 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
     groups = db.query(Group).order_by(Group.name).all()
     return render(request, "admin_park.html", user=admin, routes=routes, orphans=orphans,
                   free_gates=free_gates, groups=groups,
+                  fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))
 
 

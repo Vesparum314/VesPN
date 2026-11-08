@@ -179,6 +179,9 @@ class Node(Base):
     priority: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # True once provisioning has put the fleet public key in the node's
+    # authorized_keys — i.e. the panel now manages it by key, not by password.
+    key_installed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     notes: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

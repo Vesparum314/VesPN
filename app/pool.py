@@ -27,7 +27,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from sqlalchemy.orm import Session
 
-from . import awg, provisioning
+from . import awg, fleetkey, provisioning
 from .awg import AWGManager
 from .config import settings
 from .models import (
@@ -159,6 +159,7 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
         )
 
     with connect(node) as n:
+        provisioning.install_fleet_key(n, fleetkey.public_line(db))  # key-manage from here on
         provisioning.ensure_base(n)  # fresh Debian lacks curl, which the installers need
         info = provisioning.install_3xui(n)
         provisioning.set_panel_localhost(n)
@@ -184,6 +185,7 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
     node.xui_port = info["xui_port"]
     node.xui_token = info["xui_token"]  # encrypted via setter
     node.awg_port = pool.awg_port
+    node.key_installed = True  # fleet key now in authorized_keys → key-managed
     if not node.awg_endpoint_host:
         node.awg_endpoint_host = node.public_host
     db.commit()
@@ -447,7 +449,11 @@ def provision_gate_for_route(db: Session, route: Route) -> dict:
     if not exits:
         raise NodeOpError("в пуле нет выходов")
     with connect(gate) as g:
+        provisioning.install_fleet_key(g, fleetkey.public_line(db))  # key-manage from here on
         info = provisioning.install_gate_relay(
             g, exits, [pool.vless_port], [pool.awg_port], probe_port=pool.vless_port
         )
+    if not gate.key_installed:
+        gate.key_installed = True
+        db.commit()
     return {"pool": pool.name, "exits": exits, **info}
