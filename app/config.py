@@ -48,6 +48,14 @@ class Settings:
         self.awg_container: str = os.environ.get("AWG_CONTAINER", "vespn-awg")
         self.awg_conf_dir: str = os.environ.get("AWG_CONF_DIR", "/opt/vespn-awg")
 
+        # Optional UI theme (README → Themes). A directory with `templates/`
+        # (partials that override the built-in ones, e.g. _brand.html, _head.html)
+        # and/or `static/` (served at /theme/; `static/theme.css` is loaded after
+        # the base stylesheet). Unset = the stock look.
+        self.theme_dir: str = os.environ.get("THEME_DIR", "")
+        # Product name shown in the header, on the login page and in page titles.
+        self.brand_name: str = os.environ.get("BRAND_NAME", "VesPN")
+
         # Cookie/session
         self.session_cookie: str = os.environ.get("SESSION_COOKIE", "vpnpanel_session")
         self.session_https_only: bool = os.environ.get("SESSION_HTTPS_ONLY", "false").lower() == "true"

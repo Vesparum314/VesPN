@@ -4,22 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
-  <title>{% block title %}VesPN{% endblock %}</title>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <title>{% block title %}{{ brand }}{% endblock %}</title>
+  {% include "_head.html" %}
   <link rel="stylesheet" href="/static/style.css">
+  {% if theme_css %}<link rel="stylesheet" href="/theme/theme.css">{% endif %}
 </head>
-<body>
-  {% macro shield() %}
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M12 2.3 4 5.4v6.2c0 4.7 3.3 8.6 8 10.1 4.7-1.5 8-5.4 8-10.1V5.4L12 2.3Z" fill="var(--accent-weak)" stroke="var(--accent)" stroke-width="1.7" stroke-linejoin="round"/>
-      <path d="m8.4 12 2.5 2.5 4.7-5" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-  {% endmacro %}
-
+<body class="{% block body_class %}{% endblock %}">
   {% if user is defined and user %}
   <header class="bar">
     <div class="bar-in">
-      <a href="/" class="brand">{{ shield() }} VesPN</a>
+      <a href="/" class="brand">{% include "_brand.html" %}</a>
       {% if not user.must_change_password %}
       <nav>
         <a class="tab" href="/" aria-current="{{ 'true' if request.url.path == '/' else 'false' }}">Устройства</a>

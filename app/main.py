@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import ChoiceLoader, FileSystemLoader
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -57,11 +58,19 @@ app = FastAPI(title="VPN self-service panel")
 
 _PW_EXEMPT = {"/login", "/logout", "/change-password", "/healthz"}
 
+# --- optional theme (see config.theme_dir) ----------------------------------
+THEME_DIR: Path | None = Path(settings.theme_dir) if settings.theme_dir else None
+if THEME_DIR is not None and not THEME_DIR.is_dir():
+    log.warning("THEME_DIR=%s is not a directory — using the stock look.", THEME_DIR)
+    THEME_DIR = None
+THEME_TEMPLATES = THEME_DIR / "templates" if THEME_DIR and (THEME_DIR / "templates").is_dir() else None
+THEME_STATIC = THEME_DIR / "static" if THEME_DIR and (THEME_DIR / "static").is_dir() else None
+
 
 async def _enforce_password_change(request: Request, call_next):
     """Users flagged must_change_password are pinned to /change-password."""
     path = request.url.path
-    if path in _PW_EXEMPT or path.startswith("/static"):
+    if path in _PW_EXEMPT or path.startswith(("/static", "/theme")):
         return await call_next(request)
     try:
         uid = request.session.get("uid")
@@ -91,7 +100,17 @@ app.add_middleware(
     same_site="lax",
 )
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+if THEME_STATIC:
+    app.mount("/theme", StaticFiles(directory=THEME_STATIC), name="theme")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+if THEME_TEMPLATES:
+    # Theme templates win; anything the theme doesn't ship falls back to the stock ones.
+    templates.env.loader = ChoiceLoader([FileSystemLoader(str(THEME_TEMPLATES)), templates.env.loader])
+templates.env.globals["brand"] = settings.brand_name
+templates.env.globals["theme_css"] = bool(THEME_STATIC and (THEME_STATIC / "theme.css").is_file())
+if THEME_DIR:
+    log.info("Theme: %s (templates=%s, theme.css=%s)", THEME_DIR, bool(THEME_TEMPLATES),
+             templates.env.globals["theme_css"])
 
 
 def _hbytes(n) -> str:
