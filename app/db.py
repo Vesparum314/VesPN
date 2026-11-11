@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 from .config import settings
@@ -21,6 +21,22 @@ if settings.database_url.startswith("sqlite"):
 engine = create_engine(settings.database_url, connect_args=_connect_args, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
+
+
+if settings.database_url.startswith("sqlite"):
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        """WAL + a busy timeout so the background job worker (app/jobs.py) and the
+        request threads share the one SQLite file cleanly: WAL lets reads run while
+        a writer is active, and the timeout makes a brief write collision wait
+        instead of raising 'database is locked'."""
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cur.close()
 
 
 def get_db() -> Iterator[Session]:
@@ -40,6 +56,7 @@ def init_db() -> None:
     _rebuild_changed_tables()
     Base.metadata.create_all(bind=engine)
     _add_columns()
+    _reset_orphaned_jobs()
     _seed_default_group()
     _migrate_announcement()
     _ensure_fleet_key()
@@ -114,6 +131,17 @@ def _add_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN priority INTEGER NOT NULL DEFAULT 100")
         if "key_installed" not in node_cols:
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN key_installed BOOLEAN NOT NULL DEFAULT 0")
+        # Background-job tracking for long node ops (provisioning / gate relay).
+        if "job_state" not in node_cols:
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN job_state VARCHAR(16) NOT NULL DEFAULT 'idle'")
+        if "job_kind" not in node_cols:
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN job_kind VARCHAR(32)")
+        if "job_message" not in node_cols:
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN job_message TEXT NOT NULL DEFAULT ''")
+        if "job_started_at" not in node_cols:
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN job_started_at DATETIME")
+        if "job_finished_at" not in node_cols:
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN job_finished_at DATETIME")
         if "route_id" not in cols("devices"):
             conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN route_id INTEGER")
         # users.role (Этап 2): roles admin|operator|client; carry over old is_admin.
@@ -126,6 +154,26 @@ def _add_columns() -> None:
                 )
         if "created_by" not in cols("users"):
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN created_by INTEGER")
+
+
+def _reset_orphaned_jobs() -> None:
+    """A node job left in `running` can't survive a panel restart — its worker
+    thread is gone with the process — so flip any leftover `running` to `error` on
+    startup, otherwise the «Парк» would show a spinner forever and block re-runs."""
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes'"
+        ).fetchone()
+        if not row:
+            return
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(nodes)")]
+        if "job_state" not in cols:
+            return
+        conn.exec_driver_sql(
+            "UPDATE nodes SET job_state='error', "
+            "job_message='прервано перезапуском панели', "
+            "job_finished_at=CURRENT_TIMESTAMP WHERE job_state='running'"
+        )
 
 
 def _seed_default_group() -> None:

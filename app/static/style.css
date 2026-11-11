@@ -106,6 +106,14 @@ main{padding:22px max(16px,env(safe-area-inset-right,0px)) 48px max(16px,env(saf
 .b-bad{background:var(--bad-bg);color:var(--bad)}
 .b-dot::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block}
 
+/* group chips (per-user membership) */
+.chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.chip-tag{display:inline-flex;align-items:center;gap:2px;font-size:12px;font-weight:600;
+  background:var(--panel-3);color:var(--fg-soft);padding:3px 4px 3px 10px;border-radius:999px;white-space:nowrap}
+.chip-tag form{margin:0;display:inline-flex}
+.chip-x{background:none;border:0;color:var(--muted);cursor:pointer;font-size:15px;line-height:1;padding:0 3px;border-radius:999px}
+.chip-x:hover{color:var(--bad)}
+
 /* buttons */
 .btn{border:1px solid var(--border-strong);background:var(--panel-2);color:var(--fg);font:inherit;font-weight:600;
   font-size:13.5px;padding:8px 14px;border-radius:9px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;white-space:nowrap;text-decoration:none}
@@ -140,7 +148,6 @@ select{padding:7px 8px;font-size:13px}
 input:focus,select:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}
 label{font-size:13px;color:var(--fg-soft);display:flex;flex-direction:column;gap:5px;font-weight:500}
 label.check{flex-direction:row;align-items:center;gap:8px}
-.chk-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow:auto;margin-bottom:8px;padding:2px 0}
 dialog{border:1px solid var(--border-strong);border-radius:14px;background:var(--panel);color:var(--fg);padding:20px;max-width:min(520px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.4)}
 dialog::backdrop{background:rgba(0,0,0,.5)}
 dialog h2{font-size:17px}
