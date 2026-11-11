@@ -2,7 +2,8 @@
 .env
 .env.*
 !.env.example
-data/
+# local SQLite dir at the repo root only — NOT app/data/ (ships the VLESS inbound template)
+/data/
 *.db
 *.sqlite*
 *.log
