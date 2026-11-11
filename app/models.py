@@ -55,6 +55,17 @@ _SYNC_LABEL = {
     SYNC_UNREACHABLE: "недоступен",
 }
 
+# Background job state for a long node operation (provisioning / gate relay). The
+# HTTP request returns at once and the real work runs in a thread (see app/jobs.py);
+# the «Парк» page shows this and blocks a second click while `running`. This is how
+# minutes-long operations survive a reverse-proxy response timeout (e.g. Cloudflare
+# 524 at 100 s) without the admin losing the result or double-triggering a rollout.
+JOB_IDLE = "idle"
+JOB_RUNNING = "running"
+JOB_DONE = "done"
+JOB_ERROR = "error"
+JOB_STATES = (JOB_IDLE, JOB_RUNNING, JOB_DONE, JOB_ERROR)
+
 # Monitoring reachability-history kinds (see NodeStatusHistory).
 HIST_MGMT = "mgmt"      # Hub → node management reachability (Hub→gate, Hub→exit via gate)
 HIST_CLIENT = "client"  # gate → exit client path (VLESS traffic port)
@@ -182,6 +193,17 @@ class Node(Base):
     # True once provisioning has put the fleet public key in the node's
     # authorized_keys — i.e. the panel now manages it by key, not by password.
     key_installed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+    # Background job for a long op on this node (provisioning, gate relay). The
+    # request thread only flips `job_state` to `running` and spawns a worker; the
+    # worker writes the result back here (see app/jobs.py). job_kind is a short code
+    # ('provision' | 'relay'); job_message holds the success text or the error.
+    job_state: Mapped[str] = mapped_column(String(16), default=JOB_IDLE, server_default=JOB_IDLE)
+    job_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    job_message: Mapped[str] = mapped_column(Text, default="", server_default="")
+    job_started_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+    job_finished_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+
     notes: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -221,6 +243,10 @@ class Node(Base):
     @property
     def is_synced(self) -> bool:
         return self.sync_state == SYNC_SYNCED
+
+    @property
+    def job_running(self) -> bool:
+        return self.job_state == JOB_RUNNING
 
 
 class ExitPool(Base):

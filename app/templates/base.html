@@ -19,7 +19,6 @@
         <a class="tab" href="/" aria-current="{{ 'true' if request.url.path == '/' else 'false' }}">Устройства</a>
         {% if user.is_staff %}
           <a class="tab" href="/admin/park" aria-current="{{ 'true' if request.url.path == '/admin/park' else 'false' }}">Парк</a>
-          <a class="tab" href="/admin/groups" aria-current="{{ 'true' if request.url.path == '/admin/groups' else 'false' }}">Группы</a>
           <a class="tab" href="/admin/monitor" aria-current="{{ 'true' if request.url.path == '/admin/monitor' else 'false' }}">Мониторинг</a>
           <a class="tab" href="/admin/traffic" aria-current="{{ 'true' if request.url.path == '/admin/traffic' else 'false' }}">Трафик</a>
           <a class="tab" href="/admin/users" aria-current="{{ 'true' if request.url.path == '/admin/users' else 'false' }}">Пользователи</a>

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import qrcode
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import ChoiceLoader, FileSystemLoader
@@ -20,6 +20,7 @@ from starlette.status import HTTP_303_SEE_OTHER
 
 from . import appconfig
 from . import fleetkey
+from . import jobs
 from . import monitor
 from . import nodes as node_ops
 from . import pool as pool_ops
@@ -27,6 +28,7 @@ from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
 from .models import (
+    JOB_RUNNING,
     PROTO_AWG,
     PROTO_VLESS,
     PROTOCOLS,
@@ -540,21 +542,35 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
-        try:
+        # Provisioning is minutes of SSH — run it in the background (app/jobs.py) so
+        # the response returns now (no reverse-proxy 524) and a second click is blocked.
+        def _do(db: Session, node: Node) -> str:
             if node.pool_id:
                 info = pool_ops.provision_pool_exit(db, node)
                 rec = info.get("reconcile", {})
-                flash(request, f"«{node.name}» развёрнут как клон пула: 3x-ui (:{info['xui_port']}) + "
-                               f"AmneziaWG (UDP :{info['awg_port']}); синхронизация "
-                               f"{'ok' if rec.get('ok') else rec.get('error', '—')}", "success")
-            else:
-                info = node_ops.provision_node(db, node)
-                flash(request, f"Нода «{node.name}» развёрнута: 3x-ui (порт {info['xui_port']}) + "
-                               f"AmneziaWG (UDP {info['awg_port']})", "success")
-        except Exception as e:
-            log.exception("provision failed")
-            flash(request, f"Провижининг не удался: {e}", "error")
+                return (f"Развёрнут как клон пула: 3x-ui (:{info['xui_port']}) + "
+                        f"AmneziaWG (UDP :{info['awg_port']}); синхронизация "
+                        f"{'ok' if rec.get('ok') else rec.get('error', '—')}")
+            info = node_ops.provision_node(db, node)
+            return (f"Развёрнута: 3x-ui (порт {info['xui_port']}) + "
+                    f"AmneziaWG (UDP {info['awg_port']})")
+
+        if jobs.start_node_job(db, node, "provision", _do):
+            flash(request, f"«{node.name}»: раскатка запущена в фоне — статус обновится на «Парке».", "success")
+        else:
+            flash(request, f"«{node.name}»: раскатка уже идёт — дождитесь завершения.", "error")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.get("/admin/park/status")
+def admin_park_status(request: Request, db: Session = Depends(get_db)):
+    """Lightweight poll for «Парк»: ids of nodes whose job is still running. The page
+    auto-reloads once a running job leaves this list, so the final result badge shows
+    without a manual refresh."""
+    if not _require_staff(request, db):
+        return JSONResponse({"running": []}, status_code=403)
+    running = [nid for (nid,) in db.query(Node.id).filter(Node.job_state == JOB_RUNNING).all()]
+    return JSONResponse({"running": running})
 
 
 @app.post("/admin/nodes/{node_id}/delete")
@@ -666,27 +682,31 @@ def admin_provision_relay(request: Request, route_id: int, db: Session = Depends
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route and route.gate_node and route.pool:
-        try:
+        gate = route.gate_node
+        rid = route.id
+
+        # Raising the relay is a long op too — background it on the gate node, so the
+        # «Поднять релей» button reports progress and can't be double-fired.
+        def _do(db: Session, gate: Node) -> str:
+            route = db.get(Route, rid)
             info = node_ops.provision_gate_for_route(db, route)
-            flash(request, f"Релей на «{route.gate_node.name}» поднят → пул {info['pool']} "
-                           f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})", "success")
-        except Exception as e:
-            log.exception("relay provision failed")
-            flash(request, f"Релей не поднялся: {e}", "error")
+            return (f"Релей поднят → пул {info['pool']} "
+                    f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})")
+
+        if jobs.start_node_job(db, gate, "relay", _do):
+            flash(request, f"«{gate.name}»: подъём релея запущен в фоне — статус на «Парке».", "success")
+        else:
+            flash(request, f"«{gate.name}»: операция уже идёт — дождитесь завершения.", "error")
     elif route:
         flash(request, "У маршрута должны быть и gate, и пул выходов", "error")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
-# --- admin: groups ------------------------------------------------------
+# --- admin: groups (managed on the «Пользователи и группы» page) --------
 @app.get("/admin/groups", response_class=HTMLResponse)
 def admin_groups(request: Request, db: Session = Depends(get_db)):
-    admin = _require_staff(request, db)
-    if not admin:
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    groups = db.query(Group).order_by(Group.name).all()
-    users = db.query(User).order_by(User.username).all()
-    return render(request, "admin_groups.html", user=admin, groups=groups, users=users)
+    # groups were merged into the users page; keep the old URL working
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/groups")
@@ -702,24 +722,7 @@ def admin_add_group(request: Request, name: str = Form(...), db: Session = Depen
         db.add(Group(name=name))
         db.commit()
         flash(request, f"Группа «{name}» создана", "success")
-    return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
-
-
-@app.post("/admin/groups/{group_id}/members")
-def admin_set_group_members(
-    request: Request, group_id: int,
-    user_ids: list[int] = Form(default=[]),
-    db: Session = Depends(get_db),
-):
-    """Set the members of a group (which accounts belong to it)."""
-    if not _require_staff(request, db):
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    group = db.get(Group, group_id)
-    if group:
-        group.users = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
-        db.commit()
-        flash(request, f"В группе «{group.name}»: участников — {len(group.users)}", "success")
-    return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/groups/{group_id}/delete")
@@ -731,7 +734,7 @@ def admin_delete_group(request: Request, group_id: int, db: Session = Depends(ge
         db.delete(group)
         db.commit()
         flash(request, "Группа удалена", "success")
-    return RedirectResponse("/admin/groups", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
 # --- admin: park (gates + exits + routes, merged into one page) ---------
@@ -932,7 +935,8 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     users = db.query(User).order_by(User.id).all()
-    return render(request, "admin_users.html", user=admin, users=users)
+    groups = db.query(Group).order_by(Group.name).all()
+    return render(request, "admin_users.html", user=admin, users=users, groups=groups)
 
 
 # --- admin: notifications (admin -> clients) ----------------------------
@@ -1043,6 +1047,30 @@ def admin_set_user_role(
         target.role = role
         db.commit()
         flash(request, f"Роль «{target.username}»: {role}", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/users/{user_id}/group")
+def admin_toggle_user_group(
+    request: Request, user_id: int,
+    group_id: int = Form(...), action: str = Form("add"),
+    db: Session = Depends(get_db),
+):
+    """Add or remove ONE group on a user — the per-user, scalable way to manage
+    membership (a chip to drop, a dropdown to add), instead of a users×groups grid."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    target = db.get(User, user_id)
+    group = db.get(Group, group_id)
+    if target and group:
+        if action == "remove" and group in target.groups:
+            target.groups.remove(group)
+            db.commit()
+            flash(request, f"«{target.username}» убран из «{group.name}»", "success")
+        elif action == "add" and group not in target.groups:
+            target.groups.append(group)
+            db.commit()
+            flash(request, f"«{target.username}» добавлен в «{group.name}»", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
