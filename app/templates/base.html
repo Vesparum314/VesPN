@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark light">
   <title>{% block title %}{{ brand }}{% endblock %}</title>
   {% include "_head.html" %}
-  <link rel="stylesheet" href="/static/style.css">
-  {% if theme_css %}<link rel="stylesheet" href="/theme/theme.css">{% endif %}
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
+  {% if theme_css %}<link rel="stylesheet" href="/theme/theme.css?v={{ asset_v }}">{% endif %}
 </head>
 <body class="{% block body_class %}{% endblock %}">
   {% if user is defined and user %}
