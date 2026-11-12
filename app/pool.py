@@ -41,8 +41,9 @@ from .models import (
     IssuedConfig,
     Node,
     Route,
+    slugify,
 )
-from .nodes import NodeOpError, _gate_creds_for, _rewrite_vless_host, connect
+from .nodes import NodeOpError, _gate_creds_for, _rewrite_vless_host, _set_vless_label, connect
 from .xui import XUIClient
 
 log = logging.getLogger("vpnpanel.pool")
@@ -354,6 +355,10 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
                 log.warning("vless fan-out to %s failed: %s", m.name, e)
         if link is None:
             raise NodeOpError(f"не удалось выпустить VLESS: {last_err}")
+
+        # Label the link by ROUTE + full identifier (route-user-device), not the
+        # exit node's name that 3x-ui bakes in — stays meaningful after failover.
+        link = _set_vless_label(link, f"{slugify(route.name)}-{email}")
 
         if existing is None:
             existing = IssuedConfig(device_id=device.id, protocol=PROTO_VLESS)

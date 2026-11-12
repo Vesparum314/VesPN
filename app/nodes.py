@@ -26,6 +26,14 @@ def _rewrite_vless_host(link: str, host: str) -> str:
     pre, _old, port, rest = m.groups()
     return f"{pre}{host}{port or ''}{rest}"
 
+
+def _set_vless_label(link: str, label: str) -> str:
+    """Set the share link's #fragment — the name the VPN app shows for the config.
+    `label` is an ASCII slug (route + user + device), so it needs no escaping and
+    renders identically in every client."""
+    base = link.split("#", 1)[0]
+    return f"{base}#{label}" if label else base
+
 from . import fleetkey, provisioning
 from .awg import AWGManager
 from .models import PROTO_AWG, PROTO_VLESS, ROLE_EXIT, ROLE_GATE, Device, IssuedConfig, Node, Route

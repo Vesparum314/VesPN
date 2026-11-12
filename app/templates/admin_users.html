@@ -32,7 +32,7 @@
         <div class="chips">
           {% for g in u.groups %}
             <span class="chip-tag">{{ g.name }}<form method="post" action="/admin/users/{{ u.id }}/group"><input type="hidden" name="group_id" value="{{ g.id }}"><input type="hidden" name="action" value="remove"><button class="chip-x" title="Убрать из «{{ g.name }}»" aria-label="Убрать из группы {{ g.name }}">×</button></form></span>
-          {% else %}<span class="muted">—</span>{% endfor %}
+          {% endfor %}
           {% set avail = groups | rejectattr('id', 'in', member_ids) | list %}
           {% if avail %}
           <form method="post" action="/admin/users/{{ u.id }}/group" class="status-form" style="gap:4px">

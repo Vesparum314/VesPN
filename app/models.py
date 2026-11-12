@@ -102,8 +102,21 @@ announcement_groups = Table(
 )
 
 
+# Cyrillic → Latin, so Russian user/device names become readable ASCII slugs
+# (the client's node-side email, the config filename, the VLESS link label) instead
+# of being stripped to "x". Lowercase keys — slugify lowercases before transliterating.
+_TRANSLIT = {ord(k): v for k, v in {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}.items()}
+
+
 def slugify(value: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    s = value.strip().lower().translate(_TRANSLIT)
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-")
     return s or "x"
 
 

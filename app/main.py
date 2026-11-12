@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import time
 from pathlib import Path
 
 import qrcode
@@ -110,6 +111,22 @@ if THEME_TEMPLATES:
     templates.env.loader = ChoiceLoader([FileSystemLoader(str(THEME_TEMPLATES)), templates.env.loader])
 templates.env.globals["brand"] = settings.brand_name
 templates.env.globals["theme_css"] = bool(THEME_STATIC and (THEME_STATIC / "theme.css").is_file())
+
+
+def _asset_version() -> str:
+    """Cache-busting token for CSS: the newest mtime of the stylesheet(s), read at
+    startup. A deploy (or a theme `restart`) changes it, so the browser/Cloudflare
+    fetch the fresh file instead of showing a stale one."""
+    paths = [BASE_DIR / "static" / "style.css"]
+    if THEME_STATIC:
+        paths.append(THEME_STATIC / "theme.css")
+    try:
+        return str(int(max(p.stat().st_mtime for p in paths if p.exists())))
+    except Exception:
+        return str(int(time.time()))
+
+
+templates.env.globals["asset_v"] = _asset_version()
 if THEME_DIR:
     log.info("Theme: %s (templates=%s, theme.css=%s)", THEME_DIR, bool(THEME_TEMPLATES),
              templates.env.globals["theme_css"])
