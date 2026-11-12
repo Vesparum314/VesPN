@@ -14,9 +14,19 @@ The panel reaches the API over an SSH tunnel to the node's 127.0.0.1:<panel_port
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 
 import requests
+
+log = logging.getLogger("vpnpanel.xui")
+
+# 3x-ui keeps its own SQLite (WAL) and writes to it constantly (traffic stats,
+# xray reloads), so a write of ours (add/update client, edit inbound) can land on
+# a momentary "database is locked" even though the node is healthy. It clears in
+# well under a second, so we retry the API call a few times before giving up.
+_LOCK_HINT = "database is locked"
 
 
 class XUIError(RuntimeError):
@@ -31,30 +41,45 @@ class VlessInbound:
 
 
 class XUIClient:
-    def __init__(self, base_url: str, token: str, timeout: int = 20):
+    def __init__(self, base_url: str, token: str, timeout: int = 20, retries: int = 5):
         # base_url e.g. http://127.0.0.1:<localport>/<webBasePath>
         self.base = base_url.rstrip("/")
         self.s = requests.Session()
         self.s.headers["Authorization"] = f"Bearer {token}"
         self.s.headers["Accept"] = "application/json"
         self.timeout = timeout
+        self.retries = max(1, retries)
 
     # --- low level -------------------------------------------------------
     def _get(self, path: str) -> dict:
-        r = self.s.get(self.base + path, timeout=self.timeout)
-        r.raise_for_status()
-        return self._ok(r.json())
+        return self._request("get", path)
 
     def _post_json(self, path: str, payload: dict | None = None) -> dict:
-        r = self.s.post(self.base + path, json=payload or {}, timeout=self.timeout)
-        r.raise_for_status()
-        return self._ok(r.json())
+        return self._request("post", path, payload)
 
-    @staticmethod
-    def _ok(resp: dict) -> dict:
-        if not resp.get("success"):
-            raise XUIError(resp.get("msg") or "3x-ui API returned success=false")
-        return resp
+    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        """One API call, retrying only a transient 'database is locked' from 3x-ui's
+        SQLite with a short backoff."""
+        url = self.base + path
+        delay, last_msg = 0.3, ""
+        for attempt in range(self.retries):
+            if method == "post":
+                r = self.s.post(url, json=payload or {}, timeout=self.timeout)
+            else:
+                r = self.s.get(url, timeout=self.timeout)
+            r.raise_for_status()
+            resp = r.json()
+            if resp.get("success"):
+                return resp
+            msg = resp.get("msg") or "3x-ui API returned success=false"
+            if _LOCK_HINT in msg.lower() and attempt < self.retries - 1:
+                last_msg = msg
+                log.info("3x-ui locked on %s, retry %d/%d", path, attempt + 1, self.retries - 1)
+                time.sleep(delay)
+                delay = min(delay * 1.6, 2.0)
+                continue
+            raise XUIError(msg)
+        raise XUIError(last_msg or "3x-ui API returned success=false")
 
     # --- inbounds --------------------------------------------------------
     def list_inbounds(self) -> list[dict]:
