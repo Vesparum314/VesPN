@@ -51,7 +51,16 @@ from .models import (
     TrafficStat,
     User,
 )
-from .security import current_user, hash_password, login_session, logout_session, verify_password
+from .ratelimit import login_throttle
+from .security import (
+    PASSWORD_RULES,
+    current_user,
+    hash_password,
+    login_session,
+    logout_session,
+    password_problem,
+    verify_password,
+)
 
 log = logging.getLogger("vpnpanel")
 logging.basicConfig(level=logging.INFO)
@@ -258,10 +267,26 @@ def login_submit(
     password: str = Form(...),
     db: Session = Depends(get_db),
 ):
+    ip = request.client.host if request.client else "?"
+    wait = login_throttle.retry_after(ip, username)
+    if wait:
+        # refused before the password is even checked — a blocked client learns nothing
+        log.warning("login throttled from %s (user %r, retry in %ss)", ip, username, wait)
+        flash(request, f"Слишком много неудачных попыток. Повторите через {(wait + 59) // 60} мин.", "error")
+        return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
     user = db.query(User).filter_by(username=username).first()
     if not user or not verify_password(password, user.password_hash):
+        login_throttle.fail(ip, username)
+        log.warning("login failed from %s (user %r)", ip, username)
         flash(request, "Неверный логин или пароль", "error")
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
+    login_throttle.success(ip, username)
+    # A password set before the current rules (or a weak ADMIN_PASSWORD) is still
+    # accepted once, but the user is sent to /change-password to replace it.
+    if not user.must_change_password and password_problem(password, user.username):
+        user.must_change_password = True
+        db.commit()
+        flash(request, f"Пароль не соответствует требованиям ({PASSWORD_RULES}) — задайте новый.", "info")
     login_session(request, user)
     return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
 
@@ -277,7 +302,8 @@ def change_password_form(request: Request, db: Session = Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
-    return render(request, "change_password.html", user=user, forced=user.must_change_password)
+    return render(request, "change_password.html", user=user, forced=user.must_change_password,
+                  rules=PASSWORD_RULES)
 
 
 @app.post("/change-password")
@@ -290,8 +316,9 @@ def change_password_submit(
     user = current_user(request, db)
     if not user:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
-    if len(new_password) < 6:
-        flash(request, "Пароль должен быть не короче 6 символов", "error")
+    problem = password_problem(new_password, user.username)
+    if problem:
+        flash(request, problem, "error")
     elif new_password != confirm:
         flash(request, "Пароли не совпадают", "error")
     elif new_password == settings.default_user_password:
