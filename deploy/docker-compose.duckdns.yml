@@ -12,6 +12,8 @@ services:
     environment:
       - DATABASE_URL=sqlite:////data/panel.db
       - SESSION_HTTPS_ONLY=true
+      # visitor IP from Caddy's X-Forwarded-For (login throttling); safe: only Caddy reaches the panel
+      - FORWARDED_ALLOW_IPS=*
 
   caddy:
     build:
