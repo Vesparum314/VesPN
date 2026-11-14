@@ -36,9 +36,11 @@ class Settings:
         )
         self.xui_folder: str = os.environ.get("XUI_FOLDER", "/usr/local/x-ui")
 
-        # The latest Xray bundled by the installer doesn't work on all clients;
-        # pin every freshly provisioned node to this known-good version.
-        self.xray_version: str = os.environ.get("XRAY_VERSION", "v26.6.27")
+        # Pin every freshly provisioned node to one known-good Xray-core for
+        # reproducible deploys (the installer's "latest" drifts over time). Pinned to
+        # v26.11.9 now that our clients support its Reality handshake; was v26.6.27
+        # (the newer core refused to connect on the client apps we had back then).
+        self.xray_version: str = os.environ.get("XRAY_VERSION", "v26.11.9")
 
         # AmneziaWG auto-deploy. The panel now stands the AWG server up itself,
         # as a container from the official amneziavpn/amneziawg-go image (the

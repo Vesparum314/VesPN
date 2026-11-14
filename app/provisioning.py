@@ -141,7 +141,7 @@ def pin_xray_version(node: SSHNode, version: str, panel_port: int) -> str:
     """Replace the installed Xray-core with a specific release and restart x-ui.
 
     The installer ships the latest Xray, which doesn't connect on all clients;
-    we pin every node to a known-good version (default v26.6.27). Returns the
+    we pin every node to a known-good version (default v26.11.9). Returns the
     version string reported by the pinned binary."""
     folder = settings.xui_folder
     url = f"https://github.com/XTLS/Xray-core/releases/download/{version}/Xray-linux-64.zip"
