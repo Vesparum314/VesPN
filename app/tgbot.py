@@ -103,26 +103,30 @@ def _ensure_proxy() -> str | None:
         if _proxy["ssh"] is not None and _proxy["port"]:
             return f"http://127.0.0.1:{_proxy['port']}"
     from .db import SessionLocal
+    # Keep the session open while tunnelling: open_proxy_tunnel resolves the exit's
+    # gate through the node's session (pool → route → gate). A detached node has no
+    # session, so the gate lookup came back empty and every exit failed with
+    # «гейт не определён» — the bot never reached Telegram.
     db = SessionLocal()
     try:
-        exits = _candidate_exits(db)
+        for ex in _candidate_exits(db):
+            try:
+                n, port, fwd = node_ops.open_proxy_tunnel(ex, TG_PROXY_PORT)
+            except Exception as e:
+                log.warning("tg: tunnel to %s failed: %s", ex.name, e)
+                continue
+            if _probe_proxy(port):
+                with _proxy_lock:
+                    _proxy.update(ssh=n, fwd=fwd, port=port, exit_id=ex.id, exit_name=ex.name)
+                log.info("tg: proxying via exit %s", ex.name)
+                return f"http://127.0.0.1:{port}"
+            log.warning("tg: tunnel to %s is up but its Telegram proxy did not answer", ex.name)
+            try:
+                fwd.stop()
+            finally:
+                n.close()
     finally:
         db.close()
-    for ex in exits:
-        try:
-            n, port, fwd = node_ops.open_proxy_tunnel(ex, TG_PROXY_PORT)
-        except Exception as e:
-            log.warning("tg: tunnel to %s failed: %s", ex.name, e)
-            continue
-        if _probe_proxy(port):
-            with _proxy_lock:
-                _proxy.update(ssh=n, fwd=fwd, port=port, exit_id=ex.id, exit_name=ex.name)
-            log.info("tg: proxying via exit %s", ex.name)
-            return f"http://127.0.0.1:{port}"
-        try:
-            fwd.stop()
-        finally:
-            n.close()
     log.warning("tg: no reachable exit proxy")
     return None
 
