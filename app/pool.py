@@ -10,7 +10,7 @@ is the source of truth: `desired_state` is derived from the issued configs, and
 each exit is converged to it.
 
 The gate never decrypts: it only DNATs ciphertext to a healthy member (see
-`provisioning.install_gate_relay` + its daemon). Public IPs differ between
+`relay.py` + its daemon). Public IPs differ between
 members and are invisible to the client — it always dials the gate.
 """
 
@@ -493,46 +493,52 @@ def deprovision_device(db: Session, device: Device) -> None:
                 log.warning("deprovision of %s on %s failed: %s", cfg.identifier, m.name, e)
 
 
-# --- gate relay for a pool route ---------------------------------------
-def provision_gate_relay(db: Session, gate: Node) -> dict:
-    """Set one gate up as a health-checked L4 relay for its gate pool's route: push
-    the member IPs + the pool's service ports, deploy the daemon. The daemon then
-    steers DNAT to live members only. Every gate of a gate pool gets the same relay.
+# --- gate relay for a gate pool ----------------------------------------
+def gate_pool_plan(db: Session, gate_pool_id: int) -> dict:
+    """The relay plan every gate of the pool runs, built from ALL routes using the
+    pool (see app/relay.py). Raises NodeOpError explaining a conflict."""
+    from . import relay
 
-    One SERVER pool per gate pool for now: routes of several protocols over the
-    same server pool are fine (one member list, each protocol's ports), but routes
-    over different server pools need the relay generated from all of them (SNI
-    routing on a shared TCP port, distinct UDP ports), which this daemon can't
-    express yet — refuse rather than overwrite."""
+    routes = (
+        db.query(Route)
+        .filter(Route.gate_pool_id == gate_pool_id)
+        .order_by(Route.id)
+        .all()
+    )
+    if not routes:
+        raise NodeOpError("пул гейтов не используется ни одним маршрутом")
+    try:
+        return relay.build_plan(routes)
+    except relay.RelayConflict as e:
+        raise NodeOpError(str(e)) from None
+
+
+def gate_pool_problem(db: Session, gate_pool_id: int) -> str:
+    """'' if the pool's routes fit one relay, else why not (for the «Парк» page)."""
+    try:
+        gate_pool_plan(db, gate_pool_id)
+        return ""
+    except NodeOpError as e:
+        return str(e)
+
+
+def provision_gate_relay(db: Session, gate: Node) -> dict:
+    """Set one gate up as the health-checked relay of its gate pool: the plan built
+    from every route of the pool (DNAT for single-target ports, SNI routing for TCP
+    ports shared by several TLS routes, UDP for AmneziaWG), pushed with the daemon.
+    The daemon then steers traffic to live servers only. Every gate of a gate pool
+    gets the same relay."""
+    from . import relay
+
     if not gate.is_gate:
         raise NodeOpError(f"«{gate.name}» — не gate-сервер")
     if gate.gate_pool_id is None:
         raise NodeOpError(f"гейт «{gate.name}» не входит в пул гейтов")
-    routes = db.query(Route).filter(Route.gate_pool_id == gate.gate_pool_id).all()
-    if not routes:
-        raise NodeOpError(f"пул гейтов «{gate.name}» не используется ни одним маршрутом")
-    if len({r.pool_id for r in routes}) > 1:
-        raise NodeOpError(
-            "пул гейтов обслуживает маршруты на разных пулах серверов — такой общий "
-            "релей ещё не поддерживается (маршруты разных протоколов на одном пуле "
-            "серверов — можно)"
-        )
-    route = routes[0]
-    pool = route.pool
-    if pool is None:
-        raise NodeOpError("у маршрута нет пула выходов")
-    # Priority order (lower = preferred): the gate daemon routes to the first
-    # healthy member in this list, so the order IS the active/standby priority.
-    members = sorted(pool.members, key=lambda m: (m.priority, m.id))
-    exits = [m.public_host for m in members]
-    if not exits:
-        raise NodeOpError("в пуле нет выходов")
+    plan = gate_pool_plan(db, gate.gate_pool_id)
     with connect(gate) as g:
         provisioning.install_fleet_key(g, fleetkey.public_line(db))  # key-manage from here on
-        info = provisioning.install_gate_relay(
-            g, exits, [pool.vless_port], [pool.awg_port], probe_port=pool.vless_port
-        )
+        info = relay.install(g, plan)
     if not gate.key_installed:
         gate.key_installed = True
         db.commit()
-    return {"pool": pool.name, "exits": exits, **info}
+    return {"summary": relay.plan_summary(plan), "plan": plan, **info}

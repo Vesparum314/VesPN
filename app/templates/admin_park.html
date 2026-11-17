@@ -83,7 +83,7 @@
       {% else %}<span class="badge b-warn">не используется маршрутами</span>{% endif %}
     </h2>
     <div class="row-actions">
-      {% if gp.routes and gp.gates %}
+      {% if gp.routes and gp.gates and not gate_pool_problems.get(gp.id) %}
       <form method="post" action="/admin/gatepools/{{ gp.id }}/relay" onsubmit="return confirm('Поднять/обновить релей на всех гейтах пула «{{ gp.name }}» ({{ gp.gates|map(attribute='name')|join(', ') }})? Релей собирается из всех маршрутов пула.')"><button class="btn btn-sm"{% if busy %} disabled{% endif %}>{{ '⏳ релей…' if busy else 'Поднять релей' }}</button></form>
       {% endif %}
       {% if free_gates %}
@@ -95,6 +95,9 @@
       <form method="post" action="/admin/gatepools/{{ gp.id }}/delete" onsubmit="return confirm('Удалить пул гейтов «{{ gp.name }}»? Гейты останутся в парке.')"><button class="btn btn-ghost btn-sm btn-danger"{% if gp.routes %} disabled title="используется маршрутами"{% endif %}>Удалить</button></form>
     </div>
   </div>
+  {% if gate_pool_problems.get(gp.id) %}
+  <div class="flash flash-error" style="margin:10px 12px 0">Релей не собрать: {{ gate_pool_problems[gp.id] }}</div>
+  {% endif %}
   <div class="tbl-wrap"><table>
     <thead><tr><th>Гейт</th><th>Хост</th><th>Приоритет</th><th></th></tr></thead>
     <tbody>

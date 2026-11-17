@@ -936,8 +936,8 @@ def _start_relay_jobs(request: Request, db: Session, gates: list[Node], pool_nam
 
     def _do(db: Session, gate: Node) -> str:
         info = node_ops.provision_gate_relay(db, gate)
-        return (f"Релей поднят → пул {info['pool']} "
-                f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})")
+        sni = f", SNI-роутер {info['sni']}" if info.get("sni") else ""
+        return f"Релей поднят: {info['summary']} (демон {info.get('daemon', '?')}{sni})"
 
     started, busy = [], []
     for gate in gates:
@@ -1003,6 +1003,9 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
     return render(request, "admin_park.html", user=admin, routes=routes, orphans=orphans,
                   free_gates=free_gates, gate_pools=gate_pools, groups=groups,
                   server_pools=db.query(ExitPool).order_by(ExitPool.name).all(),
+                  gate_pool_problems={
+                      gp.id: pool_ops.gate_pool_problem(db, gp.id) for gp in gate_pools if gp.routes
+                  },
                   protocols=ALL_PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
                   fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))
