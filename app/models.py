@@ -31,7 +31,19 @@ from .crypto import decrypt, encrypt
 
 PROTO_VLESS = "vless"
 PROTO_AWG = "awg"
+PROTO_NAIVE = "naive"
+# Protocols a client can pick for a device today. NaiveProxy joins once its
+# issuance is implemented; ALL_PROTOCOLS is what a server pool may be typed as.
 PROTOCOLS = (PROTO_VLESS, PROTO_AWG)
+ALL_PROTOCOLS = (PROTO_VLESS, PROTO_AWG, PROTO_NAIVE)
+PROTOCOL_LABELS = {PROTO_VLESS: "VLESS", PROTO_AWG: "AmneziaWG", PROTO_NAIVE: "NaiveProxy"}
+
+# DNS providers the panel can keep a route's client hostname in sync with
+# (A records = the route's live entry points). Only the API flavour differs.
+DNS_CLOUDFLARE = "cloudflare"
+DNS_DESEC = "desec"
+DNS_DYNV6 = "dynv6"
+DNS_KINDS = (DNS_CLOUDFLARE, DNS_DESEC, DNS_DYNV6)
 
 # A node's role in a route. An exit runs the VPN and leaves to the internet; a
 # gate is an RU relay placed in front of an exit (client → gate → exit → net).
@@ -199,8 +211,15 @@ class Node(Base):
     last_reconcile_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
     # Failover priority within the pool: LOWER = preferred. The gate relay sends
     # all traffic to the lowest-priority healthy member and only falls down to the
-    # next when it dies (active/standby, not load-balancing).
+    # next when it dies (active/standby, not load-balancing). For a gate it orders
+    # the gates of its gate pool (which one the panel manages exits through first).
     priority: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
+
+    # Gate-pool membership (gate nodes only). Every gate of a pool runs the same
+    # relay, so clients may enter through any of them.
+    gate_pool_id: Mapped[int | None] = mapped_column(
+        ForeignKey("gate_pools.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     # True once provisioning has put the fleet public key in the node's
@@ -275,6 +294,10 @@ class ExitPool(Base):
     __tablename__ = "exit_pools"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
+
+    # The protocol this pool's servers run (vless | naive | awg). Empty = a legacy
+    # pool from before typed pools: its exits run BOTH VLESS and AmneziaWG.
+    protocol: Mapped[str] = mapped_column(String(16), default="", server_default="")
 
     # --- VLESS Reality identity (shared across members) ---
     vless_port: Mapped[int] = mapped_column(Integer, default=17771)
@@ -353,13 +376,77 @@ class ExitPool(Base):
     def synced_exits(self) -> list["Node"]:
         return [n for n in self.members if n.sync_state == SYNC_SYNCED]
 
+    @property
+    def is_legacy(self) -> bool:
+        return not self.protocol
+
+    def serves(self, protocol: str) -> bool:
+        """Whether a device of `protocol` can get a config from this pool."""
+        if self.is_legacy:
+            return protocol in (PROTO_VLESS, PROTO_AWG)
+        return protocol == self.protocol
+
+    @property
+    def protocol_label(self) -> str:
+        if self.is_legacy:
+            return "VLESS + AmneziaWG"
+        return PROTOCOL_LABELS.get(self.protocol, self.protocol)
+
+
+class GatePool(Base):
+    """A set of interchangeable RU entry points (gates).
+
+    Every gate of the pool runs the same relay — built from ALL routes that use
+    the pool — so a client may enter through any of them, and one pool can front
+    several routes (several protocols) at once. Gates are expendable: adding or
+    replacing one changes only DNS and subscriptions, never the client's config."""
+
+    __tablename__ = "gate_pools"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    members: Mapped[list["Node"]] = relationship(
+        "Node", primaryjoin="Node.gate_pool_id == GatePool.id", viewonly=True
+    )
+    routes: Mapped[list["Route"]] = relationship("Route", back_populates="gate_pool", viewonly=True)
+
+    @property
+    def gates(self) -> list["Node"]:
+        """Gates in management/preference order (lower priority first)."""
+        return sorted(self.members, key=lambda n: (n.priority, n.id))
+
+
+class DnsProvider(Base):
+    """API access to one DNS zone, used to point a route's client hostname at the
+    route's live entry points. The token is stored encrypted, like node secrets."""
+
+    __tablename__ = "dns_providers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True)
+    kind: Mapped[str] = mapped_column(String(16))  # one of DNS_KINDS
+    zone: Mapped[str] = mapped_column(String(255))
+    token_enc: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def token(self) -> str | None:
+        return decrypt(self.token_enc)
+
+    @token.setter
+    def token(self, value: str | None) -> None:
+        self.token_enc = encrypt(value)
+
 
 class Route(Base):
-    """A path clients can pick: a GATE fronting an exit POOL.
+    """A path clients can pick: a protocol's server POOL, entered either through a
+    GATE POOL (RU relays) or directly.
 
-    The client always dials the gate (`host`); the gate's L4 relay fails over
-    across the pool's synced exits. The config's crypto comes from the pool's
-    shared identity, so it stays valid whichever exit currently serves it.
+    The client dials `host` — a hostname kept pointing at the route's live entry
+    points (or, when none is set, the first gate / server itself). Through a gate
+    pool, every gate's L4 relay fails over across the server pool's synced
+    members. The config's crypto comes from the server pool's shared identity, so
+    it stays valid whichever gate and whichever server currently carry it.
     """
 
     __tablename__ = "routes"
@@ -368,14 +455,25 @@ class Route(Base):
     pool_id: Mapped[int | None] = mapped_column(
         ForeignKey("exit_pools.id", ondelete="CASCADE"), nullable=True, index=True
     )
-    gate_id: Mapped[int | None] = mapped_column(
-        ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True
+    # NULL = direct: clients connect to the server pool itself, no RU gate.
+    gate_pool_id: Mapped[int | None] = mapped_column(
+        ForeignKey("gate_pools.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # What goes into client configs. Empty host = fall back to the first gate's
+    # (or, for a direct route, the first server's) public host; empty port = the
+    # protocol's default port of the server pool.
+    client_host: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Zone whose API keeps `client_host` A records = live entry points (optional).
+    dns_provider_id: Mapped[int | None] = mapped_column(
+        ForeignKey("dns_providers.id", ondelete="SET NULL"), nullable=True
     )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     pool: Mapped["ExitPool | None"] = relationship("ExitPool")
-    gate_node: Mapped["Node | None"] = relationship("Node", foreign_keys=[gate_id])
+    gate_pool: Mapped["GatePool | None"] = relationship("GatePool", back_populates="routes")
+    dns_provider: Mapped["DnsProvider | None"] = relationship("DnsProvider")
     # Access groups allowed to use this route. Empty = no client may use it.
     groups: Mapped[list["Group"]] = relationship(secondary=route_groups, back_populates="routes")
 
@@ -389,33 +487,61 @@ class Route(Base):
         return bool({g.id for g in self.groups} & set(user.group_ids))
 
     @property
+    def is_direct(self) -> bool:
+        return self.gate_pool_id is None
+
+    @property
+    def gates(self) -> list["Node"]:
+        return self.gate_pool.gates if self.gate_pool else []
+
+    @property
+    def primary_gate(self) -> "Node | None":
+        gates = self.gates
+        return gates[0] if gates else None
+
+    @property
+    def entry_points(self) -> list["Node"]:
+        """Nodes clients actually connect to: the gates, or (direct) the servers."""
+        if not self.is_direct:
+            return self.gates
+        return sorted(self.pool.members, key=lambda n: (n.priority, n.id)) if self.pool else []
+
+    @property
     def host(self) -> str:
-        """Host clients dial — the gate (the stable, domestic failover point)."""
-        return self.gate_node.public_host if self.gate_node else ""
+        """Host clients dial: the managed hostname, else the first entry point."""
+        if self.client_host:
+            return self.client_host
+        entries = self.entry_points
+        return entries[0].public_host if entries else ""
+
+    def serves(self, protocol: str) -> bool:
+        return bool(self.pool and self.pool.serves(protocol))
+
+    @property
+    def protocol_label(self) -> str:
+        return self.pool.protocol_label if self.pool else "—"
 
     @property
     def hops(self) -> str:
-        """Human path, e.g. 'gate-ru-1 → pool:eu (2 exit)'."""
-        gate = self.gate_node.name if self.gate_node else "—"
+        """Human path, e.g. 'гейты:ru-a (2) → пул:eu (2 exit)'."""
+        entry = "напрямую" if self.is_direct else (
+            f"гейты:{self.gate_pool.name} ({len(self.gates)})" if self.gate_pool else "—"
+        )
         if self.pool:
-            return f"{gate} → пул:{self.pool.name} ({len(self.pool.exits)} exit)"
-        return f"{gate} → ?"
+            return f"{entry} → пул:{self.pool.name} ({len(self.pool.exits)} exit)"
+        return f"{entry} → ?"
 
     @property
     def is_blocked(self) -> bool:
-        """Unusable if there is no gate/pool, or the pool has no synced exit."""
-        if self.gate_node is None or self.pool is None:
-            return True
-        if not self.pool.synced_exits:
-            return True
-        return False
+        return bool(self.block_reason)
 
     @property
     def block_reason(self) -> str:
-        if self.gate_node is None:
-            return "нет гейта"
+        """Why the route can't serve clients right now ('' = it can)."""
         if self.pool is None:
             return "нет пула выходов"
+        if not self.is_direct and not self.gates:
+            return "в пуле гейтов нет гейтов"
         if not self.pool.synced_exits:
             return "в пуле нет синхронизированных выходов"
         return ""
@@ -483,6 +609,9 @@ class Device(Base):
     route_id: Mapped[int | None] = mapped_column(
         ForeignKey("routes.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Secret part of the device's subscription URL (random, unguessable). NULL until
+    # first requested; re-issuing it revokes the old URL.
+    sub_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped[User] = relationship(back_populates="devices")
@@ -539,9 +668,20 @@ class IssuedConfig(Base):
     sub_id: Mapped[str] = mapped_column(String(64), default="")        # vless subId (forced on clones)
     address: Mapped[str] = mapped_column(String(64), default="")       # awg ip
     payload: Mapped[str] = mapped_column(Text, default="")             # vless link / awg vpn://
+    # A per-device secret the servers must know in clear (NaiveProxy password),
+    # stored encrypted like node secrets.
+    secret_enc: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     device: Mapped[Device] = relationship(back_populates="configs")
+
+    @property
+    def secret(self) -> str | None:
+        return decrypt(self.secret_enc)
+
+    @secret.setter
+    def secret(self, value: str | None) -> None:
+        self.secret_enc = encrypt(value)
 
 
 class TrafficStat(Base):

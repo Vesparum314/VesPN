@@ -65,67 +65,115 @@ def _creds(node: Node) -> NodeCredentials:
     )
 
 
-def _gate_creds_for(node: Node) -> NodeCredentials | None:
-    """SSH jump host for reaching a pooled exit: its pool's gate. RU DPI drops the
-    direct Hub→exit handshake for flagged ranges, but the gate reaches the exit, so
-    the panel tunnels its management SSH through the gate (the gate only forwards
-    ciphertext, never authenticates to the exit). Returns None for gates, non-pooled
-    nodes, or when no gate is resolvable (then we connect directly)."""
+def _gate_candidates_for(node: Node) -> list[Node]:
+    """Gates the panel may jump through to reach a pooled exit, in the order to try
+    them: the gates of every gate pool fronting the exit's pool (routes by id,
+    gates by priority). RU DPI drops the direct Hub→exit handshake for flagged
+    ranges, but a gate reaches the exit, so management SSH is tunnelled through a
+    gate (it only forwards ciphertext, never authenticates to the exit). Any gate
+    of those pools will do — so losing one gate never cuts the panel off.
+
+    Empty for gates, non-pooled nodes, and pools served only by direct routes."""
     try:
         if node.role != ROLE_EXIT or node.pool_id is None:
-            return None
+            return []
         sess = object_session(node)
         if sess is None:
-            return None
-        route = (
+            return []
+        routes = (
             sess.query(Route)
-            .filter(Route.pool_id == node.pool_id, Route.gate_id.isnot(None))
+            .filter(Route.pool_id == node.pool_id, Route.gate_pool_id.isnot(None))
             .order_by(Route.id)
-            .first()
+            .all()
         )
-        gate = route.gate_node if route else None
-        if gate is None:
+        seen: set[int] = set()
+        gates: list[Node] = []
+        for r in routes:
+            for g in r.gates:
+                if g.id not in seen and g.id != node.id:
+                    seen.add(g.id)
+                    gates.append(g)
+        if not gates and not _pool_has_routes(sess, node.pool_id):
             # Exit provisioned before its route exists (first-time self-service): if
             # exactly one gate node is registered, front through it. With several we
-            # can't guess — a route must then say which gate fronts this pool.
-            gates = sess.query(Node).filter(Node.role == ROLE_GATE).all()
-            if len(gates) == 1:
-                gate = gates[0]
-        if gate is None or gate.id == node.id:
-            return None
-        return NodeCredentials(
-            host=gate.ssh_host, port=gate.ssh_port,
-            username=gate.ssh_username, password=gate.ssh_password,
-            pkey=_fleet_pkey(gate),
-        )
+            # can't guess — a route must then say which gate pool fronts this pool.
+            lone = sess.query(Node).filter(Node.role == ROLE_GATE).all()
+            if len(lone) == 1 and lone[0].id != node.id:
+                gates = lone
+        return gates
     except Exception:
-        return None
+        return []
+
+
+def _pool_has_routes(sess: Session, pool_id: int) -> bool:
+    return sess.query(Route.id).filter(Route.pool_id == pool_id).first() is not None
+
+
+def _jump_creds(gate: Node) -> NodeCredentials:
+    return NodeCredentials(
+        host=gate.ssh_host, port=gate.ssh_port,
+        username=gate.ssh_username, password=gate.ssh_password,
+        pkey=_fleet_pkey(gate),
+    )
+
+
+def _gate_creds_for(node: Node) -> NodeCredentials | None:
+    """Credentials of the first gate to jump through (see _gate_candidates_for)."""
+    gates = _gate_candidates_for(node)
+    return _jump_creds(gates[0]) if gates else None
 
 
 def _exit_needs_gate(node: Node) -> bool:
-    """Every pooled exit is managed STRICTLY through its gate: the panel never opens
-    a direct Hub→exit connection on its own, so no such link exists for RU DPI to
-    flag. (Gates and nodes with no pool have no gate fronting them.)"""
-    return node.role == ROLE_EXIT and node.pool_id is not None
+    """A pooled exit is managed STRICTLY through a gate: the panel never opens a
+    direct Hub→exit connection on its own, so no such link exists for RU DPI to
+    flag. The exception is a pool that only DIRECT routes use — its clients already
+    reach the servers directly, so there's nothing to hide and no gate to use.
+    (Gates and nodes with no pool have no gate fronting them.)"""
+    if node.role != ROLE_EXIT or node.pool_id is None:
+        return False
+    sess = object_session(node)
+    if sess is None:
+        return True
+    if not _pool_has_routes(sess, node.pool_id):
+        return True  # no route yet: stay strict (it will most likely get a gate)
+    return (
+        sess.query(Route.id)
+        .filter(Route.pool_id == node.pool_id, Route.gate_pool_id.isnot(None))
+        .first()
+        is not None
+    )
+
+
+def _connect_via_gates(node: Node) -> SSHNode:
+    """Open SSH to a pooled exit through the first gate that works."""
+    gates = _gate_candidates_for(node)
+    if not gates:
+        raise NodeOpError(
+            f"выход «{node.name}»: панель управляет выходом только через гейт, но "
+            f"гейт не определён — сначала раскатайте гейт и свяжите его с пулом"
+        )
+    errors: list[str] = []
+    for gate in gates:
+        try:
+            return SSHNode(_creds(node), jump=_jump_creds(gate)).connect()
+        except Exception as e:
+            log.warning("via gate %s to %s failed: %s", gate.name, node.name, e)
+            errors.append(f"{gate.name}: {e}")
+    raise NodeOpError(f"выход «{node.name}» недоступен ни через один гейт ({'; '.join(errors)})")
 
 
 @contextmanager
 def connect(node: Node, allow_direct: bool = False):
-    """SSH to a node. A pooled exit is reached ONLY through its gate (ProxyJump):
-    there is no automatic direct fallback, so the panel never opens a Hub→exit
-    connection by itself — if the gate path can't be established we raise (instead
-    of hanging on DPI). The sole exception is `allow_direct=True`, an explicit admin
-    override (the «connect directly» button) that bypasses the gate to diagnose an
-    exit unreachable through it, at the cost of a visible Hub→exit connection. Gates
-    and gateless nodes have no fronting gate and are connected to directly."""
+    """SSH to a node. A pooled exit is reached ONLY through a gate (ProxyJump),
+    trying the gates of its gate pools in turn: there is no automatic direct
+    fallback, so the panel never opens a Hub→exit connection by itself — if no gate
+    path can be established we raise (instead of hanging on DPI). The sole
+    exception is `allow_direct=True`, an explicit admin override (the «connect
+    directly» button) that bypasses the gate to diagnose an exit unreachable
+    through it, at the cost of a visible Hub→exit connection. Gates, gateless
+    nodes and servers of direct-only pools are connected to directly."""
     if _exit_needs_gate(node) and not allow_direct:
-        jump = _gate_creds_for(node)
-        if jump is None:
-            raise NodeOpError(
-                f"выход «{node.name}»: панель управляет выходом только через гейт, но "
-                f"гейт не определён — сначала раскатайте гейт и свяжите его с пулом"
-            )
-        n = SSHNode(_creds(node), jump=jump).connect()
+        n = _connect_via_gates(node)
     else:
         n = SSHNode(_creds(node)).connect()
     try:
@@ -143,10 +191,7 @@ def open_proxy_tunnel(node: Node, remote_port: int, remote_host: str = "127.0.0.
     from .node_ssh import _LocalForward
 
     if _exit_needs_gate(node):
-        jump = _gate_creds_for(node)
-        if jump is None:
-            raise NodeOpError(f"выход «{node.name}»: гейт не определён — туннель невозможен")
-        n = SSHNode(_creds(node), jump=jump).connect()
+        n = _connect_via_gates(node)
     else:
         n = SSHNode(_creds(node)).connect()
     fwd = _LocalForward(n.transport, remote_host, remote_port)
@@ -233,8 +278,8 @@ def provision_node(db: Session, node: Node) -> dict:
     return {**info, "awg_port": awg_port, "awg": awg_info}
 
 
-def provision_gate_for_route(db: Session, route) -> dict:
-    """Set the route's gate up as a health-checked L4 relay to its exit pool."""
+def provision_gate_relay(db: Session, gate: Node) -> dict:
+    """Set a gate up as a health-checked L4 relay for its gate pool's route."""
     from . import pool
 
-    return pool.provision_gate_for_route(db, route)
+    return pool.provision_gate_relay(db, gate)

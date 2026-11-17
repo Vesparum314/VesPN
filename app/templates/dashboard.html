@@ -49,7 +49,7 @@
       <label>Маршрут
         <select name="route_id" required>
           {% for r in routes if not r.is_blocked %}
-            <option value="{{ r.id }}">{{ r.name }}</option>
+            <option value="{{ r.id }}">{{ r.name }} · {{ r.protocol_label }}</option>
           {% endfor %}
         </select>
       </label>

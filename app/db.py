@@ -56,6 +56,7 @@ def init_db() -> None:
     _rebuild_changed_tables()
     Base.metadata.create_all(bind=engine)
     _add_columns()
+    _migrate_route_gates()
     _reset_orphaned_jobs()
     _seed_default_group()
     _migrate_announcement()
@@ -154,6 +155,67 @@ def _add_columns() -> None:
                 )
         if "created_by" not in cols("users"):
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN created_by INTEGER")
+        # Gate pools, typed server pools, client host/port per route, subscriptions.
+        if "gate_pool_id" not in cols("nodes"):
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN gate_pool_id INTEGER")
+        if "protocol" not in cols("exit_pools"):
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN protocol VARCHAR(16) NOT NULL DEFAULT ''")
+        rcols = cols("routes")
+        if "gate_pool_id" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN gate_pool_id INTEGER")
+        if "client_host" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN client_host VARCHAR(255) NOT NULL DEFAULT ''")
+        if "client_port" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN client_port INTEGER")
+        if "dns_provider_id" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN dns_provider_id INTEGER")
+        if "sub_token" not in cols("devices"):
+            # SQLite can't ADD a UNIQUE column — add it, then the same unique index
+            # create_all builds on a fresh DB (NULLs don't collide).
+            conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN sub_token VARCHAR(64)")
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_devices_sub_token ON devices (sub_token)"
+            )
+        if "secret_enc" not in cols("issued_configs"):
+            conn.exec_driver_sql("ALTER TABLE issued_configs ADD COLUMN secret_enc VARCHAR(512)")
+
+
+def _migrate_route_gates() -> None:
+    """One-time: routes used to point at ONE gate node (`routes.gate_id`). Move each
+    such gate into a gate pool (reusing the pool if the gate is already in one) and
+    point the route at that pool. `gate_id` stays in old tables, unused."""
+    with engine.begin() as conn:
+        rcols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(routes)")]
+        if "gate_id" not in rcols:
+            return  # fresh DB: never had single-gate routes
+        rows = conn.exec_driver_sql(
+            "SELECT r.id, r.gate_id, n.name, n.gate_pool_id FROM routes r "
+            "JOIN nodes n ON n.id = r.gate_id "
+            "WHERE r.gate_id IS NOT NULL AND r.gate_pool_id IS NULL"
+        ).fetchall()
+        for route_id, gate_id, gate_name, gate_pool_id in rows:
+            if gate_pool_id is None:
+                # The gate may have been pooled by an earlier row of this loop.
+                gate_pool_id = conn.exec_driver_sql(
+                    "SELECT gate_pool_id FROM nodes WHERE id = :g", {"g": gate_id}
+                ).fetchone()[0]
+            if gate_pool_id is None:
+                name, n = gate_name, 1
+                while conn.exec_driver_sql(
+                    "SELECT 1 FROM gate_pools WHERE name = :n", {"n": name}
+                ).fetchone():
+                    n += 1
+                    name = f"{gate_name}-{n}"
+                conn.exec_driver_sql("INSERT INTO gate_pools (name) VALUES (:n)", {"n": name})
+                gate_pool_id = conn.exec_driver_sql(
+                    "SELECT id FROM gate_pools WHERE name = :n", {"n": name}
+                ).fetchone()[0]
+                conn.exec_driver_sql(
+                    "UPDATE nodes SET gate_pool_id = :p WHERE id = :g", {"p": gate_pool_id, "g": gate_id}
+                )
+            conn.exec_driver_sql(
+                "UPDATE routes SET gate_pool_id = :p WHERE id = :r", {"p": gate_pool_id, "r": route_id}
+            )
 
 
 def _reset_orphaned_jobs() -> None:

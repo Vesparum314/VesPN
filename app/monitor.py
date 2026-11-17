@@ -123,12 +123,13 @@ def run_checks(db: Session) -> dict:
         p = pools.get(node.pool_id)
         return p.name if p else None
 
-    # Which gate fronts a given pooled exit — its pool's route gate.
+    # Which gate fronts a given pooled exit — the first gate of its route's gate
+    # pool (the one management goes through first).
     gate_for_exit: dict[int, Node] = {}
     for r in routes:
-        if r.gate_node and r.pool:
+        if r.primary_gate and r.pool:
             for m in r.pool.members:
-                gate_for_exit.setdefault(m.id, r.gate_node)
+                gate_for_exit.setdefault(m.id, r.primary_gate)
 
     mgmt_state: dict[int, bool] = {}    # node_id -> Hub→node management reachable
     client_state: dict[int, bool] = {}  # exit node_id -> gate→exit (VLESS) reachable
@@ -177,7 +178,7 @@ def run_checks(db: Session) -> dict:
 
         # --- view (б): client path (gate → pool exits on traffic ports) ----
         for r in routes:
-            gate, pool = r.gate_node, r.pool
+            gate, pool = r.primary_gate, r.pool
             if not gate or not pool:
                 continue
             g = gate_g(gate)

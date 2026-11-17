@@ -5,7 +5,7 @@
 <div class="head">
   <div>
     <h1>Парк</h1>
-    <div class="sub">Маршрут = гейт (вход, RU) + его выходы с общей идентичностью. Выход управляется и обслуживается <b>только через свой гейт</b>. Клиент дертит гейт, тот переключается между живыми выходами.</div>
+    <div class="sub">Маршрут = вход (пул гейтов в RU или напрямую) + пул серверов одного протокола с общей идентичностью. Выход за гейтами управляется <b>только через гейты</b> (любой живой гейт пула). Клиент подключается к любому гейту пула, тот переключается между живыми выходами. Один пул гейтов может обслуживать несколько маршрутов.</div>
   </div>
   <button class="btn btn-primary" type="button" onclick="document.getElementById('dlg-route').showModal()">Создать маршрут</button>
 </div>
@@ -20,12 +20,16 @@
 <div class="panel">
   <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
     <h2 style="margin:0">Маршрут «{{ r.name }}»
+      <span class="badge b-exit">{{ r.protocol_label }}</span>
       {% if r.enabled %}<span class="badge b-ok">включён</span>{% else %}<span class="badge b-exit">выключен</span>{% endif %}
       {% if r.is_blocked %}<span class="badge b-bad" title="{{ r.block_reason }}">не работает</span>{% endif %}
     </h2>
     <div class="row-actions">
-      {% if r.gate_node and r.pool %}
-      <form method="post" action="/admin/routes/{{ r.id }}/provision_relay" onsubmit="return confirm('Поднять/обновить релей на {{ r.gate_node.name }}?')"{% if r.gate_node.job_running %} data-job-running="{{ r.gate_node.id }}"{% endif %}><button class="btn btn-sm"{% if r.gate_node.job_running %} disabled{% endif %}>{{ '⏳ релей…' if r.gate_node.job_running else 'Поднять релей' }}</button></form>
+      {% if r.gates and r.pool %}
+      {% set relay_busy = r.gates|selectattr('job_running')|list %}
+      <form method="post" action="/admin/routes/{{ r.id }}/provision_relay" onsubmit="return confirm('Поднять/обновить релей на всех гейтах пула ({{ r.gates|map(attribute='name')|join(', ') }})?')"><button class="btn btn-sm"{% if relay_busy %} disabled{% endif %}>{{ '⏳ релей…' if relay_busy else 'Поднять релей' }}</button></form>
+      {% endif %}
+      {% if r.pool %}
       <form method="post" action="/admin/pools/{{ r.pool.id }}/reconcile"><button class="btn btn-ghost btn-sm">Синхронизировать</button></form>
       {% endif %}
       <form method="post" action="/admin/routes/{{ r.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Выключить' if r.enabled else 'Включить' }}</button></form>
@@ -33,7 +37,41 @@
     </div>
   </div>
   <div class="panel-b">
-    <div class="sub" style="margin-bottom:10px">Гейт: <b>{{ r.gate_node.name if r.gate_node else '— не задан' }}</b>{% if r.gate_node %} <span class="mono">{{ r.gate_node.public_host }}</span> {{ jobbadge(r.gate_node) }}{% endif %} · адрес для клиентов: <span class="mono">{{ r.host or '—' }}</span></div>
+    <div class="sub" style="margin-bottom:6px">Вход:
+      {% if r.is_direct %}<b>напрямую</b> (клиенты подключаются к серверам пула)
+      {% else %}пул гейтов <b>«{{ r.gate_pool.name }}»</b>{% if r.gate_pool.routes|length > 1 %} <span class="badge b-warn" title="этот пул гейтов обслуживает и другие маршруты">общий: {{ r.gate_pool.routes|length }} маршр.</span>{% endif %}{% endif %}
+      · адрес для клиентов: <span class="mono">{{ r.host or '—' }}</span>{% if r.client_host %} <span class="muted">(имя)</span>{% endif %}</div>
+    {% if not r.is_direct %}
+    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px">
+      {% for g in r.gates %}
+      <div class="status-form"{% if g.job_running %} data-job-running="{{ g.id }}"{% endif %}>
+        <span class="badge b-gate">gate</span> <b>{{ g.name }}</b> <span class="mono">{{ g.public_host }}</span> {{ jobbadge(g) }}
+        <form method="post" action="/admin/nodes/{{ g.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
+        <form method="post" action="/admin/nodes/{{ g.id }}/gate_pool" onsubmit="return confirm('Убрать {{ g.name }} из пула гейтов «{{ r.gate_pool.name }}»{% if r.gate_pool.routes|length > 1 %} (он общий для нескольких маршрутов){% endif %}?')"><button class="btn btn-ghost btn-sm">Убрать</button></form>
+      </div>
+      {% else %}
+      <span class="badge b-warn">в пуле гейтов нет гейтов</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="status-form" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+      {% if free_gates %}
+      <form method="post" action="/admin/routes/{{ r.id }}/gates" class="status-form">
+        <select name="gate_id">{% for g in free_gates %}<option value="{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% endfor %}</select>
+        <button class="btn btn-ghost btn-sm">+ Гейт в пул</button>
+      </form>
+      {% endif %}
+      {% set other_gp = gate_pools|rejectattr('id', 'equalto', r.gate_pool_id)|list %}
+      {% if other_gp or not r.is_direct %}
+      <form method="post" action="/admin/routes/{{ r.id }}/entry" class="status-form" onsubmit="return confirm('Сменить вход маршрута «{{ r.name }}»? Конфиги клиентов не меняются; на гейтах нового пула нужно поднять релей.')">
+        <select name="entry">
+          {% for gp in other_gp %}<option value="gatepool:{{ gp.id }}">пул гейтов «{{ gp.name }}» ({{ gp.members|length }})</option>{% endfor %}
+          {% if not r.is_direct %}<option value="direct">напрямую (без гейтов)</option>{% endif %}
+        </select>
+        <button class="btn btn-ghost btn-sm">Сменить вход</button>
+      </form>
+      {% endif %}
+    </div>
 
     <form method="post" action="/admin/routes/{{ r.id }}/groups" class="status-form" style="margin-bottom:10px;flex-wrap:wrap">
       <span class="muted">Доступ (группы):</span>
@@ -111,7 +149,9 @@
             <select name="pool_id"><option value="">— в маршрут…</option>{% for r in routes %}{% if r.pool %}<option value="{{ r.pool.id }}">{{ r.name }}</option>{% endif %}{% endfor %}</select>
             <button class="btn btn-ghost btn-sm">Привязать</button>
           </form>
-          {% else %}<span class="muted">используйте как гейт в «Создать маршрут»</span>{% endif %}
+          {% elif n.gate_pool_id %}<span class="muted">в пуле гейтов, который не использует ни один маршрут</span>
+          <form method="post" action="/admin/nodes/{{ n.id }}/gate_pool"><button class="btn btn-ghost btn-sm">Вынуть из пула</button></form>
+          {% else %}<span class="muted">добавьте в маршрут («+ Гейт в пул») или выберите в «Создать маршрут»</span>{% endif %}
           <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
           <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
         </div></td>
@@ -140,9 +180,16 @@
     <h2 style="margin:0 0 12px">Новый маршрут</h2>
     <div style="display:flex;flex-direction:column;gap:12px">
       <label>Имя <input name="name" required placeholder="eu"></label>
-      <label>Гейт (вход)
-        <select name="gate_id" required>
-          {% for g in free_gates %}<option value="{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% else %}<option value="" disabled selected>нет свободных gate — добавьте сервер с ролью gate</option>{% endfor %}
+      <label>Протокол
+        <select name="protocol">
+          {% for p in protocols %}<option value="{{ p }}">{{ protocol_labels[p] }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Вход
+        <select name="entry" required>
+          {% if gate_pools %}<optgroup label="Существующий пул гейтов">{% for gp in gate_pools %}<option value="gatepool:{{ gp.id }}">«{{ gp.name }}» ({{ gp.members|length }} гейт.){% if gp.routes %} · уже обслуживает: {{ gp.routes|map(attribute='name')|join(', ') }}{% endif %}</option>{% endfor %}</optgroup>{% endif %}
+          {% if free_gates %}<optgroup label="Свободный гейт (станет новым пулом)">{% for g in free_gates %}<option value="gate:{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% endfor %}</optgroup>{% endif %}
+          <option value="direct">Напрямую, без гейтов</option>
         </select>
       </label>
       <details><summary class="muted">Дополнительно</summary>

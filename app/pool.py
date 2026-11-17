@@ -44,7 +44,14 @@ from .models import (
     Route,
     slugify,
 )
-from .nodes import NodeOpError, _gate_creds_for, _rewrite_vless_host, _set_vless_label, connect
+from .nodes import (
+    NodeOpError,
+    _exit_needs_gate,
+    _gate_creds_for,
+    _rewrite_vless_host,
+    _set_vless_label,
+    connect,
+)
 from .xui import XUIClient
 
 log = logging.getLogger("vpnpanel.pool")
@@ -100,13 +107,16 @@ def _gen_reality_keypair() -> tuple[str, str]:
 
 
 def create_pool(
-    db: Session, name: str, vless_port: int = DEFAULT_VLESS_PORT, awg_port: int = DEFAULT_AWG_PORT
+    db: Session, name: str, vless_port: int = DEFAULT_VLESS_PORT, awg_port: int = DEFAULT_AWG_PORT,
+    protocol: str = "",
 ) -> ExitPool:
-    """Generate a fresh pool identity (Reality + AmneziaWG) and persist it."""
+    """Generate a fresh pool identity (Reality + AmneziaWG) and persist it.
+    `protocol` types the pool (vless | naive | awg); empty = legacy VLESS+AWG."""
     rpriv, rpub = _gen_reality_keypair()
     apriv, apub = awg.gen_keypair()
     pool = ExitPool(
         name=name.strip(),
+        protocol=protocol,
         vless_port=vless_port,
         awg_port=awg_port,
         reality_public=rpub,
@@ -152,12 +162,12 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
     pool = db.get(ExitPool, node.pool_id)
     if pool is None:
         raise NodeOpError("пул не найден")
-    # Model A: a pooled exit is always managed THROUGH its gate (RU DPI drops the
+    # A pooled exit behind gates is always managed THROUGH a gate (RU DPI drops the
     # direct Hub→exit handshake). Require a resolvable gate before we start, so
     # rollout never silently depends on a direct connection that dies on DPI.
-    if _gate_creds_for(node) is None:
+    if _exit_needs_gate(node) and _gate_creds_for(node) is None:
         raise NodeOpError(
-            "у пула нет гейта: заведите gate-ноду и маршрут (пул→гейт) до раскатки выхода"
+            "у пула нет гейта: заведите пул гейтов и маршрут (пул→гейты) до раскатки выхода"
         )
 
     with connect(node) as n:
@@ -338,12 +348,16 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
     if not route.allows(device.user):
         raise NodeOpError("этот маршрут вам недоступен — выберите другой")
     pool = route.pool
-    gate = route.gate_node
     if pool is None:
         raise NodeOpError("у маршрута нет пула выходов")
-    if gate is None:
-        raise NodeOpError("у маршрута нет гейта")
-    host = route.host  # the gate
+    if not route.is_direct and not route.gates:
+        raise NodeOpError("в пуле гейтов маршрута нет гейтов")
+    if not pool.serves(device.protocol):
+        raise NodeOpError(
+            f"маршрут «{route.name}» — {pool.protocol_label}, а устройство — "
+            f"{device.protocol}: выберите маршрут этого протокола"
+        )
+    host = route.host  # managed hostname, else the first gate / server
 
     existing = db.query(IssuedConfig).filter_by(device_id=device.id).one_or_none()
 
@@ -482,14 +496,28 @@ def deprovision_device(db: Session, device: Device) -> None:
 
 
 # --- gate relay for a pool route ---------------------------------------
-def provision_gate_for_route(db: Session, route: Route) -> dict:
-    """Set the route's gate up as a health-checked L4 relay to its pool: push the
-    member IPs + the pool's service ports, deploy the daemon. The daemon then
-    steers DNAT to live members only."""
-    gate = route.gate_node
+def provision_gate_relay(db: Session, gate: Node) -> dict:
+    """Set one gate up as a health-checked L4 relay for its gate pool's route: push
+    the member IPs + the pool's service ports, deploy the daemon. The daemon then
+    steers DNAT to live members only. Every gate of a gate pool gets the same relay.
+
+    One route per gate pool for now: a pool fronting several routes needs the
+    relay to be generated from all of them (SNI routing on a shared TCP port),
+    which this daemon can't express yet — refuse rather than overwrite."""
+    if not gate.is_gate:
+        raise NodeOpError(f"«{gate.name}» — не gate-сервер")
+    if gate.gate_pool_id is None:
+        raise NodeOpError(f"гейт «{gate.name}» не входит в пул гейтов")
+    routes = db.query(Route).filter(Route.gate_pool_id == gate.gate_pool_id).all()
+    if not routes:
+        raise NodeOpError(f"пул гейтов «{gate.name}» не используется ни одним маршрутом")
+    if len({r.pool_id for r in routes}) > 1:
+        raise NodeOpError(
+            "пул гейтов обслуживает несколько маршрутов с разными пулами серверов — "
+            "общий релей ещё не поддерживается"
+        )
+    route = routes[0]
     pool = route.pool
-    if gate is None or not gate.is_gate:
-        raise NodeOpError("у маршрута нет gate-сервера")
     if pool is None:
         raise NodeOpError("у маршрута нет пула выходов")
     # Priority order (lower = preferred): the gate daemon routes to the first

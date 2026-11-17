@@ -29,9 +29,11 @@ from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
 from .models import (
+    ALL_PROTOCOLS,
     JOB_RUNNING,
     PROTO_AWG,
     PROTO_VLESS,
+    PROTOCOL_LABELS,
     PROTOCOLS,
     ROLE_ADMIN,
     ROLE_CLIENT,
@@ -43,6 +45,7 @@ from .models import (
     Announcement,
     Device,
     ExitPool,
+    GatePool,
     Group,
     IssuedConfig,
     Node,
@@ -370,6 +373,9 @@ def create_device(
     if route.is_blocked:
         flash(request, "Маршрут временно недоступен — попробуйте позже", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    if not route.serves(protocol):
+        flash(request, f"Маршрут «{route.name}» — для {route.protocol_label}, выберите другой", "error")
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     exists = db.query(Device).filter_by(user_id=user.id, name=name, protocol=protocol).first()
     if exists:
         flash(request, "Устройство с таким именем и протоколом уже есть", "error")
@@ -653,31 +659,138 @@ def admin_routes(request: Request, db: Session = Depends(get_db)):
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
+def _gate_pool_of(db: Session, gate: Node) -> GatePool:
+    """The gate's pool, creating a one-gate pool named after it if it has none."""
+    if gate.gate_pool_id:
+        gp = db.get(GatePool, gate.gate_pool_id)
+        if gp:
+            return gp
+    name, n = gate.name, 1
+    while db.query(GatePool).filter_by(name=name).first():
+        n += 1
+        name = f"{gate.name}-{n}"
+    gp = GatePool(name=name)
+    db.add(gp)
+    db.flush()
+    gate.gate_pool_id = gp.id
+    return gp
+
+
+class _EntryError(ValueError):
+    pass
+
+
+def _resolve_entry(db: Session, entry: str) -> int | None:
+    """Parse the route «entry» field into a gate_pool_id (None = direct).
+    'gatepool:<id>' — an existing gate pool; 'gate:<id>' — a gate, pooled on the
+    fly if needed; 'direct' — no gate. Raises _EntryError with a user message."""
+    entry = (entry or "").strip()
+    if entry == "direct":
+        return None
+    kind, _, raw = entry.partition(":")
+    if not raw.isdigit():
+        raise _EntryError("Выберите вход маршрута: пул гейтов, гейт или «напрямую»")
+    if kind == "gatepool":
+        gp = db.get(GatePool, int(raw))
+        if gp is None:
+            raise _EntryError("Пул гейтов не найден")
+        return gp.id
+    if kind == "gate":
+        gate = db.get(Node, int(raw))
+        if gate is None or gate.role != ROLE_GATE:
+            raise _EntryError("Выберите gate-сервер")
+        return _gate_pool_of(db, gate).id
+    raise _EntryError("Непонятный вход маршрута")
+
+
 @app.post("/admin/routes")
 def admin_add_route(
     request: Request,
     name: str = Form(...),
-    gate_id: str = Form(""),
+    entry: str = Form(""),
+    gate_id: str = Form(""),  # legacy form field: a single gate
     pool_id: str = Form(""),
     db: Session = Depends(get_db),
 ):
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
-    gate_node = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if not entry and gate_id.strip().isdigit():
+        entry = f"gate:{gate_id.strip()}"
     pool = db.get(ExitPool, int(pool_id)) if pool_id.strip().isdigit() else None
     if not name:
         flash(request, "Укажите имя маршрута", "error")
     elif db.query(Route).filter_by(name=name).first():
         flash(request, "Маршрут с таким именем уже есть", "error")
-    elif not gate_node or gate_node.role != ROLE_GATE:
-        flash(request, "Выберите входной сервер (gate)", "error")
     elif not pool:
         flash(request, "Выберите пул выходов", "error")
     else:
-        db.add(Route(name=name, gate_id=gate_node.id, pool_id=pool.id))
+        try:
+            gpid = _resolve_entry(db, entry)
+        except _EntryError as e:
+            db.rollback()
+            flash(request, str(e), "error")
+        else:
+            db.add(Route(name=name, gate_pool_id=gpid, pool_id=pool.id))
+            db.commit()
+            flash(request, f"Маршрут «{name}» создан", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/entry")
+def admin_set_route_entry(
+    request: Request, route_id: int, entry: str = Form(""), db: Session = Depends(get_db)
+):
+    """Move a route to another gate pool (or make it direct). Clients' configs
+    don't change — only where their hostname/subscription points (DNS and relays
+    of the new pool must be brought up)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if route:
+        try:
+            route.gate_pool_id = _resolve_entry(db, entry)
+        except _EntryError as e:
+            db.rollback()
+            flash(request, str(e), "error")
+        else:
+            db.commit()
+            where = "напрямую" if route.is_direct else f"пул гейтов «{route.gate_pool.name}»"
+            flash(request, f"Маршрут «{route.name}»: вход — {where}. Поднимите релей на гейтах.", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/gates")
+def admin_add_route_gate(
+    request: Request, route_id: int, gate_id: str = Form(""), db: Session = Depends(get_db)
+):
+    """Add a gate to the route's gate pool (creating the pool for a direct route)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if route and gate and gate.role == ROLE_GATE:
+        if route.gate_pool_id is None:
+            route.gate_pool_id = _gate_pool_of(db, gate).id
+        else:
+            gate.gate_pool_id = route.gate_pool_id
         db.commit()
-        flash(request, f"Маршрут «{name}» создан", "success")
+        flash(request, f"«{gate.name}» → пул гейтов «{route.gate_pool.name}». Поднимите на нём релей.", "success")
+    elif route:
+        flash(request, "Выберите gate-сервер", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/nodes/{node_id}/gate_pool")
+def admin_unpool_gate(request: Request, node_id: int, db: Session = Depends(get_db)):
+    """Take a gate out of its gate pool (it stays in the fleet, unassigned)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    node = db.get(Node, node_id)
+    if node and node.role == ROLE_GATE:
+        node.gate_pool_id = None
+        db.commit()
+        flash(request, f"«{node.name}» убран из пула гейтов", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -727,24 +840,23 @@ def admin_provision_relay(request: Request, route_id: int, db: Session = Depends
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
-    if route and route.gate_node and route.pool:
-        gate = route.gate_node
-        rid = route.id
-
-        # Raising the relay is a long op too — background it on the gate node, so the
-        # «Поднять релей» button reports progress and can't be double-fired.
+    if route and route.gates and route.pool:
+        # Raising a relay is a long op — background it on EACH gate of the pool, so
+        # every gate reports its own progress and can't be double-fired.
         def _do(db: Session, gate: Node) -> str:
-            route = db.get(Route, rid)
-            info = node_ops.provision_gate_for_route(db, route)
+            info = node_ops.provision_gate_relay(db, gate)
             return (f"Релей поднят → пул {info['pool']} "
                     f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})")
 
-        if jobs.start_node_job(db, gate, "relay", _do):
-            flash(request, f"«{gate.name}»: подъём релея запущен в фоне — статус на «Парке».", "success")
-        else:
-            flash(request, f"«{gate.name}»: операция уже идёт — дождитесь завершения.", "error")
+        started, busy = [], []
+        for gate in route.gates:
+            (started if jobs.start_node_job(db, gate, "relay", _do) else busy).append(gate.name)
+        if started:
+            flash(request, f"Подъём релея запущен в фоне: {', '.join(started)} — статус на «Парке».", "success")
+        if busy:
+            flash(request, f"Уже идёт операция: {', '.join(busy)} — дождитесь завершения.", "error")
     elif route:
-        flash(request, "У маршрута должны быть и gate, и пул выходов", "error")
+        flash(request, "У маршрута должны быть гейты и пул выходов (прямому маршруту релей не нужен)", "error")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -791,42 +903,57 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     routes = db.query(Route).order_by(Route.name).all()
     all_nodes = db.query(Node).order_by(Node.id).all()
-    route_gate_ids = {r.gate_id for r in routes if r.gate_id}
+    gate_pools = db.query(GatePool).order_by(GatePool.name).all()
+    used_gate_pools = {r.gate_pool_id for r in routes if r.gate_pool_id}
+    # Unassigned servers: exits outside any pool, gates outside any USED gate pool.
     orphans = [
         n for n in all_nodes
         if (n.role == ROLE_EXIT and n.pool_id is None)
-        or (n.role == ROLE_GATE and n.id not in route_gate_ids)
+        or (n.role == ROLE_GATE and n.gate_pool_id not in used_gate_pools)
     ]
-    free_gates = [n for n in all_nodes if n.role == ROLE_GATE and n.id not in route_gate_ids]
+    free_gates = [n for n in all_nodes if n.role == ROLE_GATE and n.gate_pool_id is None]
     groups = db.query(Group).order_by(Group.name).all()
     return render(request, "admin_park.html", user=admin, routes=routes, orphans=orphans,
-                  free_gates=free_gates, groups=groups,
+                  free_gates=free_gates, gate_pools=gate_pools, groups=groups,
+                  protocols=ALL_PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
                   fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))
 
 
 @app.post("/admin/park/route")
 def admin_park_create_route(
-    request: Request, name: str = Form(...), gate_id: str = Form(""),
+    request: Request, name: str = Form(...), entry: str = Form(""), gate_id: str = Form(""),
+    protocol: str = Form(PROTO_VLESS),
     vless_port: int = Form(17771), awg_port: int = Form(17772),
     db: Session = Depends(get_db),
 ):
-    """Create a route = gate + a fresh pool (its shared identity). Exits are added after."""
+    """Create a route = entry (gate pool / gate / direct) + a fresh server pool of
+    one protocol (its shared identity). Servers are added after."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
-    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if not entry and gate_id.strip().isdigit():
+        entry = f"gate:{gate_id.strip()}"
     if not name:
         flash(request, "Укажите имя маршрута", "error")
     elif db.query(Route).filter_by(name=name).first() or db.query(ExitPool).filter_by(name=name).first():
         flash(request, "Имя уже занято", "error")
-    elif not gate or gate.role != ROLE_GATE:
-        flash(request, "Выберите gate-сервер", "error")
+    elif protocol not in ALL_PROTOCOLS:
+        flash(request, "Выберите протокол маршрута", "error")
     else:
-        pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
-        db.add(Route(name=name, gate_id=gate.id, pool_id=pool.id))
-        db.commit()
-        flash(request, f"Маршрут «{name}» создан. Добавьте выходы и «Поднимите релей».", "success")
+        try:
+            gpid = _resolve_entry(db, entry)
+        except _EntryError as e:
+            db.rollback()
+            flash(request, str(e), "error")
+        else:
+            pool = pool_ops.create_pool(
+                db, name, vless_port=vless_port, awg_port=awg_port, protocol=protocol
+            )
+            db.add(Route(name=name, gate_pool_id=gpid, pool_id=pool.id))
+            db.commit()
+            nxt = "Добавьте выходы." if gpid is None else "Добавьте выходы и «Поднимите релей»."
+            flash(request, f"Маршрут «{name}» ({PROTOCOL_LABELS[protocol]}) создан. {nxt}", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
