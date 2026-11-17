@@ -38,6 +38,37 @@ PROTOCOLS = (PROTO_VLESS, PROTO_AWG)
 ALL_PROTOCOLS = (PROTO_VLESS, PROTO_AWG, PROTO_NAIVE)
 PROTOCOL_LABELS = {PROTO_VLESS: "VLESS", PROTO_AWG: "AmneziaWG", PROTO_NAIVE: "NaiveProxy"}
 
+# VLESS transports a server pool can run (see ExitPool.vless_transport).
+VLESS_TCP = "tcp"      # VLESS + TCP + Reality + Vision (pools from before XHTTP)
+VLESS_XHTTP = "xhttp"  # VLESS + XHTTP + Reality (default for new pools)
+
+# Default client-facing port of a NEW route (gate or server side). VLESS and
+# NaiveProxy share TCP 443 (split by SNI on a gate), AmneziaWG uses UDP 443.
+DEFAULT_CLIENT_PORT = 443
+
+_template_cache: dict | None = None
+
+
+def reality_template() -> dict:
+    """Masquerade defaults from the VLESS inbound template: target, server names,
+    uTLS fingerprint. Read once."""
+    global _template_cache
+    if _template_cache is None:
+        from pathlib import Path
+
+        path = Path(__file__).parent / "data" / "vless_inbound_template.json"
+        try:
+            rs = json.loads(path.read_text(encoding="utf-8"))["streamSettings"]["realitySettings"]
+            _template_cache = {
+                "target": rs.get("target") or rs.get("dest") or "",
+                "names": [str(n).lower() for n in rs.get("serverNames", []) if n],
+                "fp": (rs.get("settings") or {}).get("fingerprint") or "chrome",
+            }
+        except Exception:
+            _template_cache = {"target": "", "names": [], "fp": "chrome"}
+    return _template_cache
+
+
 # DNS providers the panel can keep a route's client hostname in sync with
 # (A records = the route's live entry points). Only the API flavour differs.
 DNS_CLOUDFLARE = "cloudflare"
@@ -303,6 +334,16 @@ class ExitPool(Base):
     reality_public: Mapped[str] = mapped_column(String(128), default="")
     short_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     spider_x: Mapped[str] = mapped_column(String(64), default="/")
+    # VLESS transport: 'xhttp' (VLESS + XHTTP + Reality) for new pools; 'tcp'
+    # (VLESS + TCP + Reality + Vision) for pools from before. Part of the client
+    # config — changing it means re-issuing every VLESS config of the pool.
+    vless_transport: Mapped[str] = mapped_column(String(16), default=VLESS_XHTTP, server_default="tcp")
+    xhttp_path: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Reality masquerade: the real site unauthenticated visitors are proxied to
+    # (host:port) and the SNIs the inbound answers to. Empty = the inbound
+    # template's (app/data/vless_inbound_template.json). Also part of client configs.
+    reality_target: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    reality_names_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
 
     # --- AmneziaWG identity (shared across members) ---
     awg_port: Mapped[int] = mapped_column(Integer, default=17772)
@@ -355,6 +396,37 @@ class ExitPool(Base):
     @short_ids.setter
     def short_ids(self, value: list[str]) -> None:
         self.short_ids_json = json.dumps(list(value))
+
+    @property
+    def reality_names(self) -> list[str]:
+        """SNIs the pool's Reality inbound answers to (own, else the template's)."""
+        try:
+            own = [str(n).strip().lower() for n in json.loads(self.reality_names_json or "[]") if str(n).strip()]
+        except ValueError:
+            own = []
+        return own or reality_template()["names"]
+
+    @reality_names.setter
+    def reality_names(self, value: list[str]) -> None:
+        self.reality_names_json = json.dumps([str(n).strip().lower() for n in value if str(n).strip()])
+
+    @property
+    def reality_dest(self) -> str:
+        """host:port of the masquerade site (own, else the template's)."""
+        return self.reality_target or reality_template()["target"]
+
+    @property
+    def reality_sni(self) -> str:
+        """The SNI put into client configs: the masquerade host if it is among the
+        server names, else the first server name."""
+        names = self.reality_names
+        host = self.reality_dest.rsplit(":", 1)[0].lower()
+        return host if host in names else (names[0] if names else host)
+
+    @property
+    def vless_flow(self) -> str:
+        """Client flow: Vision only on raw TCP (XHTTP carries no flow)."""
+        return "xtls-rprx-vision" if self.vless_transport == VLESS_TCP else ""
 
     @property
     def awg_params(self) -> dict:
@@ -526,6 +598,19 @@ class Route(Base):
 
     def serves(self, protocol: str) -> bool:
         return protocol in self.protocols
+
+    def port_for(self, protocol: str) -> int:
+        """Port clients dial for `protocol` on this route: the route's own port if
+        set (not for legacy routes, whose configs carry the pool ports), else the
+        pool's server port (VLESS/AWG) or 443 (NaiveProxy)."""
+        if self.client_port and not self.is_legacy:
+            return int(self.client_port)
+        if self.pool is not None:
+            if protocol == PROTO_VLESS:
+                return int(self.pool.vless_port)
+            if protocol == PROTO_AWG:
+                return int(self.pool.awg_port)
+        return DEFAULT_CLIENT_PORT
 
     @property
     def protocol_label(self) -> str:

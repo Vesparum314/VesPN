@@ -179,6 +179,17 @@ def _add_columns() -> None:
             )
         if "secret_enc" not in cols("issued_configs"):
             conn.exec_driver_sql("ALTER TABLE issued_configs ADD COLUMN secret_enc VARCHAR(512)")
+        # VLESS transport + Reality masquerade per server pool. Existing pools keep
+        # TCP+Vision (their issued configs say so); new pools get XHTTP.
+        pcols = cols("exit_pools")
+        if "vless_transport" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN vless_transport VARCHAR(16) NOT NULL DEFAULT 'tcp'")
+        if "xhttp_path" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN xhttp_path VARCHAR(64) NOT NULL DEFAULT ''")
+        if "reality_target" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN reality_target VARCHAR(255) NOT NULL DEFAULT ''")
+        if "reality_names_json" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN reality_names_json TEXT NOT NULL DEFAULT '[]'")
 
 
 def _migrate_route_gates() -> None:

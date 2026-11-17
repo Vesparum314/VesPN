@@ -122,6 +122,18 @@ class XUIClient:
             ss = json.loads(ss or "{}")
         return (ss.get("realitySettings") or {}).get("privateKey")
 
+    def inbound_network(self, inbound_id: int) -> str | None:
+        """The inbound's transport (`tcp`, `xhttp`, …)."""
+        import json
+
+        ib = next((x for x in self.list_inbounds() if x.get("id") == inbound_id), None)
+        if ib is None:
+            return None
+        ss = ib.get("streamSettings") or {}
+        if isinstance(ss, str):
+            ss = json.loads(ss or "{}")
+        return ss.get("network") or "tcp"
+
     def update_inbound_port(self, inbound_id: int, new_port: int) -> None:
         """Change an existing inbound's listen port (keeps all other settings).
         3x-ui re-applies the Xray config on update. Used to move VLESS off a

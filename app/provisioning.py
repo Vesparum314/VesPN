@@ -198,7 +198,11 @@ def _gen_short_ids() -> list[str]:
 def _build_inbound_payload(
     name: str, priv: str, pub: str,
     short_ids: list[str] | None = None, spider_x: str | None = None, port: int | None = None,
+    transport: str = "tcp", xhttp_path: str = "", target: str = "", server_names: list[str] | None = None,
 ) -> dict:
+    """The 3x-ui inbound for VLESS-Reality. `transport` 'tcp' = raw TCP (+Vision
+    flow on clients), 'xhttp' = XHTTP (mode auto → stream-one under Reality).
+    `target`/`server_names` override the template's masquerade site."""
     tpl = json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
     ss = tpl["streamSettings"]
     rs = ss["realitySettings"]
@@ -206,6 +210,19 @@ def _build_inbound_payload(
     rs.setdefault("settings", {})["publicKey"] = pub
     rs["shortIds"] = short_ids if short_ids is not None else _gen_short_ids()
     rs["settings"]["spiderX"] = spider_x or ("/" + secrets.token_hex(8))
+    if target:
+        rs["target"] = target
+        rs.pop("dest", None)
+    if server_names:
+        rs["serverNames"] = list(server_names)
+    if transport == "xhttp":
+        ss["network"] = "xhttp"
+        ss.pop("tcpSettings", None)
+        ss["xhttpSettings"] = {
+            "path": xhttp_path or ("/" + secrets.token_hex(6)),
+            "host": "",
+            "mode": "auto",
+        }
     # 3x-ui's add endpoint takes settings/streamSettings/sniffing as JSON strings
     return {
         "up": 0,
@@ -227,15 +244,20 @@ def create_vless_inbound(
     node: SSHNode, xui_path: str, xui_port: int, xui_token: str, name: str = "VPN",
     priv: str | None = None, pub: str | None = None,
     short_ids: list[str] | None = None, spider_x: str | None = None, port: int | None = None,
+    transport: str = "tcp", xhttp_path: str = "", target: str = "",
+    server_names: list[str] | None = None,
 ) -> int:
     """Create the VLESS inbound if none exists yet; return its inbound id.
 
     Standalone: Reality keys are generated on the node (`xray x25519`). For a POOL
     exit the caller passes the pool's shared Reality identity (priv/pub/shortIds/
-    spiderX/port) so every member is a clone and one link works against all."""
+    spiderX/port) and its transport/masquerade, so every member is a clone and one
+    link works against all."""
     if not (priv and pub):
         priv, pub = _xray_x25519(node)
-    payload = _build_inbound_payload(name, priv, pub, short_ids, spider_x, port)
+    payload = _build_inbound_payload(
+        name, priv, pub, short_ids, spider_x, port, transport, xhttp_path, target, server_names
+    )
     with node.tunnel(xui_port) as lport:
         xui = XUIClient(f"http://127.0.0.1:{lport}/{xui_path}", xui_token)
         existing = None
@@ -249,8 +271,9 @@ def create_vless_inbound(
             # a node that was set up standalone), replace it — otherwise the clone
             # would serve the pool's client UUIDs under the wrong server key and
             # configs would fail there after a failover.
-            if xui.inbound_reality_private(existing.inbound_id) == priv:
-                return existing.inbound_id  # already the pool identity
+            if (xui.inbound_reality_private(existing.inbound_id) == priv
+                    and xui.inbound_network(existing.inbound_id) == transport):
+                return existing.inbound_id  # already the pool identity and transport
             xui.del_inbound(existing.inbound_id)
         xui.add_inbound(payload)
         return xui.find_vless_inbound().inbound_id

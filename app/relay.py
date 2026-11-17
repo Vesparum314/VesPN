@@ -77,7 +77,7 @@ def route_services(route) -> list[Service]:
         if proto == "vless":
             port = route.client_port if (route.client_port and not route.is_legacy) else pool.vless_port
             out.append(Service(route.name, "tcp", int(port), group, int(pool.vless_port),
-                               reality_server_names()))
+                               list(getattr(pool, "reality_names", None) or reality_server_names())))
         elif proto == "awg":
             port = route.client_port if (route.client_port and not route.is_legacy) else pool.awg_port
             out.append(Service(route.name, "udp", int(port), group, int(pool.awg_port)))

@@ -37,6 +37,7 @@ from .models import (
     ROLE_EXIT,
     SYNC_SYNCED,
     SYNC_UNREACHABLE,
+    VLESS_XHTTP,
     Device,
     ExitPool,
     IssuedConfig,
@@ -48,8 +49,6 @@ from .nodes import (
     NodeOpError,
     _exit_needs_gate,
     _gate_creds_for,
-    _rewrite_vless_host,
-    _set_vless_label,
     connect,
 )
 from .xui import XUIClient
@@ -121,6 +120,8 @@ def create_pool(
         awg_public=apub,
         awg_subnet=awg.DEFAULT_SERVER_SUBNET,
         spider_x="/" + secrets.token_hex(8),
+        vless_transport=VLESS_XHTTP,
+        xhttp_path="/" + secrets.token_hex(6),
     )
     pool.reality_private = rpriv
     pool.awg_private = apriv
@@ -152,14 +153,21 @@ def _config_name(cfg: IssuedConfig) -> str:
 
 # --- provisioning a pool exit (clone) -----------------------------------
 def provision_pool_exit(db: Session, node: Node) -> dict:
-    """Stand a node up as a CLONE in its pool: install 3x-ui + the VLESS inbound
-    and the AmneziaWG server, all with the pool's shared identity, then converge
-    it to the pool's current clients."""
+    """Stand a node up as a CLONE in its pool: install what the pool's routes need
+    — 3x-ui + the VLESS inbound (pool transport/masquerade) and/or the AmneziaWG
+    server — all with the pool's shared identity, then converge it to the pool's
+    current clients."""
     if node.pool_id is None:
         raise NodeOpError("нода не привязана к пулу")
     pool = db.get(ExitPool, node.pool_id)
     if pool is None:
         raise NodeOpError("пул не найден")
+    protos = pool.protocols
+    if not protos:
+        raise NodeOpError(
+            f"у пула «{pool.name}» нет маршрутов — непонятно, какие протоколы ставить; "
+            f"сначала создайте маршрут на этом пуле"
+        )
     # A pooled exit behind gates is always managed THROUGH a gate (RU DPI drops the
     # direct Hub→exit handshake). Require a resolvable gate before we start, so
     # rollout never silently depends on a direct connection that dies on DPI.
@@ -168,40 +176,50 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
             "у пула нет гейта: заведите пул гейтов и маршрут (пул→гейты) до раскатки выхода"
         )
 
+    info: dict = {}
+    installed: list[str] = []
     with connect(node) as n:
         provisioning.install_fleet_key(n, fleetkey.public_line(db))  # key-manage from here on
         provisioning.ensure_base(n)  # fresh Debian lacks curl, which the installers need
-        info = provisioning.install_3xui(n)
-        provisioning.set_panel_localhost(n)
-        provisioning.pin_xray_version(n, settings.xray_version, info["xui_port"])
-        provisioning.create_vless_inbound(
-            n, info["xui_path"], info["xui_port"], info["xui_token"], name=node.name,
-            priv=pool.reality_private, pub=pool.reality_public,
-            short_ids=pool.short_ids, spider_x=pool.spider_x, port=pool.vless_port,
-        )
-        awg_info = provisioning.install_amneziawg(
-            n, listen_port=pool.awg_port,
-            priv=pool.awg_private, pub=pool.awg_public, psk=pool.awg_psk,
-            params=pool.awg_params, subnet_prefix=pool.awg_subnet,
-        )
-        provisioning.harden_subscription(n)  # no public :2096 sub server
+        if PROTO_VLESS in protos:
+            info = provisioning.install_3xui(n)
+            provisioning.set_panel_localhost(n)
+            provisioning.pin_xray_version(n, settings.xray_version, info["xui_port"])
+            provisioning.create_vless_inbound(
+                n, info["xui_path"], info["xui_port"], info["xui_token"], name=node.name,
+                priv=pool.reality_private, pub=pool.reality_public,
+                short_ids=pool.short_ids, spider_x=pool.spider_x, port=pool.vless_port,
+                transport=pool.vless_transport, xhttp_path=pool.xhttp_path,
+                target=pool.reality_dest, server_names=pool.reality_names,
+            )
+            provisioning.harden_subscription(n)  # no public :2096 sub server
+            installed.append(f"VLESS {pool.vless_transport.upper()} :{pool.vless_port}")
+        if PROTO_AWG in protos:
+            provisioning.install_amneziawg(
+                n, listen_port=pool.awg_port,
+                priv=pool.awg_private, pub=pool.awg_public, psk=pool.awg_psk,
+                params=pool.awg_params, subnet_prefix=pool.awg_subnet,
+            )
+            installed.append(f"AmneziaWG UDP :{pool.awg_port}")
         provisioning.disable_fail2ban(n)      # never ban the gate/panel
         try:
             provisioning.install_telegram_proxy(n)  # localhost TG proxy; bot reaches it via gate
         except Exception as e:
             log.warning("tg-proxy install on %s skipped: %s", node.name, e)
 
-    node.xui_path = info["xui_path"]
-    node.xui_port = info["xui_port"]
-    node.xui_token = info["xui_token"]  # encrypted via setter
-    node.awg_port = pool.awg_port
+    if info:
+        node.xui_path = info["xui_path"]
+        node.xui_port = info["xui_port"]
+        node.xui_token = info["xui_token"]  # encrypted via setter
+    if PROTO_AWG in protos:
+        node.awg_port = pool.awg_port
     node.key_installed = True  # fleet key now in authorized_keys → key-managed
     if not node.awg_endpoint_host:
         node.awg_endpoint_host = node.public_host
     db.commit()
 
     rec = reconcile_exit(db, pool, node)
-    return {"xui_port": info["xui_port"], "awg_port": pool.awg_port, "awg": awg_info, "reconcile": rec}
+    return {"installed": installed, "reconcile": rec}
 
 
 # --- reconcile ----------------------------------------------------------
@@ -209,10 +227,11 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
     """Converge one exit to the pool's desired client/peer set (idempotent).
     Adds missing clients/peers and removes extras, then records sync state."""
     added_v = removed_v = added_a = removed_a = 0
+    protos = pool.protocols
     try:
         with connect(node) as n:
             # --- VLESS ---
-            if node.has_xui:
+            if node.has_xui and PROTO_VLESS in protos:
                 with n.tunnel(node.xui_port) as lport:
                     xui = XUIClient(f"http://127.0.0.1:{lport}/{node.xui_path}", node.xui_token)
                     inbound = xui.find_vless_inbound()
@@ -237,7 +256,7 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
                             except Exception:
                                 pass
                             xui.add_client(
-                                c.identifier, [inbound.inbound_id],
+                                c.identifier, [inbound.inbound_id], flow=pool.vless_flow,
                                 client_id=want, sub_id=(c.sub_id or None),
                             )
                             added_v += 1
@@ -245,18 +264,19 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
                         xui.del_client(email)
                         removed_v += 1
             # --- AmneziaWG ---
-            mgr = AWGManager(n)
-            mgr.discover_container()
-            desired_a = _pool_configs(db, pool, PROTO_AWG)
-            desired_pubs = {c.identifier for c in desired_a}
-            current_pubs = {pub for pub, _ in mgr.list_peers()}
-            for c in desired_a:
-                if c.identifier not in current_pubs:
-                    mgr.upsert_peer(c.identifier, c.address, name=_config_name(c))
-                    added_a += 1
-            for pub in current_pubs - desired_pubs:
-                mgr.del_peer(pub)
-                removed_a += 1
+            if PROTO_AWG in protos:
+                mgr = AWGManager(n)
+                mgr.discover_container()
+                desired_a = _pool_configs(db, pool, PROTO_AWG)
+                desired_pubs = {c.identifier for c in desired_a}
+                current_pubs = {pub for pub, _ in mgr.list_peers()}
+                for c in desired_a:
+                    if c.identifier not in current_pubs:
+                        mgr.upsert_peer(c.identifier, c.address, name=_config_name(c))
+                        added_a += 1
+                for pub in current_pubs - desired_pubs:
+                    mgr.del_peer(pub)
+                    removed_a += 1
     except Exception as e:
         node.sync_state = SYNC_UNREACHABLE
         node.last_reconcile_at = _now()
@@ -293,24 +313,39 @@ def _alloc_awg_address(db: Session, pool: ExitPool) -> str:
     raise NodeOpError("адресный пул AmneziaWG исчерпан")
 
 
-def _vless_add_and_link(node: Node, email: str, cid: str, sub: str, host: str) -> str:
+def vless_link(pool: ExitPool, uuid: str, host: str, port: int, label: str = "") -> str:
+    """The client's vless:// link, built from the POOL identity (no node needed):
+    valid against every clone, for any entry point (`host`:`port` — a gate, the
+    route's managed name, or a server of a direct route). Subscriptions build one
+    per entry point the same way."""
+    from urllib.parse import quote, urlencode
+
+    from .models import VLESS_XHTTP, reality_template
+
+    params = {
+        "encryption": "none",
+        "security": "reality",
+        "sni": pool.reality_sni,
+        "fp": reality_template()["fp"],
+        "pbk": pool.reality_public,
+        "sid": (pool.short_ids or [""])[0],
+        "spx": pool.spider_x or "/",
+    }
+    if pool.vless_transport == VLESS_XHTTP:
+        params.update({"type": "xhttp", "path": pool.xhttp_path or "/", "mode": "auto"})
+    else:
+        params.update({"type": "tcp", "headerType": "none", "flow": pool.vless_flow})
+    h = f"[{host}]" if ":" in host else host  # IPv6 literal
+    frag = f"#{quote(label, safe='-_.')}" if label else ""
+    return f"vless://{uuid}@{h}:{int(port)}?{urlencode(params, quote_via=quote, safe='/')}{frag}"
+
+
+def _vless_add(node: Node, email: str, cid: str, sub: str, flow: str) -> None:
     with connect(node) as n, n.tunnel(node.xui_port) as lport:
         xui = XUIClient(f"http://127.0.0.1:{lport}/{node.xui_path}", node.xui_token)
         inbound = xui.find_vless_inbound()
         if not xui.client_exists(email):
-            xui.add_client(email, [inbound.inbound_id], client_id=cid, sub_id=sub)
-        links = xui.get_client_links(email)
-        if not links:
-            raise NodeOpError(f"no link returned for {email!r}")
-        return _rewrite_vless_host(links[0], host)
-
-
-def _vless_add(node: Node, email: str, cid: str, sub: str) -> None:
-    with connect(node) as n, n.tunnel(node.xui_port) as lport:
-        xui = XUIClient(f"http://127.0.0.1:{lport}/{node.xui_path}", node.xui_token)
-        inbound = xui.find_vless_inbound()
-        if not xui.client_exists(email):
-            xui.add_client(email, [inbound.inbound_id], client_id=cid, sub_id=sub)
+            xui.add_client(email, [inbound.inbound_id], flow=flow, client_id=cid, sub_id=sub)
 
 
 def _reserve_config(db: Session, row: IssuedConfig) -> IssuedConfig:
@@ -335,8 +370,8 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
     """Issue (or return existing) the device's pool-wide config.
 
     VLESS: generate the client's uuid/subId panel-side and force them onto every
-    ready member (identical link everywhere); the link is fetched from the first
-    member that answers. AmneziaWG: generate the peer locally, build the vpn://
+    ready member (identical client everywhere); the link is built from the pool
+    identity + the route's address (`vless_link`). AmneziaWG: generate the peer locally, build the vpn://
     from the POOL identity (no live node needed), and push the peer to all members."""
     # The client picks the route; honour exactly what the device is pinned to and
     # re-check access at issue time (so a revoked group stops working). No fallback.
@@ -369,6 +404,14 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         and existing.pool_id == pool.id
         and existing.route_id == route.id
     ):
+        if device.protocol == PROTO_VLESS and existing.uuid:
+            # The link is built locally from the pool identity + route address, so
+            # keep it current when the route's host/port changed (no node calls).
+            fresh = vless_link(pool, existing.uuid, host, route.port_for(PROTO_VLESS),
+                               f"{slugify(route.name)}-{existing.identifier}")
+            if fresh != existing.payload:
+                existing.payload = fresh
+                db.commit()
         return existing
 
     # members that can serve now: synced first, else any that has 3x-ui.
@@ -394,25 +437,23 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         else:
             cid, sub = str(_uuid.uuid4()), secrets.token_hex(8)
 
-        link = None
+        # Put the client (same uuid/subId) on every ready clone; at least one must
+        # take it. The link itself is built from the pool identity, not fetched.
         used_node = None
         last_err: Exception | None = None
         for m in ready:
             try:
-                if link is None:
-                    link = _vless_add_and_link(m, email, cid, sub, host)
-                    used_node = m
-                else:
-                    _vless_add(m, email, cid, sub)
+                _vless_add(m, email, cid, sub, pool.vless_flow)
+                used_node = used_node or m
             except Exception as e:  # a down member mustn't block issuance
                 last_err = e
                 log.warning("vless fan-out to %s failed: %s", m.name, e)
-        if link is None:
+        if used_node is None:
             raise NodeOpError(f"не удалось выпустить VLESS: {last_err}")
 
-        # Label the link by ROUTE + full identifier (route-user-device), not the
-        # exit node's name that 3x-ui bakes in — stays meaningful after failover.
-        link = _set_vless_label(link, f"{slugify(route.name)}-{email}")
+        # Label the link by ROUTE + full identifier (route-user-device) — stays
+        # meaningful whichever gate/exit carries it.
+        link = vless_link(pool, cid, host, route.port_for(PROTO_VLESS), f"{slugify(route.name)}-{email}")
 
         existing.protocol = PROTO_VLESS
         existing.pool_id = pool.id
@@ -432,7 +473,7 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         address = _alloc_awg_address(db, pool)
         priv, pub = awg.gen_keypair()
         server = awg.server_from_identity(
-            pool.awg_public, pool.awg_psk, pool.awg_port, pool.awg_params, pool.awg_subnet
+            pool.awg_public, pool.awg_psk, route.port_for(PROTO_AWG), pool.awg_params, pool.awg_subnet
         )
         email = device.node_identifier()
         doc = awg.build_amnezia_dict(server, priv, pub, address, host, email)

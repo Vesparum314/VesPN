@@ -147,7 +147,7 @@
 {% for p in server_pools %}
 <div class="panel">
   <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-    <h2 style="margin:0">«{{ p.name }}» <span class="badge b-exit">{{ p.protocols_label }}</span>
+    <h2 style="margin:0">«{{ p.name }}» <span class="badge b-exit">{{ p.protocols_label }}</span>{% if 'vless' in p.protocols %} <span class="badge b-exit" title="транспорт VLESS">{{ p.vless_transport|upper }}</span>{% endif %}
       {% if p.routes %}<span class="muted" style="font-size:13px;font-weight:400">маршруты: {{ p.routes|map(attribute='name')|join(', ') }}</span>{% else %}<span class="badge b-warn">не используется маршрутами</span>{% endif %}
     </h2>
     <div class="row-actions">
@@ -156,6 +156,26 @@
       <form method="post" action="/admin/pools/{{ p.id }}/delete" onsubmit="return confirm('Удалить пул «{{ p.name }}»? Его серверы станут непривязанными.')"><button class="btn btn-ghost btn-sm btn-danger"{% if p.routes %} disabled title="используется маршрутами"{% endif %}>Удалить</button></form>
     </div>
   </div>
+  {% if 'vless' in p.protocols %}
+  <details style="margin:8px 16px 0"><summary class="muted">VLESS: {{ p.vless_transport|upper }}{% if p.vless_transport == 'xhttp' %} {{ p.xhttp_path }}{% endif %} · маска {{ p.reality_dest }} · SNI в конфигах {{ p.reality_sni }}</summary>
+    <form method="post" action="/admin/pools/{{ p.id }}/vless" style="display:flex;flex-direction:column;gap:8px;margin:8px 0 4px;max-width:640px"
+          onsubmit="return confirm('Это часть клиентских конфигов. После смены: переразвернуть серверы пула, поднять релей пулов гейтов и перевыпустить VLESS-конфиги пула. Продолжить?')">
+      <label>Транспорт
+        <select name="transport">
+          <option value="xhttp" {{ 'selected' if p.vless_transport == 'xhttp' }}>XHTTP + Reality</option>
+          <option value="tcp" {{ 'selected' if p.vless_transport == 'tcp' }}>TCP + Reality + Vision (старый)</option>
+        </select>
+      </label>
+      <label>Путь XHTTP <input name="xhttp_path" value="{{ p.xhttp_path }}" placeholder="/случайный"></label>
+      <label>Сайт-маска Reality (host:port) <input name="reality_target" value="{{ p.reality_target }}" placeholder="по умолчанию из шаблона: {{ p.reality_dest }}"></label>
+      <label>SNI, на которые отвечает inbound (через пробел)
+        <textarea name="reality_names" rows="2" class="mono" placeholder="по умолчанию из шаблона">{{ p.reality_names_json|replace('[','')|replace(']','')|replace('"','')|replace(',', ' ') }}</textarea>
+        <small class="muted">Свой SNI у пула нужен, чтобы гейт мог развести два Reality-пула на одном порту; удобно брать сайт «по соседству» с гейтом (тот же хостинг).</small>
+      </label>
+      <button class="btn btn-ghost btn-sm">Сохранить</button>
+    </form>
+  </details>
+  {% endif %}
   <div class="tbl-wrap"><table>
     <thead><tr><th>Выход</th><th>Хост</th><th>Приоритет</th><th>Синхр.</th><th></th></tr></thead>
     <tbody>
@@ -289,7 +309,10 @@
           <option value="direct">Напрямую, без гейтов</option>
         </select>
       </label>
-      <details><summary class="muted">Порты нового пула</summary>
+      <label>Порт для клиентов <input name="client_port" type="number" value="443">
+        <small class="muted">Куда подключаются клиенты (на гейте или на сервере). VLESS и NaiveProxy делят TCP 443 (гейт разводит их по SNI), AmneziaWG — UDP 443.</small>
+      </label>
+      <details><summary class="muted">Порты нового пула (на серверах)</summary>
         <div style="display:flex;gap:12px;margin-top:8px">
           <label>VLESS порт <input name="vless_port" type="number" value="17771"></label>
           <label>AWG порт <input name="awg_port" type="number" value="17772"></label>

@@ -31,7 +31,10 @@ from .config import settings
 from .db import get_db, init_db
 from .models import (
     ALL_PROTOCOLS,
+    DEFAULT_CLIENT_PORT,
     DNS_KINDS,
+    VLESS_TCP,
+    VLESS_XHTTP,
     JOB_RUNNING,
     PROTO_AWG,
     PROTO_VLESS,
@@ -603,9 +606,8 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
             if node.pool_id:
                 info = pool_ops.provision_pool_exit(db, node)
                 rec = info.get("reconcile", {})
-                return (f"Развёрнут как клон пула: 3x-ui (:{info['xui_port']}) + "
-                        f"AmneziaWG (UDP :{info['awg_port']}); синхронизация "
-                        f"{'ok' if rec.get('ok') else rec.get('error', '—')}")
+                return (f"Развёрнут как клон пула: {', '.join(info['installed']) or '—'}; "
+                        f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
             info = node_ops.provision_node(db, node)
             return (f"Развёрнута: 3x-ui (порт {info['xui_port']}) + "
                     f"AmneziaWG (UDP {info['awg_port']})")
@@ -737,7 +739,8 @@ def admin_add_route(
             db.rollback()
             flash(request, str(e), "error")
         else:
-            db.add(Route(name=name, protocol=protocol, gate_pool_id=gpid, pool_id=pool.id))
+            db.add(Route(name=name, protocol=protocol, gate_pool_id=gpid, pool_id=pool.id,
+                         client_port=DEFAULT_CLIENT_PORT))
             db.commit()
             flash(request, f"Маршрут «{name}» создан", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
@@ -1020,7 +1023,7 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
 @app.post("/admin/park/route")
 def admin_park_create_route(
     request: Request, name: str = Form(...), entry: str = Form(""), gate_id: str = Form(""),
-    protocol: str = Form(PROTO_VLESS), pool_id: str = Form(""),
+    protocol: str = Form(PROTO_VLESS), pool_id: str = Form(""), client_port: str = Form(str(DEFAULT_CLIENT_PORT)),
     vless_port: int = Form(17771), awg_port: int = Form(17772),
     db: Session = Depends(get_db),
 ):
@@ -1053,7 +1056,8 @@ def admin_park_create_route(
             new_pool = pool is None
             if new_pool:
                 pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
-            db.add(Route(name=name, protocol=protocol, gate_pool_id=gpid, pool_id=pool.id))
+            cport = int(client_port) if client_port.strip().isdigit() and 0 < int(client_port) < 65536 else None
+            db.add(Route(name=name, protocol=protocol, gate_pool_id=gpid, pool_id=pool.id, client_port=cport))
             db.commit()
             if new_pool:
                 nxt = "Добавьте выходы." if gpid is None else "Добавьте выходы и «Поднимите релей»."
@@ -1089,6 +1093,41 @@ def admin_add_pool(
     else:
         pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
         flash(request, f"Пул «{pool.name}» создан (идентичность сгенерирована)", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/pools/{pool_id}/vless")
+def admin_pool_vless(
+    request: Request, pool_id: int, transport: str = Form(VLESS_XHTTP), xhttp_path: str = Form(""),
+    reality_target: str = Form(""), reality_names: str = Form(""), db: Session = Depends(get_db),
+):
+    """VLESS settings of a server pool: transport and Reality masquerade. They are
+    part of every client config — after a change the servers must be redeployed and
+    the pool's VLESS configs re-issued (subscriptions pick it up by themselves)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    pool = db.get(ExitPool, pool_id)
+    if not pool:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    target = reality_target.strip()
+    names = [n for n in reality_names.replace(",", " ").split() if n]
+    path = xhttp_path.strip()
+    if transport not in (VLESS_TCP, VLESS_XHTTP):
+        flash(request, "Неизвестный транспорт", "error")
+    elif target and (":" not in target or not target.rsplit(":", 1)[1].isdigit()):
+        flash(request, "Сайт-маска — в виде host:port, например www.example.com:443", "error")
+    elif path and not path.startswith("/"):
+        flash(request, "Путь XHTTP начинается с «/»", "error")
+    else:
+        pool.vless_transport = transport
+        if transport == VLESS_XHTTP:
+            pool.xhttp_path = path or pool.xhttp_path or ("/" + __import__("secrets").token_hex(6))
+        pool.reality_target = target
+        pool.reality_names = names
+        db.commit()
+        flash(request, f"VLESS пула «{pool.name}»: {transport.upper()}, маска {pool.reality_dest}. "
+                       f"Переразверните серверы пула и поднимите релей пулов гейтов; выданные "
+                       f"VLESS-конфиги пула нужно перевыпустить.", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
