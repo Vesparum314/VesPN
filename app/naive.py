@@ -9,9 +9,10 @@ the site). HTTP/2 only — no QUIC, so nothing UDP on the way in.
 Per server pool (clones, like the other protocols):
   * every server runs the same Caddy (container `vespn-naive`, host network, :443),
     built ON the server with xcaddy (no prebuilt image to trust or pin);
-  * one site block per NaiveProxy route of the pool (its client_host), with that
-    domain's certificate — issued on the Hub by DNS-01 (app/acme.py) and pushed
-    here, so the zone token never leaves the Hub;
+  * one site on :443 (NOT bound to a hostname: a proxy request's Host is its
+    target) serving every NaiveProxy route of the pool; each route's domain has
+    its certificate, picked by SNI — issued on the Hub by DNS-01 (app/acme.py)
+    and pushed here, so the zone token never leaves the Hub;
   * the same user list on every server: one login/password per device whose owner
     may use a NaiveProxy route on the pool (password stored encrypted in the DB).
 """
@@ -131,8 +132,14 @@ def pool_users(db: Session, pool: ExitPool, exclude: set[int] | None = None) -> 
 
 
 def render_caddyfile(domains: list[str], users: list[tuple[str, str]]) -> str:
-    """Caddyfile: one site per domain (its pushed cert), the same users on all.
-    Never an open proxy: with no users a random throwaway account is put in."""
+    """Caddyfile: ONE site on :443 for all of the pool's domains, the same users.
+
+    The site must not be bound to a hostname: a proxy request's Host is its TARGET
+    (e.g. example.com:443), so a `https://<domain>` site (= a Host matcher) would
+    never see it and the proxy would silently not work. The certificates — one
+    PEM bundle per domain in /data/certs — are loaded as a folder; Caddy picks the
+    one matching the TLS SNI. Never an open proxy: with no users a random
+    throwaway account is put in."""
     if not users:
         users = [(f"x{secrets.token_hex(6)}", new_password())]
     auth = "\n".join(f"\t\tbasic_auth {u} {p}" for u, p in users)
@@ -146,23 +153,23 @@ def render_caddyfile(domains: list[str], users: list[tuple[str, str]]) -> str:
         "\torder forward_proxy before file_server",
         "}",
         "",
+        f"# domains: {', '.join(domains)}",
+        f":{SERVER_PORT} {{",
+        "\ttls {",
+        "\t\tload /data/certs",
+        "\t}",
+        "\tforward_proxy {",
+        auth,
+        "\t\thide_ip",
+        "\t\thide_via",
+        "\t\tprobe_resistance",
+        "\t}",
+        "\tfile_server {",
+        "\t\troot /srv/site",
+        "\t}",
+        "}",
+        "",
     ]
-    for d in domains:
-        out += [
-            f"https://{d}:{SERVER_PORT} {{",
-            f"\ttls /data/certs/{d}.crt /data/certs/{d}.key",
-            "\tforward_proxy {",
-            auth,
-            "\t\thide_ip",
-            "\t\thide_via",
-            "\t\tprobe_resistance",
-            "\t}",
-            "\tfile_server {",
-            "\t\troot /srv/site",
-            "\t}",
-            "}",
-            "",
-        ]
     return "\n".join(out)
 
 
@@ -182,22 +189,24 @@ def present(node: SSHNode) -> bool:
 def _write_config(node: SSHNode, db: Session, pool: ExitPool, exclude: set[int] | None) -> list[str]:
     """Write Caddyfile, certificates and the site; returns the domains served."""
     domains = []
-    node.run(f"mkdir -p {BASE}/certs {BASE}/site && chmod 700 {BASE}/certs", timeout=20)
+    # Rewritten from scratch each time, so a removed route's domain goes away too.
+    node.run(f"mkdir -p {BASE}/certs {BASE}/site && chmod 700 {BASE}/certs && rm -f {BASE}/certs/*",
+             timeout=20)
     for r in pool_routes(pool):
         c = cert_for(db, r.client_host)
         if c is None:
-            log.warning("naive: no certificate for %s yet — site skipped", r.client_host)
+            log.warning("naive: no certificate for %s yet — domain skipped", r.client_host)
             continue
         d = r.client_host.lower()
-        _put_file(node, f"{BASE}/certs/{d}.crt", c.cert_pem)
-        _put_file(node, f"{BASE}/certs/{d}.key", c.key_pem)
+        # one PEM bundle per domain (cert chain + key) — what `tls { load <dir> }` reads
+        _put_file(node, f"{BASE}/certs/{d}.pem", c.cert_pem.rstrip() + "\n" + c.key_pem)
         domains.append(d)
     if not domains:
         raise ProvisionError(
             f"у пула «{pool.name}» нет NaiveProxy-маршрута с выпущенным сертификатом — "
             f"задайте имя хоста и DNS-провайдер маршрута и выпустите сертификат"
         )
-    node.run(f"chmod 600 {BASE}/certs/*.key", timeout=20)
+    node.run(f"chmod 600 {BASE}/certs/*.pem", timeout=20)
     _put_file(node, f"{BASE}/site/index.html", _SITE)
     _put_file(node, f"{BASE}/Caddyfile", render_caddyfile(domains, pool_users(db, pool, exclude)))
     return domains

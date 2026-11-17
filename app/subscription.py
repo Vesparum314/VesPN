@@ -35,7 +35,7 @@ from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
-from .models import PROTO_VLESS, VLESS_TCP, Device, Route, TrafficStat
+from .models import PROTO_NAIVE, PROTO_VLESS, VLESS_TCP, Device, Route, TrafficStat
 
 FORMAT_BASE64 = "base64"
 FORMAT_SINGBOX = "singbox"
