@@ -107,16 +107,14 @@ def _gen_reality_keypair() -> tuple[str, str]:
 
 
 def create_pool(
-    db: Session, name: str, vless_port: int = DEFAULT_VLESS_PORT, awg_port: int = DEFAULT_AWG_PORT,
-    protocol: str = "",
+    db: Session, name: str, vless_port: int = DEFAULT_VLESS_PORT, awg_port: int = DEFAULT_AWG_PORT
 ) -> ExitPool:
-    """Generate a fresh pool identity (Reality + AmneziaWG) and persist it.
-    `protocol` types the pool (vless | naive | awg); empty = legacy VLESS+AWG."""
+    """Generate a fresh pool identity (Reality + AmneziaWG) and persist it. Which
+    protocols the servers actually run follows from the routes on the pool."""
     rpriv, rpub = _gen_reality_keypair()
     apriv, apub = awg.gen_keypair()
     pool = ExitPool(
         name=name.strip(),
-        protocol=protocol,
         vless_port=vless_port,
         awg_port=awg_port,
         reality_public=rpub,
@@ -352,9 +350,9 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         raise NodeOpError("у маршрута нет пула выходов")
     if not route.is_direct and not route.gates:
         raise NodeOpError("в пуле гейтов маршрута нет гейтов")
-    if not pool.serves(device.protocol):
+    if not route.serves(device.protocol):
         raise NodeOpError(
-            f"маршрут «{route.name}» — {pool.protocol_label}, а устройство — "
+            f"маршрут «{route.name}» — {route.protocol_label}, а устройство — "
             f"{device.protocol}: выберите маршрут этого протокола"
         )
     host = route.host  # managed hostname, else the first gate / server
@@ -501,9 +499,11 @@ def provision_gate_relay(db: Session, gate: Node) -> dict:
     the member IPs + the pool's service ports, deploy the daemon. The daemon then
     steers DNAT to live members only. Every gate of a gate pool gets the same relay.
 
-    One route per gate pool for now: a pool fronting several routes needs the
-    relay to be generated from all of them (SNI routing on a shared TCP port),
-    which this daemon can't express yet — refuse rather than overwrite."""
+    One SERVER pool per gate pool for now: routes of several protocols over the
+    same server pool are fine (one member list, each protocol's ports), but routes
+    over different server pools need the relay generated from all of them (SNI
+    routing on a shared TCP port, distinct UDP ports), which this daemon can't
+    express yet — refuse rather than overwrite."""
     if not gate.is_gate:
         raise NodeOpError(f"«{gate.name}» — не gate-сервер")
     if gate.gate_pool_id is None:
@@ -513,8 +513,9 @@ def provision_gate_relay(db: Session, gate: Node) -> dict:
         raise NodeOpError(f"пул гейтов «{gate.name}» не используется ни одним маршрутом")
     if len({r.pool_id for r in routes}) > 1:
         raise NodeOpError(
-            "пул гейтов обслуживает несколько маршрутов с разными пулами серверов — "
-            "общий релей ещё не поддерживается"
+            "пул гейтов обслуживает маршруты на разных пулах серверов — такой общий "
+            "релей ещё не поддерживается (маршруты разных протоколов на одном пуле "
+            "серверов — можно)"
         )
     route = routes[0]
     pool = route.pool

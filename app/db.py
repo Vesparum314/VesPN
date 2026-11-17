@@ -155,12 +155,13 @@ def _add_columns() -> None:
                 )
         if "created_by" not in cols("users"):
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN created_by INTEGER")
-        # Gate pools, typed server pools, client host/port per route, subscriptions.
+        # Gate pools, per-protocol routes, client host/port per route, subscriptions.
         if "gate_pool_id" not in cols("nodes"):
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN gate_pool_id INTEGER")
-        if "protocol" not in cols("exit_pools"):
-            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN protocol VARCHAR(16) NOT NULL DEFAULT ''")
         rcols = cols("routes")
+        if "protocol" not in rcols:
+            # '' = legacy route serving VLESS + AmneziaWG, which is what existing ones do.
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN protocol VARCHAR(16) NOT NULL DEFAULT ''")
         if "gate_pool_id" not in rcols:
             conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN gate_pool_id INTEGER")
         if "client_host" not in rcols:

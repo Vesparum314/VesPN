@@ -295,10 +295,6 @@ class ExitPool(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
 
-    # The protocol this pool's servers run (vless | naive | awg). Empty = a legacy
-    # pool from before typed pools: its exits run BOTH VLESS and AmneziaWG.
-    protocol: Mapped[str] = mapped_column(String(16), default="", server_default="")
-
     # --- VLESS Reality identity (shared across members) ---
     vless_port: Mapped[int] = mapped_column(Integer, default=17771)
     reality_private_enc: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -319,6 +315,7 @@ class ExitPool(Base):
     members: Mapped[list["Node"]] = relationship(
         "Node", primaryjoin="Node.pool_id == ExitPool.id", viewonly=True
     )
+    routes: Mapped[list["Route"]] = relationship("Route", back_populates="pool", viewonly=True)
 
     # --- secret helpers ---
     @property
@@ -377,20 +374,18 @@ class ExitPool(Base):
         return [n for n in self.members if n.sync_state == SYNC_SYNCED]
 
     @property
-    def is_legacy(self) -> bool:
-        return not self.protocol
-
-    def serves(self, protocol: str) -> bool:
-        """Whether a device of `protocol` can get a config from this pool."""
-        if self.is_legacy:
-            return protocol in (PROTO_VLESS, PROTO_AWG)
-        return protocol == self.protocol
+    def protocols(self) -> list[str]:
+        """Protocols this pool's servers must run — the union of its routes'
+        protocols. One server can carry several (e.g. VLESS and NaiveProxy): the
+        pool simply has a route per protocol."""
+        found: set[str] = set()
+        for r in self.routes:
+            found.update(r.protocols)
+        return [p for p in ALL_PROTOCOLS if p in found]
 
     @property
-    def protocol_label(self) -> str:
-        if self.is_legacy:
-            return "VLESS + AmneziaWG"
-        return PROTOCOL_LABELS.get(self.protocol, self.protocol)
+    def protocols_label(self) -> str:
+        return " + ".join(PROTOCOL_LABELS[p] for p in self.protocols) or "—"
 
 
 class GatePool(Base):
@@ -439,8 +434,9 @@ class DnsProvider(Base):
 
 
 class Route(Base):
-    """A path clients can pick: a protocol's server POOL, entered either through a
-    GATE POOL (RU relays) or directly.
+    """A path clients can pick: ONE protocol over a server POOL, entered either
+    through a GATE POOL (RU relays) or directly. A pool whose servers carry several
+    protocols has one route per protocol (they may share the gate pool, too).
 
     The client dials `host` — a hostname kept pointing at the route's live entry
     points (or, when none is set, the first gate / server itself). Through a gate
@@ -452,6 +448,9 @@ class Route(Base):
     __tablename__ = "routes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
+    # vless | naive | awg. Empty = a legacy route from before per-protocol routes:
+    # it serves BOTH VLESS and AmneziaWG (and its pool's servers run both).
+    protocol: Mapped[str] = mapped_column(String(16), default="", server_default="")
     pool_id: Mapped[int | None] = mapped_column(
         ForeignKey("exit_pools.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -471,7 +470,7 @@ class Route(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    pool: Mapped["ExitPool | None"] = relationship("ExitPool")
+    pool: Mapped["ExitPool | None"] = relationship("ExitPool", back_populates="routes")
     gate_pool: Mapped["GatePool | None"] = relationship("GatePool", back_populates="routes")
     dns_provider: Mapped["DnsProvider | None"] = relationship("DnsProvider")
     # Access groups allowed to use this route. Empty = no client may use it.
@@ -514,12 +513,21 @@ class Route(Base):
         entries = self.entry_points
         return entries[0].public_host if entries else ""
 
+    @property
+    def is_legacy(self) -> bool:
+        return not self.protocol
+
+    @property
+    def protocols(self) -> list[str]:
+        """What a device on this route may use (a legacy route: VLESS and AWG)."""
+        return [PROTO_VLESS, PROTO_AWG] if self.is_legacy else [self.protocol]
+
     def serves(self, protocol: str) -> bool:
-        return bool(self.pool and self.pool.serves(protocol))
+        return protocol in self.protocols
 
     @property
     def protocol_label(self) -> str:
-        return self.pool.protocol_label if self.pool else "—"
+        return " + ".join(PROTOCOL_LABELS.get(p, p) for p in self.protocols)
 
     @property
     def hops(self) -> str:

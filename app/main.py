@@ -710,6 +710,7 @@ def admin_add_route(
     entry: str = Form(""),
     gate_id: str = Form(""),  # legacy form field: a single gate
     pool_id: str = Form(""),
+    protocol: str = Form(PROTO_VLESS),
     db: Session = Depends(get_db),
 ):
     if not _require_staff(request, db):
@@ -724,6 +725,8 @@ def admin_add_route(
         flash(request, "Маршрут с таким именем уже есть", "error")
     elif not pool:
         flash(request, "Выберите пул выходов", "error")
+    elif protocol not in ALL_PROTOCOLS:
+        flash(request, "Выберите протокол маршрута", "error")
     else:
         try:
             gpid = _resolve_entry(db, entry)
@@ -731,7 +734,7 @@ def admin_add_route(
             db.rollback()
             flash(request, str(e), "error")
         else:
-            db.add(Route(name=name, gate_pool_id=gpid, pool_id=pool.id))
+            db.add(Route(name=name, protocol=protocol, gate_pool_id=gpid, pool_id=pool.id))
             db.commit()
             flash(request, f"Маршрут «{name}» создан", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
@@ -915,6 +918,7 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
     groups = db.query(Group).order_by(Group.name).all()
     return render(request, "admin_park.html", user=admin, routes=routes, orphans=orphans,
                   free_gates=free_gates, gate_pools=gate_pools, groups=groups,
+                  server_pools=db.query(ExitPool).order_by(ExitPool.name).all(),
                   protocols=ALL_PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
                   fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))
@@ -923,23 +927,29 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
 @app.post("/admin/park/route")
 def admin_park_create_route(
     request: Request, name: str = Form(...), entry: str = Form(""), gate_id: str = Form(""),
-    protocol: str = Form(PROTO_VLESS),
+    protocol: str = Form(PROTO_VLESS), pool_id: str = Form(""),
     vless_port: int = Form(17771), awg_port: int = Form(17772),
     db: Session = Depends(get_db),
 ):
-    """Create a route = entry (gate pool / gate / direct) + a fresh server pool of
-    one protocol (its shared identity). Servers are added after."""
+    """Create a route = one protocol + entry (gate pool / gate / direct) + a server
+    pool: a fresh one (new shared identity, servers added after) or an existing
+    one — that adds the protocol to the servers already in it."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
     if not entry and gate_id.strip().isdigit():
         entry = f"gate:{gate_id.strip()}"
+    pool = db.get(ExitPool, int(pool_id)) if pool_id.strip().isdigit() else None
     if not name:
         flash(request, "Укажите имя маршрута", "error")
-    elif db.query(Route).filter_by(name=name).first() or db.query(ExitPool).filter_by(name=name).first():
+    elif db.query(Route).filter_by(name=name).first() or (
+        pool is None and db.query(ExitPool).filter_by(name=name).first()
+    ):
         flash(request, "Имя уже занято", "error")
     elif protocol not in ALL_PROTOCOLS:
         flash(request, "Выберите протокол маршрута", "error")
+    elif pool_id.strip() and pool is None:
+        flash(request, "Пул серверов не найден", "error")
     else:
         try:
             gpid = _resolve_entry(db, entry)
@@ -947,12 +957,16 @@ def admin_park_create_route(
             db.rollback()
             flash(request, str(e), "error")
         else:
-            pool = pool_ops.create_pool(
-                db, name, vless_port=vless_port, awg_port=awg_port, protocol=protocol
-            )
-            db.add(Route(name=name, gate_pool_id=gpid, pool_id=pool.id))
+            new_pool = pool is None
+            if new_pool:
+                pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
+            db.add(Route(name=name, protocol=protocol, gate_pool_id=gpid, pool_id=pool.id))
             db.commit()
-            nxt = "Добавьте выходы." if gpid is None else "Добавьте выходы и «Поднимите релей»."
+            if new_pool:
+                nxt = "Добавьте выходы." if gpid is None else "Добавьте выходы и «Поднимите релей»."
+            else:
+                nxt = (f"Протокол добавлен к серверам пула «{pool.name}» — переразверните их"
+                       + ("" if gpid is None else " и поднимите релей") + ".")
             flash(request, f"Маршрут «{name}» ({PROTOCOL_LABELS[protocol]}) создан. {nxt}", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 

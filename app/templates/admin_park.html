@@ -41,6 +41,7 @@
       {% if r.is_direct %}<b>напрямую</b> (клиенты подключаются к серверам пула)
       {% else %}пул гейтов <b>«{{ r.gate_pool.name }}»</b>{% if r.gate_pool.routes|length > 1 %} <span class="badge b-warn" title="этот пул гейтов обслуживает и другие маршруты">общий: {{ r.gate_pool.routes|length }} маршр.</span>{% endif %}{% endif %}
       · адрес для клиентов: <span class="mono">{{ r.host or '—' }}</span>{% if r.client_host %} <span class="muted">(имя)</span>{% endif %}</div>
+    {% if r.pool %}<div class="sub" style="margin-bottom:6px">Серверы: пул <b>«{{ r.pool.name }}»</b> · на серверах: {{ r.pool.protocols_label }}{% if r.pool.routes|length > 1 %} <span class="muted">(маршруты пула: {{ r.pool.routes|map(attribute='name')|join(', ') }})</span>{% endif %}</div>{% endif %}
     {% if not r.is_direct %}
     <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px">
       {% for g in r.gates %}
@@ -184,6 +185,13 @@
         <select name="protocol">
           {% for p in protocols %}<option value="{{ p }}">{{ protocol_labels[p] }}</option>{% endfor %}
         </select>
+      </label>
+      <label>Серверы (пул выходов)
+        <select name="pool_id">
+          <option value="">новый пул (серверы добавите после)</option>
+          {% for sp in server_pools %}<option value="{{ sp.id }}">существующий «{{ sp.name }}» ({{ sp.members|length }} серв.; уже: {{ sp.protocols_label }})</option>{% endfor %}
+        </select>
+        <small class="muted">Один сервер может нести несколько протоколов: выберите существующий пул — протокол добавится к его серверам (их нужно будет переразвернуть).</small>
       </label>
       <label>Вход
         <select name="entry" required>
