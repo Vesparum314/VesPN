@@ -32,10 +32,9 @@ from .crypto import decrypt, encrypt
 PROTO_VLESS = "vless"
 PROTO_AWG = "awg"
 PROTO_NAIVE = "naive"
-# Protocols a client can pick for a device today. NaiveProxy joins once its
-# issuance is implemented; ALL_PROTOCOLS is what a server pool may be typed as.
-PROTOCOLS = (PROTO_VLESS, PROTO_AWG)
-ALL_PROTOCOLS = (PROTO_VLESS, PROTO_AWG, PROTO_NAIVE)
+# Protocols a client can pick for a device / a route can carry.
+PROTOCOLS = (PROTO_VLESS, PROTO_AWG, PROTO_NAIVE)
+ALL_PROTOCOLS = PROTOCOLS
 PROTOCOL_LABELS = {PROTO_VLESS: "VLESS", PROTO_AWG: "AmneziaWG", PROTO_NAIVE: "NaiveProxy"}
 
 # VLESS transports a server pool can run (see ExitPool.vless_transport).
@@ -641,6 +640,8 @@ class Route(Base):
         """Why the route can't serve clients right now ('' = it can)."""
         if self.pool is None:
             return "нет пула выходов"
+        if self.protocol == PROTO_NAIVE and not self.client_host:
+            return "у NaiveProxy-маршрута не задано имя хоста (на него выпускается сертификат)"
         if not self.is_direct and not self.gates:
             return "в пуле гейтов нет гейтов"
         if not self.pool.synced_exits:
@@ -816,6 +817,26 @@ class TrafficStat(Base):
     @seen.setter
     def seen(self, value: dict) -> None:
         self.seen_json = json.dumps(value)
+
+
+class NaiveCert(Base):
+    """TLS certificate of a NaiveProxy domain, issued on the Hub (app/acme.py, DNS-01)
+    and pushed to every server of the pool. The key is stored encrypted."""
+
+    __tablename__ = "naive_certs"
+    domain: Mapped[str] = mapped_column(String(255), primary_key=True)
+    cert_pem: Mapped[str] = mapped_column(Text)
+    key_enc: Mapped[str] = mapped_column(Text)
+    not_after: Mapped["DateTime"] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def key_pem(self) -> str:
+        return decrypt(self.key_enc) or ""
+
+    @key_pem.setter
+    def key_pem(self, value: str) -> None:
+        self.key_enc = encrypt(value)
 
 
 class GateSample(Base):

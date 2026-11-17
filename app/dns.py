@@ -114,6 +114,67 @@ def _dynv6(p: DnsProvider, fqdn: str, ips: list[str]) -> None:
 _PROVIDERS = {DNS_CLOUDFLARE: _cloudflare, DNS_DESEC: _desec, DNS_DYNV6: _dynv6}
 
 
+# --- TXT (ACME DNS-01 challenges, see app/acme.py) --------------------------
+def _txt_cloudflare(p: DnsProvider, fqdn: str, value: str | None) -> None:
+    api = "https://api.cloudflare.com/client/v4"
+    h = {"Authorization": f"Bearer {p.token}", "Content-Type": "application/json"}
+    z = _check(requests.get(f"{api}/zones", params={"name": p.zone}, headers=h, timeout=TIMEOUT),
+               "cloudflare zones").json().get("result") or []
+    if not z:
+        raise DnsError(f"зона {p.zone} не найдена в Cloudflare")
+    zid = z[0]["id"]
+    have = _check(requests.get(f"{api}/zones/{zid}/dns_records", params={"type": "TXT", "name": fqdn},
+                               headers=h, timeout=TIMEOUT), "cloudflare txt").json().get("result") or []
+    for r in have:
+        _check(requests.delete(f"{api}/zones/{zid}/dns_records/{r['id']}", headers=h, timeout=TIMEOUT),
+               "cloudflare txt delete")
+    if value:
+        _check(requests.post(f"{api}/zones/{zid}/dns_records", headers=h, timeout=TIMEOUT,
+                             json={"type": "TXT", "name": fqdn, "content": value, "ttl": TTL}),
+               "cloudflare txt create")
+
+
+def _txt_desec(p: DnsProvider, fqdn: str, value: str | None) -> None:
+    api = f"https://desec.io/api/v1/domains/{p.zone.rstrip('.')}"
+    h = {"Authorization": f"Token {p.token}", "Content-Type": "application/json"}
+    dom = _check(requests.get(f"{api}/", headers=h, timeout=TIMEOUT), "desec domain").json()
+    ttl = max(TTL, int(dom.get("minimum_ttl") or TTL))
+    body = [{"subname": _subname(fqdn, p.zone), "type": "TXT", "ttl": ttl,
+             "records": [f'"{value}"'] if value else []}]
+    _check(requests.patch(f"{api}/rrsets/", headers=h, data=json.dumps(body), timeout=TIMEOUT),
+           "desec txt")
+
+
+def _txt_dynv6(p: DnsProvider, fqdn: str, value: str | None) -> None:
+    api = "https://dynv6.com/api/v2"
+    h = {"Authorization": f"Bearer {p.token}", "Accept": "application/json"}
+    zid = _check(requests.get(f"{api}/zones/by-name/{p.zone.rstrip('.')}", headers=h, timeout=TIMEOUT),
+                 "dynv6 zone").json()["id"]
+    sub = _subname(fqdn, p.zone)
+    recs = _check(requests.get(f"{api}/zones/{zid}/records", headers=h, timeout=TIMEOUT),
+                  "dynv6 records").json()
+    for r in recs:
+        if r.get("type") == "TXT" and r.get("name") == sub:
+            _check(requests.delete(f"{api}/zones/{zid}/records/{r['id']}", headers=h, timeout=TIMEOUT),
+                   "dynv6 txt delete")
+    if value:
+        _check(requests.post(f"{api}/zones/{zid}/records", headers=h, timeout=TIMEOUT,
+                             json={"type": "TXT", "name": sub, "data": value}), "dynv6 txt create")
+
+
+_TXT = {DNS_CLOUDFLARE: _txt_cloudflare, DNS_DESEC: _txt_desec, DNS_DYNV6: _txt_dynv6}
+
+
+def set_txt(p: DnsProvider, fqdn: str, value: str) -> None:
+    """Make `fqdn` carry exactly one TXT record, `value`."""
+    _subname(fqdn, p.zone)
+    _TXT[p.kind](p, fqdn.rstrip(".").lower(), value)
+
+
+def clear_txt(p: DnsProvider, fqdn: str) -> None:
+    _TXT[p.kind](p, fqdn.rstrip(".").lower(), None)
+
+
 def set_a_records(p: DnsProvider, fqdn: str, ips: list[str]) -> None:
     if not ips:
         raise DnsError("нечего публиковать: нет IP")

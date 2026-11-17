@@ -372,6 +372,7 @@ def _scheduler() -> None:
     last_monitor = 0.0
     last_journal = 0.0
     last_backup_day = None
+    last_cert_day = None
     time.sleep(20)  # settle before the first probe
     while True:
         _refresh_cfg()
@@ -381,6 +382,23 @@ def _scheduler() -> None:
                 _journal_cycle()
         except Exception as e:
             log.warning("journal tick failed: %s", e)
+        try:
+            today = datetime.now(timezone.utc).date()
+            if last_cert_day != today:  # NaiveProxy certificates: renew what's due
+                last_cert_day = today
+                from .db import SessionLocal
+                from . import naive
+
+                s = SessionLocal()
+                try:
+                    for msg in naive.renew_all(s):
+                        log.info("naive: %s", msg)
+                        if _cfg["enabled"]:
+                            broadcast(f"🔐 {msg}")
+                finally:
+                    s.close()
+        except Exception as e:
+            log.warning("cert tick failed: %s", e)
         try:
             now = datetime.now(timezone.utc)
             # monitoring runs on its cadence regardless (keeps the page fresh);

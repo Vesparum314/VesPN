@@ -209,14 +209,18 @@ def run_checks(db: Session) -> dict:
                 exits = []
                 for m in pool.members:
                     if g is not None:
-                        vless_ok: bool | None = _probe_tcp(g, m.public_host, pool.vless_port)
+                        # TCP traffic port of the pool: VLESS, else NaiveProxy (443), else
+                        # (AWG-only) SSH — whether the host is up at all.
+                        tport = (pool.vless_port if "vless" in pool.protocols
+                                 else 443 if "naive" in pool.protocols else (m.ssh_port or 22))
+                        vless_ok: bool | None = _probe_tcp(g, m.public_host, tport)
                         awg = _probe_udp(g, m.public_host, pool.awg_port)
                         client_state[m.id] = client_state.get(m.id, False) or bool(vless_ok)
                     else:
                         vless_ok, awg = None, None
                     exits.append({
                         "name": m.name,
-                        "vless_port": pool.vless_port, "vless_ok": vless_ok,
+                        "vless_port": tport if g is not None else pool.vless_port, "vless_ok": vless_ok,
                         "awg_port": pool.awg_port, "awg": awg,
                     })
                 active = [names.get(ip, ip) for ip in view.get("active", [])]

@@ -33,6 +33,7 @@ from .awg import AWGManager
 from .config import settings
 from .models import (
     PROTO_AWG,
+    PROTO_NAIVE,
     PROTO_VLESS,
     ROLE_EXIT,
     SYNC_SYNCED,
@@ -143,33 +144,43 @@ def _pool_configs(db: Session, pool: ExitPool, protocol: str) -> list[IssuedConf
     )
 
 
-def user_vless_routes(db: Session, user) -> list[Route]:
-    """Enabled VLESS-capable routes the user may use — what their VLESS devices'
+# VLESS and NaiveProxy clients are accounts (uuid / login+password) that can live
+# on several pools at once, so a device's subscription can list every route of its
+# protocol its owner may use. (AmneziaWG peers are per pool: address + key.)
+def user_proto_routes(db: Session, user, proto: str) -> list[Route]:
+    """Enabled routes of `proto` the user may use — what their devices'
     subscriptions list (the device's own route first is up to the caller)."""
-    return [r for r in accessible_routes(db, user) if r.serves(PROTO_VLESS) and r.pool is not None]
+    return [r for r in accessible_routes(db, user) if r.serves(proto) and r.pool is not None]
 
 
-def device_vless_pools(db: Session, device: Device) -> list[ExitPool]:
-    """Server pools a VLESS device's client must exist on: its own route's pool
-    plus the pool of every VLESS route its owner may use (subscriptions list them
-    all, and one uuid per device works on all of them)."""
+def user_vless_routes(db: Session, user) -> list[Route]:
+    return user_proto_routes(db, user, PROTO_VLESS)
+
+
+def device_proto_pools(db: Session, device: Device, proto: str) -> list[ExitPool]:
+    """Server pools a device's account must exist on: its own route's pool plus
+    the pool of every `proto` route its owner may use."""
     pools: dict[int, ExitPool] = {}
     if device.route is not None and device.route.pool is not None:
         pools[device.route.pool.id] = device.route.pool
-    for r in user_vless_routes(db, device.user):
+    for r in user_proto_routes(db, device.user, proto):
         pools.setdefault(r.pool.id, r.pool)
     return list(pools.values())
 
 
-def pool_vless_configs(db: Session, pool: ExitPool) -> list[IssuedConfig]:
-    """VLESS clients that must exist on `pool`'s servers: configs issued on the
-    pool, plus those of devices whose owner may use some VLESS route on it (they
-    reach it through their subscription). A user who loses access to all of the
-    pool's routes drops out — reconcile then removes the client."""
-    routes = [r for r in pool.routes if r.enabled and r.serves(PROTO_VLESS)]
+def device_vless_pools(db: Session, device: Device) -> list[ExitPool]:
+    return device_proto_pools(db, device, PROTO_VLESS)
+
+
+def pool_proto_configs(db: Session, pool: ExitPool, proto: str) -> list[IssuedConfig]:
+    """Accounts of `proto` that must exist on `pool`'s servers: configs issued on
+    the pool, plus those of devices whose owner may use some `proto` route on it
+    (they reach it through their subscription). A user who loses access to all of
+    the pool's routes drops out — reconcile then removes the account."""
+    routes = [r for r in pool.routes if r.enabled and r.serves(proto)]
     out = []
-    for c in db.query(IssuedConfig).filter(IssuedConfig.protocol == PROTO_VLESS).all():
-        if not c.uuid:
+    for c in db.query(IssuedConfig).filter(IssuedConfig.protocol == proto).all():
+        if proto == PROTO_VLESS and not c.uuid:
             continue
         if c.pool_id == pool.id:
             out.append(c)
@@ -178,6 +189,10 @@ def pool_vless_configs(db: Session, pool: ExitPool) -> list[IssuedConfig]:
         if dev is not None and any(r.allows(dev.user) for r in routes):
             out.append(c)
     return out
+
+
+def pool_vless_configs(db: Session, pool: ExitPool) -> list[IssuedConfig]:
+    return pool_proto_configs(db, pool, PROTO_VLESS)
 
 
 def _config_name(cfg: IssuedConfig) -> str:
@@ -189,11 +204,16 @@ def _config_name(cfg: IssuedConfig) -> str:
 
 
 # --- provisioning a pool exit (clone) -----------------------------------
-def provision_pool_exit(db: Session, node: Node) -> dict:
+def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> dict:
     """Stand a node up as a CLONE in its pool: install what the pool's routes need
-    — 3x-ui + the VLESS inbound (pool transport/masquerade) and/or the AmneziaWG
-    server — all with the pool's shared identity, then converge it to the pool's
-    current clients."""
+    — 3x-ui + the VLESS inbound (pool transport/masquerade), the AmneziaWG server,
+    the NaiveProxy Caddy — all with the pool's shared identity, then converge it
+    to the pool's current clients.
+
+    `only_missing` («Привести к пулу») is the safe mode for a server that already
+    serves clients: install only protocols that aren't there yet (3x-ui is not
+    reinstalled, the AWG container is not recreated), refresh NaiveProxy users and
+    certificates, ensure the VLESS inbound matches the pool, then reconcile."""
     if node.pool_id is None:
         raise NodeOpError("нода не привязана к пулу")
     pool = db.get(ExitPool, node.pool_id)
@@ -213,12 +233,31 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
             "у пула нет гейта: заведите пул гейтов и маршрут (пул→гейты) до раскатки выхода"
         )
 
+    from . import naive
+
+    if PROTO_NAIVE in protos:
+        # Certificates are issued on the Hub (DNS-01) before touching the server.
+        for r in naive.pool_routes(pool):
+            naive.ensure_cert(db, r)
+
     info: dict = {}
     installed: list[str] = []
     with connect(node) as n:
         provisioning.install_fleet_key(n, fleetkey.public_line(db))  # key-manage from here on
         provisioning.ensure_base(n)  # fresh Debian lacks curl, which the installers need
-        if PROTO_VLESS in protos:
+        _rc, names, _ = n.run("docker ps -a --format '{{.Names}}' 2>/dev/null", timeout=30)
+        running = set((names or "").split())
+        if PROTO_VLESS in protos and only_missing and node.has_xui:
+            # Keep 3x-ui and its clients; only make sure the inbound is the pool's.
+            provisioning.create_vless_inbound(
+                n, node.xui_path, node.xui_port, node.xui_token, name=node.name,
+                priv=pool.reality_private, pub=pool.reality_public,
+                short_ids=pool.short_ids, spider_x=pool.spider_x, port=pool.vless_port,
+                transport=pool.vless_transport, xhttp_path=pool.xhttp_path,
+                target=pool.reality_dest, server_names=pool.reality_names,
+            )
+            installed.append(f"VLESS {pool.vless_transport.upper()} (проверен)")
+        elif PROTO_VLESS in protos:
             info = provisioning.install_3xui(n)
             provisioning.set_panel_localhost(n)
             provisioning.pin_xray_version(n, settings.xray_version, info["xui_port"])
@@ -231,13 +270,22 @@ def provision_pool_exit(db: Session, node: Node) -> dict:
             )
             provisioning.harden_subscription(n)  # no public :2096 sub server
             installed.append(f"VLESS {pool.vless_transport.upper()} :{pool.vless_port}")
-        if PROTO_AWG in protos:
+        if PROTO_AWG in protos and only_missing and settings.awg_container in running:
+            installed.append("AmneziaWG (уже стоит)")
+        elif PROTO_AWG in protos:
             provisioning.install_amneziawg(
                 n, listen_port=pool.awg_port,
                 priv=pool.awg_private, pub=pool.awg_public, psk=pool.awg_psk,
                 params=pool.awg_params, subnet_prefix=pool.awg_subnet,
             )
-            installed.append(f"AmneziaWG UDP :{pool.awg_port}")
+            installed.append(f"AmneziaWG {pool.awg_version} UDP :{pool.awg_port}")
+        if PROTO_NAIVE in protos:
+            if only_missing and naive.CONTAINER in running:
+                naive.sync(n, db, pool)
+                installed.append("NaiveProxy (обновлён)")
+            else:
+                res = naive.install(n, db, pool)
+                installed.append(f"NaiveProxy :443 ({', '.join(res['domains'])})")
         provisioning.disable_fail2ban(n)      # never ban the gate/panel
         try:
             provisioning.install_telegram_proxy(n)  # localhost TG proxy; bot reaches it via gate
@@ -314,6 +362,11 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
                 for pub in current_pubs - desired_pubs:
                     mgr.del_peer(pub)
                     removed_a += 1
+            # --- NaiveProxy: the whole user list + certificates, then a reload ---
+            if PROTO_NAIVE in protos:
+                from . import naive
+
+                naive.sync(n, db, pool)
     except Exception as e:
         node.sync_state = SYNC_UNREACHABLE
         node.last_reconcile_at = _now()
@@ -449,6 +502,14 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
             if fresh != existing.payload:
                 existing.payload = fresh
                 db.commit()
+        elif device.protocol == PROTO_NAIVE and existing.secret:
+            from . import naive
+
+            fresh = naive.link(existing.identifier, existing.secret, host,
+                               route.port_for(PROTO_NAIVE), f"{slugify(route.name)}-{existing.identifier}")
+            if fresh != existing.payload:
+                existing.payload = fresh
+                db.commit()
         return existing
 
     # members that can serve now: synced first, else any that has 3x-ui.
@@ -553,6 +614,41 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
             raise NodeOpError("не удалось добавить пир ни на один выход пула")
         return cfg
 
+    elif device.protocol == PROTO_NAIVE:
+        from . import naive
+
+        if not pool.members:
+            raise NodeOpError("в пуле нет серверов")
+        login = device.node_identifier()
+        if existing is None:
+            # Reserve first: a parallel request reuses this login/password.
+            row = IssuedConfig(device_id=device.id, pool_id=pool.id, route_id=route.id,
+                               protocol=PROTO_NAIVE, identifier=login)
+            row.secret = naive.new_password()
+            existing = _reserve_config(db, row)
+        password = existing.secret or naive.new_password()
+        existing.secret = password
+        existing.protocol = PROTO_NAIVE
+        existing.pool_id = pool.id
+        existing.route_id = route.id
+        existing.identifier = existing.identifier or login
+        db.commit()
+        # The user list is per pool: push it to every NaiveProxy pool the owner can
+        # use (their subscription lists those routes). The home pool must take it.
+        ok_home, errs = naive.push_pool(db, pool)
+        if ok_home == 0:
+            raise NodeOpError("не удалось добавить пользователя NaiveProxy ни на один сервер пула: "
+                              + "; ".join(errs))
+        for other in device_proto_pools(db, device, PROTO_NAIVE):
+            if other.id != pool.id:
+                naive.push_pool(db, other)
+        existing.payload = naive.link(existing.identifier, password, host,
+                                      route.port_for(PROTO_NAIVE),
+                                      f"{slugify(route.name)}-{existing.identifier}")
+        db.commit()
+        db.refresh(existing)
+        return existing
+
     raise NodeOpError(f"unknown protocol {device.protocol!r}")
 
 
@@ -560,6 +656,15 @@ def deprovision_device(db: Session, device: Device) -> None:
     """Remove the device's clients/peers from every member of its pool(s).
     Never raises — a dead exit just can't be cleaned, which is fine."""
     for cfg in list(device.configs):
+        if cfg.protocol == PROTO_NAIVE:
+            # Users are a full list per pool: re-push it without this device to
+            # every NaiveProxy pool (the device row still exists at this point).
+            from . import naive
+
+            for p in db.query(ExitPool).all():
+                if PROTO_NAIVE in p.protocols:
+                    naive.push_pool(db, p, exclude={cfg.id})
+            continue
         pools: dict[int, ExitPool] = {}
         home = db.get(ExitPool, cfg.pool_id) if cfg.pool_id else None
         if home is not None:

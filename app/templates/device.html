@@ -4,7 +4,7 @@
 <a class="back" href="/">← К устройствам</a>
 <div class="head">
   <div>
-    <h1>{{ device.name }} <span class="badge b-{{ device.protocol }}" style="vertical-align:middle">{{ 'VLESS' if device.protocol == 'vless' else 'AmneziaWG' }}</span></h1>
+    <h1>{{ device.name }} <span class="badge b-{{ device.protocol }}" style="vertical-align:middle">{{ {'vless':'VLESS','awg':'AmneziaWG','naive':'NaiveProxy'}.get(device.protocol, device.protocol) }}</span></h1>
   </div>
 </div>
 
@@ -18,8 +18,13 @@
       <div class="qr"><img src="{{ sub_qr }}" alt="QR подписки" width="200" height="200"></div>
       <div style="min-width:0">
         <ol class="steps">
+          {% if is_naive %}
+          <li>Приложение <b>Karing</b> (Android, iPhone, Mac, Windows) → добавить <b>подписку</b> по ссылке или QR.</li>
+          <li>Karing сам выбирает рабочий вход (группа «auto») и переключается, если какой-то заблокируют; панель сама добавляет новые входы и убирает неработающие.</li>
+          {% else %}
           <li>Приложение (<b>v2rayNG</b> на Android, <b>OneXray</b> на iPhone/Mac/Windows) → добавить <b>подписку</b> (Subscription / «+ из URL») — отсканируйте QR или вставьте ссылку.</li>
           <li>Обновите подписку и выберите сервер «… · авто». Если он перестал работать — выберите другой из списка или обновите подписку: панель сама убирает неработающие входы и добавляет новые.</li>
+          {% endif %}
         </ol>
         <code class="payload" id="sub_payload">{{ sub }}</code>
         <div class="dev-actions">
@@ -41,6 +46,8 @@
         <ol class="steps">
           {% if is_awg %}
             <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.{% if route and route.pool and route.pool.awg_version == '3.1' %} Нужна версия приложения <b>5.0.1.5 или новее</b> (протокол AmneziaWG 3.1).{% endif %}</li>
+          {% elif is_naive %}
+            <li>Приложение <b>Karing</b> или <b>NekoBox</b> (Android) → добавить из буфера или по QR (ссылка <code>naive+https://</code>). Держите приложение обновлённым: устаревшая версия Chromium внутри — сама по себе заметный признак.</li>
           {% else %}
             <li>Приложение (v2rayNG, OneXray…) → добавить из буфера или по QR. Одна ссылка = один вход: если его заблокируют, подписка выше переживёт это сама, а ссылку придётся взять заново.</li>
           {% endif %}

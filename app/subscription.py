@@ -94,28 +94,33 @@ def allow(ip: str) -> bool:
 
 # --- entries ------------------------------------------------------------
 def _routes_for(db: Session, device: Device) -> list[Route]:
-    from .pool import user_vless_routes
+    from .pool import user_proto_routes
 
-    routes = [r for r in user_vless_routes(db, device.user) if not r.is_blocked]
+    proto = device.protocol
+    routes = [r for r in user_proto_routes(db, device.user, proto) if not r.is_blocked]
     own = device.route
-    if own is not None and own.serves(PROTO_VLESS) and own.pool is not None:
+    if own is not None and own.serves(proto) and own.pool is not None:
         routes = [own] + [r for r in routes if r.id != own.id]
     return routes
 
 
 def entries(db: Session, device: Device) -> list[dict]:
-    """[{label, route, host, port, link}] for the device — VLESS only (AWG configs
-    are static; NaiveProxy joins with its own issuance)."""
+    """[{label, route, proto, host, port, sni, link, …}] for the device. VLESS and
+    NaiveProxy (AWG configs are static). A NaiveProxy entry by gate IP has no
+    plain link (the link's host is also its SNI, which must be the domain) — it
+    only goes into the sing-box format, which can dial an IP with a given SNI."""
+    from . import naive
     from .pool import vless_link
 
-    if device.protocol != PROTO_VLESS:
+    proto = device.protocol
+    if proto not in (PROTO_VLESS, PROTO_NAIVE):
         return []
-    cfg = next((c for c in device.configs if c.protocol == PROTO_VLESS and c.uuid), None)
-    if cfg is None:
+    cfg = next((c for c in device.configs if c.protocol == proto), None)
+    if cfg is None or (proto == PROTO_VLESS and not cfg.uuid) or (proto == PROTO_NAIVE and not cfg.secret):
         return []
     out: list[dict] = []
     for r in _routes_for(db, device):
-        port = r.port_for(PROTO_VLESS)
+        port = r.port_for(proto)
         hosts: list[tuple[str, str]] = []
         if r.client_host:
             hosts.append(("авто", r.client_host))
@@ -124,10 +129,15 @@ def entries(db: Session, device: Device) -> list[dict]:
                 hosts.append((str(i), n.public_host))
         for tag, host in hosts:
             label = f"{r.name} · {tag}"
-            out.append({
-                "label": label, "route": r, "host": host, "port": port,
-                "link": vless_link(r.pool, cfg.uuid, host, port, label),
-            })
+            item = {"label": label, "route": r, "proto": proto, "host": host, "port": port}
+            if proto == PROTO_VLESS:
+                item["uuid"] = cfg.uuid
+                item["link"] = vless_link(r.pool, cfg.uuid, host, port, label)
+            else:
+                item.update(user=cfg.identifier, password=cfg.secret, sni=r.client_host,
+                            link=naive.link(cfg.identifier, cfg.secret, host, port, label)
+                            if host == r.client_host else None)
+            out.append(item)
     return out
 
 
@@ -140,10 +150,16 @@ def pick_format(user_agent: str, requested: str = "") -> str:
 
 
 def render_base64(items: list[dict]) -> str:
-    return base64.b64encode("\n".join(i["link"] for i in items).encode()).decode()
+    return base64.b64encode("\n".join(i["link"] for i in items if i.get("link")).encode()).decode()
 
 
-def _singbox_outbound(item: dict, uuid: str) -> dict | None:
+def _singbox_outbound(item: dict, uuid: str = "") -> dict | None:
+    if item.get("proto") == "naive":
+        from . import naive
+
+        return naive.singbox_outbound(item["label"], item["user"], item["password"],
+                                      item["host"], item["port"], item["sni"])
+    uuid = item.get("uuid") or uuid
     pool = item["route"].pool
     if pool.vless_transport != VLESS_TCP:
         return None  # sing-box has no XHTTP
@@ -162,7 +178,7 @@ def _singbox_outbound(item: dict, uuid: str) -> dict | None:
     }
 
 
-def render_singbox(items: list[dict], uuid: str) -> str | None:
+def render_singbox(items: list[dict], uuid: str = "") -> str | None:
     outs = [o for o in (_singbox_outbound(i, uuid) for i in items) if o]
     if not outs:
         return None

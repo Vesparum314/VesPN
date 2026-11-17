@@ -99,6 +99,7 @@ main{padding:22px max(16px,env(safe-area-inset-right,0px)) 48px max(16px,env(saf
   padding:3px 9px;border-radius:999px;white-space:nowrap}
 .b-vless{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
 .b-awg{background:var(--ok-bg);color:var(--ok)}
+.b-naive{background:var(--warn-bg);color:var(--warn)}
 .b-gate{background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent)}
 .b-exit{background:var(--panel-3);color:var(--fg-soft)}
 .b-ok{background:var(--ok-bg);color:var(--ok)}

@@ -38,6 +38,7 @@ from .models import (
     VLESS_XHTTP,
     JOB_RUNNING,
     PROTO_AWG,
+    PROTO_NAIVE,
     PROTO_VLESS,
     PROTOCOL_LABELS,
     PROTOCOLS,
@@ -55,6 +56,7 @@ from .models import (
     GatePool,
     Group,
     IssuedConfig,
+    NaiveCert,
     Node,
     Route,
     Setting,
@@ -446,7 +448,7 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
     # follows gate changes by itself (app/subscription.py).
     sub = sub_qr = None
     sub_items: list[dict] = []
-    if cfg and device.protocol == PROTO_VLESS:
+    if cfg and device.protocol in (PROTO_VLESS, PROTO_NAIVE):
         sub_ops.ensure_token(db, device)
         sub = sub_ops.sub_url(device, str(request.base_url))
         sub_qr = qr_data_uri(sub)
@@ -454,7 +456,8 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
     return render(
         request, "device.html",
         user=user, device=device, route=route, cfg=cfg, qr=qr, error=error,
-        is_awg=(device.protocol == PROTO_AWG), ios_conf=ios_conf, ios_qr=ios_qr,
+        is_awg=(device.protocol == PROTO_AWG), is_naive=(device.protocol == PROTO_NAIVE),
+        ios_conf=ios_conf, ios_qr=ios_qr,
         sub=sub, sub_qr=sub_qr, sub_items=sub_items,
     )
 
@@ -493,8 +496,7 @@ def subscription(request: Request, token: str, format: str = "", db: Session = D
     hdrs = sub_ops.headers(device, db, title, settings.sub_update_hours)
     fmt = sub_ops.pick_format(request.headers.get("user-agent", ""), format)
     if fmt == sub_ops.FORMAT_SINGBOX:
-        cfg = next((c for c in device.configs if c.uuid), None)
-        body = sub_ops.render_singbox(items, cfg.uuid) if cfg else None
+        body = sub_ops.render_singbox(items)
         if body is not None:
             return Response(body, media_type="application/json", headers=hdrs)
     return Response(sub_ops.render_base64(items), media_type="text/plain; charset=utf-8", headers=hdrs)
@@ -668,6 +670,65 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
             flash(request, f"«{node.name}»: раскатка запущена в фоне — статус обновится на «Парке».", "success")
         else:
             flash(request, f"«{node.name}»: раскатка уже идёт — дождитесь завершения.", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/nodes/{node_id}/converge")
+def admin_converge_node(request: Request, node_id: int, db: Session = Depends(get_db)):
+    """«Привести к пулу»: the safe re-provision for a server already serving
+    clients — install only what's missing, refresh NaiveProxy, check the VLESS
+    inbound, reconcile. Background job like «Развернуть»."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    node = db.get(Node, node_id)
+    if node and node.pool_id:
+        def _do(db: Session, node: Node) -> str:
+            info = pool_ops.provision_pool_exit(db, node, only_missing=True)
+            rec = info.get("reconcile", {})
+            return (f"Приведён к пулу: {', '.join(info['installed']) or '—'}; "
+                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
+
+        if jobs.start_node_job(db, node, "provision", _do):
+            flash(request, f"«{node.name}»: приведение к пулу запущено в фоне.", "success")
+        else:
+            flash(request, f"«{node.name}»: операция уже идёт — дождитесь завершения.", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/cert")
+def admin_route_cert(request: Request, route_id: int, db: Session = Depends(get_db)):
+    """Issue (or renew) the NaiveProxy route's certificate on the Hub (DNS-01) and
+    push it to the pool's servers — in the background (a minute or two)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if not route or route.protocol != PROTO_NAIVE:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    if not route.client_host or route.dns_provider is None:
+        flash(request, "Сначала задайте маршруту имя хоста и DNS-провайдер его зоны (адрес маршрута)", "error")
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    import threading
+
+    rid = route.id
+
+    def _work():
+        from . import naive
+        from .db import SessionLocal
+
+        s = SessionLocal()
+        try:
+            r = s.get(Route, rid)
+            naive.ensure_cert(s, r, force=True)
+            ok, errs = naive.push_pool(s, r.pool)
+            log.info("naive cert %s: pushed to %d servers %s", r.client_host, ok, errs or "")
+        except Exception:
+            log.exception("naive cert issue failed")
+        finally:
+            s.close()
+
+    threading.Thread(target=_work, name="naive-cert", daemon=True).start()
+    flash(request, f"Выпуск сертификата для {route.client_host} запущен (1–2 мин.) — затем он будет "
+                   f"разослан на серверы пула. Обновите страницу позже.", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -1067,6 +1128,8 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
                   dns_providers=db.query(DnsProvider).order_by(DnsProvider.name).all(),
                   dns_kinds=DNS_KINDS,
                   dns_states={r.id: dns_ops.get_state(db, r.id) for r in routes if r.dns_provider_id},
+                  naive_certs={r.id: db.get(NaiveCert, r.client_host.lower())
+                               for r in routes if r.protocol == PROTO_NAIVE and r.client_host},
                   protocols=ALL_PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
                   fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))

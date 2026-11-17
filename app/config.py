@@ -80,6 +80,15 @@ class Settings:
         # Gate journal + DNS sync cadence (minutes): how precisely a gate ban is dated
         # and how fast a dead gate leaves DNS. Cheap: a TCP probe + one SSH per gate.
         self.journal_minutes: int = int(os.environ.get("JOURNAL_MINUTES", "5"))
+        # NaiveProxy servers: Caddy built on the server with the naive fork of
+        # forwardproxy (xcaddy). Builder/runtime images and the fork's git ref.
+        self.naive_builder_image: str = os.environ.get("NAIVE_BUILDER_IMAGE", "caddy:2-builder")
+        self.naive_runtime_image: str = os.environ.get("NAIVE_RUNTIME_IMAGE", "caddy:2")
+        self.naive_forwardproxy_ref: str = os.environ.get("NAIVE_FORWARDPROXY_REF", "naive")
+        # ACME directory for NaiveProxy certificates (DNS-01, issued on the Hub).
+        self.acme_directory: str = os.environ.get(
+            "ACME_DIRECTORY", "https://acme-v02.api.letsencrypt.org/directory"
+        )
         # Subscriptions: public base URL they are served under (a host of their own,
         # not the panel's — e.g. https://sub.example.org). Empty = served under the
         # panel's own address (fine for a private install / testing). When set,
