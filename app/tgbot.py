@@ -352,12 +352,35 @@ def _poll() -> None:
             time.sleep(5)
 
 
+def _journal_cycle() -> None:
+    """Gate journal + DNS sync (app/journal.py) — runs regardless of the bot."""
+    from .db import SessionLocal
+    from . import journal
+
+    db = SessionLocal()
+    try:
+        journal.run_cycle(db)
+    except Exception as e:
+        log.warning("journal cycle failed: %s", e)
+    finally:
+        db.close()
+
+
 def _scheduler() -> None:
+    from .config import settings
+
     last_monitor = 0.0
+    last_journal = 0.0
     last_backup_day = None
     time.sleep(20)  # settle before the first probe
     while True:
         _refresh_cfg()
+        try:
+            if time.monotonic() - last_journal >= max(60, settings.journal_minutes * 60):
+                last_journal = time.monotonic()
+                _journal_cycle()
+        except Exception as e:
+            log.warning("journal tick failed: %s", e)
         try:
             now = datetime.now(timezone.utc)
             # monitoring runs on its cadence regardless (keeps the page fresh);

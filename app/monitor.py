@@ -80,29 +80,46 @@ def _ips(s: str) -> list[str]:
     return [x.strip().strip("'\"") for x in s.split(",") if x.strip()]
 
 
-def _daemon_view(g) -> dict:
-    """Read the relay daemon's live state from an already-open gate session (the
-    running client-path truth: which exits it sees healthy, which is active, and the
-    number of active-exit changes in the last hour)."""
+def _for_pool(line: str, pool_name: str | None) -> bool:
+    """A relay-daemon log line about `pool_name`. The v2 daemon logs one line per
+    server pool («pool=<name> active=…»); a v1 daemon (one pool) has no pool= tag."""
+    if "pool=" not in line:
+        return True
+    return pool_name is not None and f"pool={pool_name} active=" in line
+
+
+def _daemon_view(g, pool_name: str | None = None) -> dict:
+    """Read the relay daemon's live state for one server pool from an already-open
+    gate session (the running client-path truth: which exits it sees healthy, which
+    is active, and the number of active-exit changes in the last hour)."""
     view: dict = {"daemon": None, "active": [], "healthy": [], "flaps_1h": None}
     if g is None:
         return view
     try:
         _rc, act, _ = g.run(
-            "journalctl -u vespn-relay --no-pager 2>/dev/null | grep active= | tail -1", timeout=15
+            "journalctl -u vespn-relay --no-pager 2>/dev/null | grep active= | tail -300", timeout=15
         )
-        m = _ACTIVE_RE.search(act or "")
+        mine = [l for l in (act or "").splitlines() if _for_pool(l, pool_name)]
+        m = _ACTIVE_RE.search(mine[-1]) if mine else None
         if m:
             view["active"] = _ips(m.group(1))
             view["healthy"] = _ips(m.group(2))
         _rc, flaps, _ = g.run(
-            "journalctl -u vespn-relay --no-pager --since '-1 hour' 2>/dev/null | grep -c active=",
+            "journalctl -u vespn-relay --no-pager --since '-1 hour' 2>/dev/null | grep active=",
             timeout=15,
         )
-        try:
-            view["flaps_1h"] = int((flaps or "0").strip())
-        except ValueError:
-            pass
+        # The v2 daemon re-logs EVERY pool on any change, so count only the lines
+        # where this pool's active member actually changed.
+        changes, prev = 0, None
+        for l in (flaps or "").splitlines():
+            if not _for_pool(l, pool_name):
+                continue
+            mm = _ACTIVE_RE.search(l)
+            cur = mm.group(1) if mm else None
+            if prev is not None and cur != prev:
+                changes += 1
+            prev = cur
+        view["flaps_1h"] = changes
         _rc, st, _ = g.run("systemctl is-active vespn-relay 2>&1", timeout=10)
         view["daemon"] = (st or "").strip()
     except Exception as e:
@@ -177,52 +194,60 @@ def run_checks(db: Session) -> dict:
                     })
 
         # --- view (б): client path (gate → pool exits on traffic ports) ----
+        # Every gate of the route's gate pool is a separate entry point, so each one
+        # is checked on its own: one dead gate is an alert (it's a ban signal) even
+        # while the others keep the route alive.
         for r in routes:
-            gate, pool = r.primary_gate, r.pool
-            if not gate or not pool:
+            pool = r.pool
+            if not pool or not r.gates:
                 continue
-            g = gate_g(gate)
-            view = _daemon_view(g)
-            names = {m.public_host: m.name for m in pool.members}
-            exits = []
-            for m in pool.members:
-                if g is not None:
-                    vless_ok: bool | None = _probe_tcp(g, m.public_host, pool.vless_port)
-                    awg = _probe_udp(g, m.public_host, pool.awg_port)
-                    client_state[m.id] = bool(vless_ok)
-                else:
-                    vless_ok, awg = None, None
-                exits.append({
-                    "name": m.name,
-                    "vless_port": pool.vless_port, "vless_ok": vless_ok,
-                    "awg_port": pool.awg_port, "awg": awg,
+            working = 0
+            for gate in r.gates:
+                g = gate_g(gate)
+                view = _daemon_view(g, pool.name)
+                names = {m.public_host: m.name for m in pool.members}
+                exits = []
+                for m in pool.members:
+                    if g is not None:
+                        vless_ok: bool | None = _probe_tcp(g, m.public_host, pool.vless_port)
+                        awg = _probe_udp(g, m.public_host, pool.awg_port)
+                        client_state[m.id] = client_state.get(m.id, False) or bool(vless_ok)
+                    else:
+                        vless_ok, awg = None, None
+                    exits.append({
+                        "name": m.name,
+                        "vless_port": pool.vless_port, "vless_ok": vless_ok,
+                        "awg_port": pool.awg_port, "awg": awg,
+                    })
+                active = [names.get(ip, ip) for ip in view.get("active", [])]
+                # (б): "down" = the gate can't reach the exit's traffic port right
+                # now (fresh probe), independent of the daemon's hysteretic list.
+                down = [e["name"] for e in exits if e["vless_ok"] is False]
+                gate_up = (g is not None) and view.get("daemon") == "active"
+                if gate_up and view.get("active"):
+                    working += 1
+                snap["routes"].append({
+                    "route": r.name, "gate": gate.name,
+                    "gate_up": gate_up, "daemon": view.get("daemon"),
+                    "active": active,
+                    "healthy": [names.get(ip, ip) for ip in view.get("healthy", [])],
+                    "down": down, "exits": exits,
+                    "flaps_1h": view.get("flaps_1h"), "error": view.get("error"),
                 })
-            active = [names.get(ip, ip) for ip in view.get("active", [])]
-            # (б): "down" = the gate can't reach the exit's traffic port right now
-            # (fresh probe), independent of the daemon's hysteretic healthy list.
-            down = [e["name"] for e in exits if e["vless_ok"] is False]
-            gate_up = (g is not None) and view.get("daemon") == "active"
-            snap["routes"].append({
-                "route": r.name, "gate": gate.name,
-                "gate_up": gate_up, "daemon": view.get("daemon"),
-                "active": active,
-                "healthy": [names.get(ip, ip) for ip in view.get("healthy", [])],
-                "down": down, "exits": exits,
-                "flaps_1h": view.get("flaps_1h"), "error": view.get("error"),
-            })
-            # alert-worthy (client-impacting) only:
-            if g is None:
-                snap["problems"].append(f"маршрут «{r.name}»: гейт {gate.name} недоступен с Hub")
-            elif view.get("daemon") != "active":
-                snap["problems"].append(
-                    f"маршрут «{r.name}»: релей-демон на {gate.name} не работает ({view.get('daemon')})"
-                )
-            elif not view.get("active"):
-                snap["problems"].append(f"маршрут «{r.name}»: НЕТ активного выхода — все упали!")
-            elif (view.get("flaps_1h") or 0) >= FLAP_ALERT:
-                snap["problems"].append(
-                    f"маршрут «{r.name}»: флаппинг выхода ({view['flaps_1h']} переключений/час)"
-                )
+                # alert-worthy (client-impacting) only:
+                where = f"маршрут «{r.name}», гейт {gate.name}"
+                if g is None:
+                    snap["problems"].append(f"{where}: гейт недоступен с Hub")
+                elif view.get("daemon") != "active":
+                    snap["problems"].append(f"{where}: релей-демон не работает ({view.get('daemon')})")
+                elif not view.get("active"):
+                    snap["problems"].append(f"{where}: НЕТ активного выхода — все упали!")
+                elif (view.get("flaps_1h") or 0) >= FLAP_ALERT:
+                    snap["problems"].append(
+                        f"{where}: флаппинг выхода ({view['flaps_1h']} переключений/час)"
+                    )
+            if working == 0:
+                snap["problems"].append(f"маршрут «{r.name}»: НИ ОДНОГО рабочего гейта — маршрут лежит")
 
     _record_transitions(db, mgmt_state, HIST_MGMT)
     _record_transitions(db, client_state, HIST_CLIENT)
@@ -297,7 +322,7 @@ def summarize(snap: dict | None) -> str:
             extra = f" · флаппинг {flaps}/ч" if (flaps or 0) >= FLAP_ALERT else ""
             down = r.get("down") or []
             downs = f" · не видны гейту: {', '.join(down)}" if down else ""
-            lines.append(f"{mark} {r['route']}: активен {act}{extra}{downs}")
+            lines.append(f"{mark} {r['route']} · {r.get('gate', '?')}: активен {act}{extra}{downs}")
     else:
         lines.append("— маршрутов нет")
 

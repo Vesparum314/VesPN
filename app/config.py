@@ -75,6 +75,9 @@ class Settings:
         self.tg_api_base: str = os.environ.get("TG_API_BASE", "https://api.telegram.org")
         self.tg_backup_hour: int = int(os.environ.get("TG_BACKUP_HOUR", "6"))  # UTC hour for the daily backup
         self.tg_monitor_minutes: int = int(os.environ.get("TG_MONITOR_MINUTES", "60"))  # monitoring cadence
+        # Gate journal + DNS sync cadence (minutes): how precisely a gate ban is dated
+        # and how fast a dead gate leaves DNS. Cheap: a TCP probe + one SSH per gate.
+        self.journal_minutes: int = int(os.environ.get("JOURNAL_MINUTES", "5"))
 
     @property
     def tg_admin_chats(self) -> list[str]:

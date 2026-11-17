@@ -289,9 +289,18 @@ def apply_haproxy(text):
         subprocess.run(["systemctl", "start", "vespn-sni"], check=False)
 
 
+def drop_flows_to(ip):
+    """Forget conntrack entries whose reply comes from `ip` (the old active server).
+    Without this a UDP client that keeps sending (AmneziaWG keepalives) stays
+    DNAT'ed to the dead server forever — its entry never times out."""
+    subprocess.run(["conntrack", "-D", "--reply-src", ip],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 def main():
     state = {}
     last = None
+    prev_active = {}
     while True:
         cfg = load() or {"groups": {}, "dnat": [], "sni": [], "interval": 5}
         groups = cfg.get("groups", {})
@@ -321,6 +330,10 @@ def main():
             apply_nft(build_nft(cfg, active))
             apply_haproxy(build_haproxy(cfg, active))
             last = sig
+            for key, old in prev_active.items():
+                if old and active.get(key) != old:
+                    drop_flows_to(old)
+            prev_active = dict(active)
             for key, g in groups.items():
                 a = [active[key]] if key in active else []
                 sys.stderr.write("vespn-relay: pool=%s active=%r (healthy=%r)\n"
@@ -375,7 +388,8 @@ def install(node: SSHNode, plan: dict) -> dict:
         raise ProvisionError("no ports to relay")
     need_haproxy = bool(plan.get("sni"))
     pkgs = "command -v nft >/dev/null 2>&1 || (apt-get update && apt-get install -y nftables) >/dev/null 2>&1; " \
-           "command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y python3) >/dev/null 2>&1; "
+           "command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y python3) >/dev/null 2>&1; " \
+           "command -v conntrack >/dev/null 2>&1 || (apt-get update && apt-get install -y conntrack) >/dev/null 2>&1; "
     if need_haproxy:
         pkgs += ("command -v haproxy >/dev/null 2>&1 || (apt-get update && apt-get install -y haproxy) >/dev/null 2>&1; "
                  "systemctl disable --now haproxy >/dev/null 2>&1; ")  # we run our own unit

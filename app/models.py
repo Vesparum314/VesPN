@@ -81,6 +81,8 @@ JOB_STATES = (JOB_IDLE, JOB_RUNNING, JOB_DONE, JOB_ERROR)
 # Monitoring reachability-history kinds (see NodeStatusHistory).
 HIST_MGMT = "mgmt"      # Hub → node management reachability (Hub→gate, Hub→exit via gate)
 HIST_CLIENT = "client"  # gate → exit client path (VLESS traffic port)
+HIST_HUB = "hub"        # gate journal: gate's ports reachable from the Hub (inside the region)
+HIST_ABROAD = "abroad"  # gate journal: gate reachable from a server abroad
 
 
 # A user's access role (distinct from a node's role above). `admin` = full control
@@ -723,6 +725,29 @@ class TrafficStat(Base):
     @seen.setter
     def seen(self, value: dict) -> None:
         self.seen_json = json.dumps(value)
+
+
+class GateSample(Base):
+    """One gate-journal sample (every few minutes): is the gate reachable from the
+    Hub (inside the censored region — roughly what clients see) and from a server
+    abroad (tells «blocked at the hoster/upstream» from «blocked for local
+    clients»), plus traffic counters and how many clients were connected. Kept to
+    answer, after a ban, *when* it happened, *from which side* and *under what
+    load* — the point of running several gates side by side."""
+
+    __tablename__ = "gate_samples"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    hub_ok: Mapped[bool] = mapped_column(Boolean)
+    abroad_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # None = no vantage point
+    vantage: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Cumulative interface counters on the gate (reset on reboot); None = not read.
+    rx_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tx_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    clients: Mapped[int | None] = mapped_column(Integer, nullable=True)  # distinct client IPs right now
+
+    node: Mapped["Node"] = relationship("Node")
 
 
 class NodeStatusHistory(Base):

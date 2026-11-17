@@ -20,6 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.status import HTTP_303_SEE_OTHER
 
 from . import appconfig
+from . import dns as dns_ops
 from . import fleetkey
 from . import jobs
 from . import monitor
@@ -30,6 +31,7 @@ from .config import settings
 from .db import get_db, init_db
 from .models import (
     ALL_PROTOCOLS,
+    DNS_KINDS,
     JOB_RUNNING,
     PROTO_AWG,
     PROTO_VLESS,
@@ -44,6 +46,7 @@ from .models import (
     USER_ROLES,
     Announcement,
     Device,
+    DnsProvider,
     ExitPool,
     GatePool,
     Group,
@@ -1006,6 +1009,9 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
                   gate_pool_problems={
                       gp.id: pool_ops.gate_pool_problem(db, gp.id) for gp in gate_pools if gp.routes
                   },
+                  dns_providers=db.query(DnsProvider).order_by(DnsProvider.name).all(),
+                  dns_kinds=DNS_KINDS,
+                  dns_states={r.id: dns_ops.get_state(db, r.id) for r in routes if r.dns_provider_id},
                   protocols=ALL_PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
                   fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))
@@ -1135,6 +1141,112 @@ def admin_monitor(request: Request, db: Session = Depends(get_db)):
     history = [(n, monitor.node_history(db, n.id, limit=12)) for n in nodes_all]
     return render(request, "admin_monitor.html", user=admin,
                   snap=monitor.get_state(db), tg=appconfig.tg_config(db), history=history)
+
+
+@app.get("/admin/journal", response_class=HTMLResponse)
+def admin_journal(request: Request, days: int = 30, db: Session = Depends(get_db)):
+    """Gate journal: per gate — reachable from the Hub / from abroad, since when,
+    traffic and clients while it lived, recent flips (see app/journal.py)."""
+    from . import journal
+
+    admin = _require_staff(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    days = max(1, min(int(days), 90))
+    gates = db.query(Node).filter(Node.role == ROLE_GATE).order_by(Node.id).all()
+    reports = [journal.gate_report(db, g, days) for g in gates]
+    return render(request, "admin_journal.html", user=admin, reports=reports, days=days,
+                  every=settings.journal_minutes)
+
+
+@app.post("/admin/journal/run")
+def admin_journal_run(request: Request, db: Session = Depends(get_db)):
+    """Take a journal sample now (in the background: one SSH per gate)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    import threading
+    from . import tgbot
+
+    threading.Thread(target=tgbot._journal_cycle, name="journal-now", daemon=True).start()
+    flash(request, "Замер запущен — обновите страницу через минуту", "success")
+    return RedirectResponse("/admin/journal", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: DNS providers + route client address ------------------------
+@app.post("/admin/dns")
+def admin_add_dns(
+    request: Request, name: str = Form(...), kind: str = Form(...), zone: str = Form(...),
+    token: str = Form(""), db: Session = Depends(get_db),
+):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    name, zone = name.strip(), zone.strip().rstrip(".").lower()
+    if not name or not zone or kind not in DNS_KINDS or not token.strip():
+        flash(request, "Укажите имя, тип, зону и API-токен", "error")
+    elif db.query(DnsProvider).filter_by(name=name).first():
+        flash(request, "DNS-провайдер с таким именем уже есть", "error")
+    else:
+        p = DnsProvider(name=name, kind=kind, zone=zone)
+        p.token = token.strip()  # encrypted via setter
+        db.add(p)
+        db.commit()
+        flash(request, f"DNS-провайдер «{name}» ({zone}) добавлен", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/dns/{pid}/delete")
+def admin_delete_dns(request: Request, pid: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    p = db.get(DnsProvider, pid)
+    if p:
+        users = [r.name for r in db.query(Route).filter(Route.dns_provider_id == p.id).all()]
+        if users:
+            flash(request, f"DNS-провайдер «{p.name}» используют маршруты: {', '.join(users)}", "error")
+        else:
+            db.delete(p)
+            db.commit()
+            flash(request, f"DNS-провайдер «{p.name}» удалён", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/client")
+def admin_route_client(
+    request: Request, route_id: int, client_host: str = Form(""), client_port: str = Form(""),
+    dns_provider_id: str = Form(""), db: Session = Depends(get_db),
+):
+    """What client configs name for this route: hostname (optionally kept in sync
+    with a DNS provider) and port. Changing them changes NEW configs; already
+    issued ones keep what they had until re-issued (subscriptions update by
+    themselves)."""
+    from . import dns, journal
+
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if not route:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    host = client_host.strip().rstrip(".").lower()
+    port = int(client_port) if client_port.strip().isdigit() else None
+    p = db.get(DnsProvider, int(dns_provider_id)) if dns_provider_id.strip().isdigit() else None
+    if port is not None and not 1 <= port <= 65535:
+        flash(request, "Порт — от 1 до 65535", "error")
+    elif p and not host:
+        flash(request, "Для DNS-синхронизации укажите имя хоста", "error")
+    elif p and host != p.zone and not host.endswith("." + p.zone):
+        flash(request, f"Имя {host} не в зоне {p.zone} провайдера «{p.name}»", "error")
+    else:
+        route.client_host = host
+        route.client_port = port
+        route.dns_provider_id = p.id if p else None
+        db.commit()
+        msg = f"Адрес маршрута «{route.name}»: {route.host or '—'}" + (f":{port}" if port else "")
+        if p:
+            st = dns.sync_route(db, route, journal.live_gate_ids(db), force=True)
+            msg += (f"; DNS → {', '.join(st.get('ips', []))}" if not st.get("error")
+                    else f"; DNS не обновлён: {st['error']}")
+        flash(request, msg, "error" if p and st.get("error") else "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/monitor/check")

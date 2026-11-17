@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Журнал гейтов — {{ brand }}{% endblock %}
+{% block content %}
+{% macro when(t) %}{% if t %}<span class="mono">{{ t.strftime('%Y-%m-%d %H:%M') }}</span> UTC{% else %}—{% endif %}{% endmacro %}
+{% macro okbad(v, ok_text, bad_text) %}{% if v is none %}<span class="badge b-warn">нет данных</span>{% elif v %}<span class="badge b-ok b-dot">{{ ok_text }}</span>{% else %}<span class="badge b-bad b-dot">{{ bad_text }}</span>{% endif %}{% endmacro %}
+<div class="head">
+  <div>
+    <h1>Журнал гейтов</h1>
+    <div class="sub">Каждые {{ every }} мин. для каждого гейта: доступен ли он <b>с Hub</b> (изнутри региона — примерно как его видят клиенты) и <b>из-за рубежа</b> (с любого доступного сервера), сколько трафика прошло и сколько клиентов было подключено. «Доступен из-за рубежа, но не с Hub» — заблокирован для региона; «недоступен ни оттуда, ни оттуда» — отрезан у хостера/вышестоящего оператора.</div>
+  </div>
+  <div class="row-actions">
+    <form method="get" action="/admin/journal" class="status-form">
+      <select name="days" onchange="this.form.submit()">{% for d in (1, 7, 30, 90) %}<option value="{{ d }}" {{ 'selected' if d == days }}>за {{ d }} дн.</option>{% endfor %}</select>
+    </form>
+    <form method="post" action="/admin/journal/run"><button class="btn btn-primary">Замерить сейчас</button></form>
+  </div>
+</div>
+
+{% for rep in reports %}
+{% set g = rep.gate %}{% set last = rep.last %}
+<div class="panel">
+  <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <h2 style="margin:0">{{ g.name }} <span class="mono muted" style="font-size:13px;font-weight:400">{{ g.public_host }}</span></h2>
+    <div>
+      {% if last %}
+        с Hub: {{ okbad(last.hub_ok, 'доступен', 'НЕДОСТУПЕН') }}
+        из-за рубежа: {{ okbad(last.abroad_ok, 'доступен', 'НЕДОСТУПЕН') }}
+      {% else %}<span class="badge b-warn">замеров ещё нет</span>{% endif %}
+    </div>
+  </div>
+  <div class="panel-b">
+    <div class="tbl-wrap"><table>
+      <tbody>
+        <tr><td>Замеров за период</td><td>{{ rep.samples }}{% if rep.first_at %} · с {{ when(rep.first_at) }}{% endif %}{% if last %} · последний {{ when(last.at) }}{% if last.vantage %} <span class="muted">(рубеж: {{ last.vantage }})</span>{% endif %}{% endif %}</td></tr>
+        <tr><td>Впервые недоступен с Hub</td><td>{{ when(rep.first_hub_down) }}</td></tr>
+        <tr><td>Впервые недоступен из-за рубежа</td><td>{{ when(rep.first_abroad_down) }}</td></tr>
+        <tr><td>Трафик через гейт за период</td><td>{{ rep.traffic }}</td></tr>
+        <tr><td>Клиентов одновременно</td><td>{% if rep.clients_max is not none %}макс. {{ rep.clients_max }} · в среднем {{ rep.clients_avg }}{% if last and last.clients is not none %} · сейчас {{ last.clients }}{% endif %}{% else %}—{% endif %}</td></tr>
+      </tbody>
+    </table></div>
+    {% if rep.flips %}
+    <details style="margin-top:8px"><summary class="muted">Переходы (последние {{ rep.flips|length }})</summary>
+      <ul style="margin:6px 0 0 18px">
+        {% for f in rep.flips %}<li>{{ when(f.at) }} — {{ 'с Hub' if f.kind == 'hub' else 'из-за рубежа' }}: {% if f.up %}<span class="badge b-ok">доступен</span>{% else %}<span class="badge b-bad">недоступен</span>{% endif %}</li>{% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+  </div>
+</div>
+{% else %}
+  <div class="panel"><div class="panel-b"><span class="muted">Гейтов нет.</span></div></div>
+{% endfor %}
+{% endblock %}

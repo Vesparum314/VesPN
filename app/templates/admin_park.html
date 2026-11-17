@@ -39,7 +39,22 @@
           {% if r.is_direct %}<b>напрямую</b>{% else %}<span class="badge b-gate">гейты</span> «{{ r.gate_pool.name }}» ({{ r.gates|length }}){% endif %}
           → «{{ r.pool.name if r.pool else '—' }}» ({{ r.pool.members|length if r.pool else 0 }})
         </td>
-        <td data-label="Адрес"><span class="mono">{{ r.host or '—' }}</span>{% if r.client_host %} <span class="muted">(имя)</span>{% endif %}</td>
+        <td data-label="Адрес">
+          <details><summary><span class="mono">{{ r.host or '—' }}{% if r.client_port %}:{{ r.client_port }}{% endif %}</span>
+            {% set ds = dns_states.get(r.id) %}
+            {% if r.dns_provider %}{% if ds and ds.error %}<span class="badge b-bad" title="{{ ds.error }}">DNS ✗</span>{% elif ds and ds.ips %}<span class="badge b-ok" title="{{ ds.ips|join(', ') }} · {{ ds.at }}">DNS ✓ {{ ds.ips|length }}</span>{% else %}<span class="badge b-warn">DNS …</span>{% endif %}{% endif %}
+          </summary>
+            <form method="post" action="/admin/routes/{{ r.id }}/client" style="display:flex;flex-direction:column;gap:6px;margin-top:6px;min-width:240px">
+              <label>Имя хоста <input name="client_host" value="{{ r.client_host }}" placeholder="пусто = IP первого входа"></label>
+              <label>Порт для клиентов <input name="client_port" type="number" value="{{ r.client_port or '' }}" placeholder="по умолчанию протокола"></label>
+              <label>DNS-синхронизация
+                <select name="dns_provider_id"><option value="">— не вести</option>{% for p in dns_providers %}<option value="{{ p.id }}" {{ 'selected' if p.id == r.dns_provider_id }}>{{ p.name }} ({{ p.zone }})</option>{% endfor %}</select>
+              </label>
+              {% if ds and ds.error %}<small class="muted">Ошибка DNS: {{ ds.error }}</small>{% elif ds and ds.ips %}<small class="muted">В DNS: {{ ds.ips|join(', ') }}</small>{% endif %}
+              <button class="btn btn-ghost btn-sm">Сохранить</button>
+            </form>
+          </details>
+        </td>
         <td data-label="Доступ">
           <details><summary>{% if r.groups %}{{ r.groups|map(attribute='name')|join(', ') }}{% else %}<span class="badge b-warn">никому</span>{% endif %}</summary>
             <form method="post" action="/admin/routes/{{ r.id }}/groups" class="status-form" style="flex-wrap:wrap;margin-top:6px">
@@ -219,6 +234,25 @@
 </div>
 
 <div class="panel">
+  <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">DNS-провайдеры</h2>
+    <button class="btn btn-ghost btn-sm" type="button" onclick="document.getElementById('dlg-dns').showModal()">+ DNS-провайдер</button></div>
+  <div class="sub" style="padding:0 16px 8px">Зона с API-доступом. Если у маршрута задано имя хоста в этой зоне и выбран провайдер, панель сама держит в его A-записях IP живых входов (гейтов пула, а у прямого маршрута — серверов) — забаненный гейт выпадает из DNS, новый попадает.</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Имя</th><th>Тип</th><th>Зона</th><th></th></tr></thead>
+    <tbody>
+    {% for p in dns_providers %}
+      <tr>
+        <td data-label="Имя">{{ p.name }}</td><td data-label="Тип">{{ p.kind }}</td><td data-label="Зона"><span class="mono">{{ p.zone }}</span></td>
+        <td data-label="Действия" class="full"><form method="post" action="/admin/dns/{{ p.id }}/delete" onsubmit="return confirm('Удалить DNS-провайдер {{ p.name }}? Записи в зоне останутся.')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form></td>
+      </tr>
+    {% else %}
+      <tr><td class="full muted">Провайдеров нет.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+
+<div class="panel">
   <div class="panel-h"><h2 style="margin:0">Ключ парка</h2></div>
   <div class="panel-b">
     <div class="sub" style="margin-bottom:8px">Один SSH-ключ, которым панель управляет всеми нодами. Приватная часть хранится на Хабе (в БД, зашифровано) и наружу не отдаётся. Публичную часть панель сама ставит на ноду при раскатке; её же можно вставить при создании VM, тогда пароль root не понадобится вовсе.</div>
@@ -288,6 +322,23 @@
       </details>
     </div>
     <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Создать</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-dns">
+  <form method="post" action="/admin/dns">
+    <h2 style="margin:0 0 12px">Новый DNS-провайдер</h2>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label>Имя <input name="name" required placeholder="gates"></label>
+      <label>Тип
+        <select name="kind">{% for k in dns_kinds %}<option value="{{ k }}">{{ {'cloudflare':'Cloudflare','desec':'deSEC','dynv6':'dynv6'}.get(k, k) }}</option>{% endfor %}</select>
+      </label>
+      <label>Зона <input name="zone" required placeholder="example.dedyn.io"></label>
+      <label>API-токен <input name="token" type="password" required autocomplete="off">
+        <small class="muted">Хранится в БД зашифрованным. Права — только на эту зону (Cloudflare: «Edit zone DNS»).</small>
+      </label>
+    </div>
+    <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Добавить</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
   </form>
 </dialog>
 
