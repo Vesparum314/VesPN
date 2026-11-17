@@ -415,6 +415,7 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
     try:
         cfg = node_ops.get_or_issue_config(db, device)
     except Exception as e:
+        db.rollback()  # a failed flush leaves the session unusable for rendering
         error = f"Не удалось создать конфиг: {e}"
         log.exception("issue config failed")
     qr = qr_data_uri(cfg.payload) if cfg else None
@@ -444,6 +445,7 @@ def device_download(request: Request, device_id: int, fmt: str = "", db: Session
     try:
         cfg = node_ops.get_or_issue_config(db, device)
     except Exception:
+        db.rollback()
         return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
     content = cfg.payload
     media = "text/plain"

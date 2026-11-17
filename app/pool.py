@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import awg, fleetkey, provisioning
@@ -304,6 +305,24 @@ def _vless_add(node: Node, email: str, cid: str, sub: str) -> None:
             xui.add_client(email, [inbound.inbound_id], client_id=cid, sub_id=sub)
 
 
+def _reserve_config(db: Session, row: IssuedConfig) -> IssuedConfig:
+    """Insert the device's (single) IssuedConfig row BEFORE any node-side work and
+    commit it, so concurrent issuers agree on one identity. If another request got
+    there first, UNIQUE(device_id) rejects ours: roll back (the session must stay
+    usable) and return the winner's row instead."""
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        winner = db.query(IssuedConfig).filter_by(device_id=row.device_id).one_or_none()
+        if winner is None:  # not a duplicate after all — surface the real error
+            raise
+        return winner
+    db.refresh(row)
+    return row
+
+
 def issue_for_device(db: Session, device: Device) -> IssuedConfig:
     """Issue (or return existing) the device's pool-wide config.
 
@@ -328,6 +347,18 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
 
     existing = db.query(IssuedConfig).filter_by(device_id=device.id).one_or_none()
 
+    # Already issued for this very route/pool: hand it back as is. Opening the
+    # device page must not re-run the SSH fan-out to every exit each time (new
+    # members get existing clients through pool sync, not through page views).
+    if (
+        existing is not None
+        and existing.payload
+        and existing.protocol == device.protocol
+        and existing.pool_id == pool.id
+        and existing.route_id == route.id
+    ):
+        return existing
+
     # members that can serve now: synced first, else any that has 3x-ui.
     ready = pool.synced_exits or [m for m in pool.members if m.has_xui]
 
@@ -335,7 +366,18 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         if not ready:
             raise NodeOpError("в пуле нет готовых выходов")
         email = device.node_identifier()
-        if existing and existing.uuid:
+        if existing is None:
+            # Reserve the row (and with it the client identity) before touching any
+            # node, so a parallel request reuses the same uuid/subId instead of
+            # minting a second client.
+            existing = _reserve_config(db, IssuedConfig(
+                device_id=device.id, pool_id=pool.id, route_id=route.id,
+                protocol=PROTO_VLESS, identifier=email,
+                uuid=str(_uuid.uuid4()), sub_id=secrets.token_hex(8),
+            ))
+            if existing.payload and existing.pool_id == pool.id and existing.route_id == route.id:
+                return existing  # a parallel request finished issuing meanwhile
+        if existing.uuid:
             cid, sub = existing.uuid, existing.sub_id
         else:
             cid, sub = str(_uuid.uuid4()), secrets.token_hex(8)
@@ -360,9 +402,7 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         # exit node's name that 3x-ui bakes in — stays meaningful after failover.
         link = _set_vless_label(link, f"{slugify(route.name)}-{email}")
 
-        if existing is None:
-            existing = IssuedConfig(device_id=device.id, protocol=PROTO_VLESS)
-            db.add(existing)
+        existing.protocol = PROTO_VLESS
         existing.pool_id = pool.id
         existing.node_id = used_node.id if used_node else None
         existing.route_id = route.id
@@ -386,6 +426,15 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         doc = awg.build_amnezia_dict(server, priv, pub, address, host, email)
         vpn = awg.encode_vpn(doc)
 
+        # Reserve before pushing peers: a parallel request gets this same config
+        # (same key pair) instead of pushing a second peer for the device.
+        cfg = _reserve_config(db, IssuedConfig(
+            device_id=device.id, pool_id=pool.id, node_id=None, route_id=route.id,
+            protocol=PROTO_AWG, identifier=pub, address=address, payload=vpn,
+        ))
+        if cfg.identifier != pub:
+            return cfg  # lost the race: the winner pushes its own peer
+
         pushed = 0
         for m in pool.members:
             try:
@@ -397,16 +446,12 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
             except Exception as e:
                 log.warning("awg fan-out to %s failed: %s", m.name, e)
         if pushed == 0 and pool.members:
+            # Nothing reached a node: drop the reservation so the next attempt
+            # starts clean (otherwise it would be handed out without a peer).
+            db.delete(cfg)
+            db.commit()
             raise NodeOpError("не удалось добавить пир ни на один выход пула")
-
-        existing = IssuedConfig(
-            device_id=device.id, pool_id=pool.id, node_id=None, route_id=route.id,
-            protocol=PROTO_AWG, identifier=pub, address=address, payload=vpn,
-        )
-        db.add(existing)
-        db.commit()
-        db.refresh(existing)
-        return existing
+        return cfg
 
     raise NodeOpError(f"unknown protocol {device.protocol!r}")
 
