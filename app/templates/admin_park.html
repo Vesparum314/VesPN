@@ -2,12 +2,18 @@
 {% block title %}Парк — {{ brand }}{% endblock %}
 {% block content %}
 {% macro jobbadge(n) %}{% set jl = {'provision':'развёртывание','relay':'релей'} %}{% if n.job_running %}<span class="badge b-warn b-dot" title="идёт {{ jl.get(n.job_kind, n.job_kind or 'операция') }}…">⏳ {{ jl.get(n.job_kind, n.job_kind or 'операция') }}…</span>{% elif n.job_state == 'error' %}<span class="badge b-bad b-dot" title="{{ n.job_message }}">✗ {{ jl.get(n.job_kind, 'операция') }} не удалась</span>{% elif n.job_state == 'done' %}<span class="badge b-ok b-dot" title="{{ n.job_message }}">✓ {{ jl.get(n.job_kind, 'готово') }}</span>{% endif %}{% endmacro %}
+{% macro keybadge(n) %}{% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}{% endmacro %}
 <div class="head">
   <div>
     <h1>Парк</h1>
-    <div class="sub">Маршрут = вход (пул гейтов в RU или напрямую) + пул серверов одного протокола с общей идентичностью. Выход за гейтами управляется <b>только через гейты</b> (любой живой гейт пула). Клиент подключается к любому гейту пула, тот переключается между живыми выходами. Один пул гейтов может обслуживать несколько маршрутов.</div>
+    <div class="sub"><b>Маршрут</b> = протокол + вход (<b>пул гейтов</b> в RU или напрямую) + <b>пул серверов</b> (клоны с общей идентичностью). Пул гейтов может обслуживать несколько маршрутов, сервер — нести несколько протоколов. Выходы за гейтами панель администрирует <b>только через гейты</b> (любой живой гейт).</div>
   </div>
-  <button class="btn btn-primary" type="button" onclick="document.getElementById('dlg-route').showModal()">Создать маршрут</button>
+  <div class="row-actions">
+    <button class="btn btn-primary" type="button" onclick="document.getElementById('dlg-route').showModal()">Создать маршрут</button>
+    <button class="btn btn-ghost" type="button" onclick="document.getElementById('dlg-gatepool').showModal()">+ Пул гейтов</button>
+    <button class="btn btn-ghost" type="button" onclick="document.getElementById('dlg-pool').showModal()">+ Пул серверов</button>
+    <button class="btn btn-ghost" type="button" onclick="addServer('', null, 'сервер')">+ Сервер</button>
+  </div>
 </div>
 
 {% if test_result %}
@@ -16,149 +22,194 @@
     {% if test_result.detail %}<span class="muted">— {{ test_result.detail }}</span>{% endif %}</div>
 {% endif %}
 
-{% for r in routes %}
+{# ------------------------------------------------------------- routes #}
+<div class="panel">
+  <div class="panel-h"><h2 style="margin:0">Маршруты</h2></div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Маршрут</th><th>Вход → серверы</th><th>Адрес для клиентов</th><th>Доступ</th><th></th></tr></thead>
+    <tbody>
+    {% for r in routes %}
+      <tr>
+        <td data-label="Маршрут"><div class="stack"><span class="cell-name">{{ r.name }}
+          <span class="badge b-exit">{{ r.protocol_label }}</span>
+          {% if not r.enabled %}<span class="badge b-exit">выключен</span>{% endif %}
+          {% if r.is_blocked %}<span class="badge b-bad" title="{{ r.block_reason }}">не работает</span>{% endif %}
+        </span>{% if r.is_blocked %}<small class="muted">{{ r.block_reason }}</small>{% endif %}</div></td>
+        <td data-label="Вход → серверы">
+          {% if r.is_direct %}<b>напрямую</b>{% else %}<span class="badge b-gate">гейты</span> «{{ r.gate_pool.name }}» ({{ r.gates|length }}){% endif %}
+          → «{{ r.pool.name if r.pool else '—' }}» ({{ r.pool.members|length if r.pool else 0 }})
+        </td>
+        <td data-label="Адрес"><span class="mono">{{ r.host or '—' }}</span>{% if r.client_host %} <span class="muted">(имя)</span>{% endif %}</td>
+        <td data-label="Доступ">
+          <details><summary>{% if r.groups %}{{ r.groups|map(attribute='name')|join(', ') }}{% else %}<span class="badge b-warn">никому</span>{% endif %}</summary>
+            <form method="post" action="/admin/routes/{{ r.id }}/groups" class="status-form" style="flex-wrap:wrap;margin-top:6px">
+              {% if groups %}
+                {% for g in groups %}<label class="check" style="display:inline-flex"><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g in r.groups }}> {{ g.name }}</label>{% endfor %}
+                <button class="btn btn-ghost btn-sm">Сохранить</button>
+              {% else %}<span class="muted">групп нет — вкладка «Пользователи»</span>{% endif %}
+            </form>
+          </details>
+        </td>
+        <td data-label="Действия" class="full"><div class="row-actions">
+          {% set other_gp = gate_pools|rejectattr('id', 'equalto', r.gate_pool_id)|list %}
+          {% if other_gp or not r.is_direct %}
+          <form method="post" action="/admin/routes/{{ r.id }}/entry" class="status-form" onsubmit="return confirm('Сменить вход маршрута «{{ r.name }}»? Конфиги клиентов не меняются; на гейтах нового пула нужно поднять релей.')">
+            <select name="entry">
+              {% for gp in other_gp %}<option value="gatepool:{{ gp.id }}">→ гейты «{{ gp.name }}» ({{ gp.members|length }})</option>{% endfor %}
+              {% if not r.is_direct %}<option value="direct">→ напрямую</option>{% endif %}
+            </select>
+            <button class="btn btn-ghost btn-sm">Сменить вход</button>
+          </form>
+          {% endif %}
+          <form method="post" action="/admin/routes/{{ r.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Выключить' if r.enabled else 'Включить' }}</button></form>
+          <form method="post" action="/admin/routes/{{ r.id }}/delete" onsubmit="return confirm('Удалить маршрут «{{ r.name }}»? Устройства на нём останутся без маршрута; пулы и серверы останутся.')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
+        </div></td>
+      </tr>
+    {% else %}
+      <tr><td class="full muted">Маршрутов нет. Добавьте серверы (гейт и/или выход), затем «Создать маршрут».</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+
+{# --------------------------------------------------------- gate pools #}
+<h2 style="margin:22px 0 8px">Пулы гейтов</h2>
+{% for gp in gate_pools %}
+{% set busy = gp.gates|selectattr('job_running')|list %}
 <div class="panel">
   <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-    <h2 style="margin:0">Маршрут «{{ r.name }}»
-      <span class="badge b-exit">{{ r.protocol_label }}</span>
-      {% if r.enabled %}<span class="badge b-ok">включён</span>{% else %}<span class="badge b-exit">выключен</span>{% endif %}
-      {% if r.is_blocked %}<span class="badge b-bad" title="{{ r.block_reason }}">не работает</span>{% endif %}
+    <h2 style="margin:0">«{{ gp.name }}»
+      {% if gp.routes %}<span class="muted" style="font-size:13px;font-weight:400">обслуживает: {% for r in gp.routes %}{{ r.name }} <span class="badge b-exit">{{ r.protocol_label }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</span>
+      {% else %}<span class="badge b-warn">не используется маршрутами</span>{% endif %}
     </h2>
     <div class="row-actions">
-      {% if r.gates and r.pool %}
-      {% set relay_busy = r.gates|selectattr('job_running')|list %}
-      <form method="post" action="/admin/routes/{{ r.id }}/provision_relay" onsubmit="return confirm('Поднять/обновить релей на всех гейтах пула ({{ r.gates|map(attribute='name')|join(', ') }})?')"><button class="btn btn-sm"{% if relay_busy %} disabled{% endif %}>{{ '⏳ релей…' if relay_busy else 'Поднять релей' }}</button></form>
+      {% if gp.routes and gp.gates %}
+      <form method="post" action="/admin/gatepools/{{ gp.id }}/relay" onsubmit="return confirm('Поднять/обновить релей на всех гейтах пула «{{ gp.name }}» ({{ gp.gates|map(attribute='name')|join(', ') }})? Релей собирается из всех маршрутов пула.')"><button class="btn btn-sm"{% if busy %} disabled{% endif %}>{{ '⏳ релей…' if busy else 'Поднять релей' }}</button></form>
       {% endif %}
-      {% if r.pool %}
-      <form method="post" action="/admin/pools/{{ r.pool.id }}/reconcile"><button class="btn btn-ghost btn-sm">Синхронизировать</button></form>
-      {% endif %}
-      <form method="post" action="/admin/routes/{{ r.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Выключить' if r.enabled else 'Включить' }}</button></form>
-      <form method="post" action="/admin/routes/{{ r.id }}/delete" onsubmit="return confirm('Удалить маршрут «{{ r.name }}»? Устройства на нём останутся без маршрута.')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
-    </div>
-  </div>
-  <div class="panel-b">
-    <div class="sub" style="margin-bottom:6px">Вход:
-      {% if r.is_direct %}<b>напрямую</b> (клиенты подключаются к серверам пула)
-      {% else %}пул гейтов <b>«{{ r.gate_pool.name }}»</b>{% if r.gate_pool.routes|length > 1 %} <span class="badge b-warn" title="этот пул гейтов обслуживает и другие маршруты">общий: {{ r.gate_pool.routes|length }} маршр.</span>{% endif %}{% endif %}
-      · адрес для клиентов: <span class="mono">{{ r.host or '—' }}</span>{% if r.client_host %} <span class="muted">(имя)</span>{% endif %}</div>
-    {% if r.pool %}<div class="sub" style="margin-bottom:6px">Серверы: пул <b>«{{ r.pool.name }}»</b> · на серверах: {{ r.pool.protocols_label }}{% if r.pool.routes|length > 1 %} <span class="muted">(маршруты пула: {{ r.pool.routes|map(attribute='name')|join(', ') }})</span>{% endif %}</div>{% endif %}
-    {% if not r.is_direct %}
-    <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px">
-      {% for g in r.gates %}
-      <div class="status-form"{% if g.job_running %} data-job-running="{{ g.id }}"{% endif %}>
-        <span class="badge b-gate">gate</span> <b>{{ g.name }}</b> <span class="mono">{{ g.public_host }}</span> {{ jobbadge(g) }}
-        <form method="post" action="/admin/nodes/{{ g.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
-        <form method="post" action="/admin/nodes/{{ g.id }}/gate_pool" onsubmit="return confirm('Убрать {{ g.name }} из пула гейтов «{{ r.gate_pool.name }}»{% if r.gate_pool.routes|length > 1 %} (он общий для нескольких маршрутов){% endif %}?')"><button class="btn btn-ghost btn-sm">Убрать</button></form>
-      </div>
-      {% else %}
-      <span class="badge b-warn">в пуле гейтов нет гейтов</span>
-      {% endfor %}
-    </div>
-    {% endif %}
-    <div class="status-form" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
       {% if free_gates %}
-      <form method="post" action="/admin/routes/{{ r.id }}/gates" class="status-form">
+      <form method="post" action="/admin/gatepools/{{ gp.id }}/gates" class="status-form">
         <select name="gate_id">{% for g in free_gates %}<option value="{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% endfor %}</select>
-        <button class="btn btn-ghost btn-sm">+ Гейт в пул</button>
+        <button class="btn btn-ghost btn-sm">+ Гейт</button>
       </form>
       {% endif %}
-      {% set other_gp = gate_pools|rejectattr('id', 'equalto', r.gate_pool_id)|list %}
-      {% if other_gp or not r.is_direct %}
-      <form method="post" action="/admin/routes/{{ r.id }}/entry" class="status-form" onsubmit="return confirm('Сменить вход маршрута «{{ r.name }}»? Конфиги клиентов не меняются; на гейтах нового пула нужно поднять релей.')">
-        <select name="entry">
-          {% for gp in other_gp %}<option value="gatepool:{{ gp.id }}">пул гейтов «{{ gp.name }}» ({{ gp.members|length }})</option>{% endfor %}
-          {% if not r.is_direct %}<option value="direct">напрямую (без гейтов)</option>{% endif %}
-        </select>
-        <button class="btn btn-ghost btn-sm">Сменить вход</button>
-      </form>
-      {% endif %}
+      <form method="post" action="/admin/gatepools/{{ gp.id }}/delete" onsubmit="return confirm('Удалить пул гейтов «{{ gp.name }}»? Гейты останутся в парке.')"><button class="btn btn-ghost btn-sm btn-danger"{% if gp.routes %} disabled title="используется маршрутами"{% endif %}>Удалить</button></form>
     </div>
-
-    <form method="post" action="/admin/routes/{{ r.id }}/groups" class="status-form" style="margin-bottom:10px;flex-wrap:wrap">
-      <span class="muted">Доступ (группы):</span>
-      {% if groups %}
-        {% for g in groups %}<label class="check" style="display:inline-flex"><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g in r.groups }}> {{ g.name }}</label>{% endfor %}
-        <button class="btn btn-ghost btn-sm">Сохранить доступ</button>
-      {% else %}<span class="muted">групп нет — вкладка «Пользователи»</span>{% endif %}
-      {% if not r.groups %}<span class="badge b-warn">без групп → никому</span>{% endif %}
-    </form>
-
-    <div class="tbl-wrap"><table>
-      <thead><tr><th>Выход</th><th>Хост</th><th>Приоритет</th><th>Синхр.</th><th></th></tr></thead>
-      <tbody>
-      {% if r.pool %}
-        {% for n in r.pool.members|sort(attribute='priority') %}
-        <tr{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
-          <td data-label="Выход"><div class="stack"><span class="cell-name">{{ n.name }}
-            {% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}
-            {{ jobbadge(n) }}
-          </span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
-          <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
-          <td data-label="Приоритет">
-            <form method="post" action="/admin/nodes/{{ n.id }}/priority" class="status-form">
-              <input name="priority" type="number" value="{{ n.priority }}" style="width:68px" title="меньше = предпочтительнее">
-              <button class="btn btn-ghost btn-sm">OK</button>
-            </form>
-          </td>
-          <td data-label="Синхр.">
-            <a href="/admin/monitor" title="Подробности и история — в мониторинге">
-            {% if n.sync_state == 'synced' %}<span class="badge b-ok b-dot">синхрон</span>
-            {% elif n.sync_state == 'unreachable' %}<span class="badge b-bad b-dot">недоступен</span>
-            {% elif n.sync_state == 'drifted' %}<span class="badge b-warn b-dot">рассинхрон</span>
-            {% else %}<span class="badge b-warn b-dot">ожидает</span>{% endif %}</a>
-            <small class="muted">AWG :{{ n.awg_port }} · 3x-ui {{ '✓' if n.has_xui else '—' }}</small>
-          </td>
-          <td data-label="Действия" class="full"><div class="row-actions">
-            <form method="post" action="/admin/nodes/{{ n.id }}/provision" onsubmit="return confirm('Развернуть {{ n.name }} как клон пула (3x-ui + AmneziaWG + TG-прокси + харденинг)? Несколько минут, идёт в фоне.')"><button class="btn btn-sm"{% if n.job_running %} disabled{% endif %}>{{ '⏳ идёт…' if n.job_running else ('Переразвернуть' if n.has_xui else 'Развернуть') }}</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/test" onsubmit="return confirm('Подключиться к {{ n.name }} НАПРЯМУЮ, в обход гейта?\n\nВидимое соединение Хаб→выход. Только для диагностики.')"><input type="hidden" name="direct" value="1"><button class="btn btn-ghost btn-sm btn-danger">Напрямую ⚠</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/pool" onsubmit="return confirm('Убрать {{ n.name }} из маршрута (в «неразобранные»)?')"><input type="hidden" name="pool_id" value=""><button class="btn btn-ghost btn-sm">Убрать</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
-          </div></td>
-        </tr>
-        {% else %}
-        <tr><td class="full muted">Выходов нет — добавьте.</td></tr>
-        {% endfor %}
-      {% endif %}
-      </tbody>
-    </table></div>
-    {% if r.pool %}<div style="margin-top:10px"><button class="btn btn-ghost btn-sm" type="button" onclick="addServer('exit', {{ r.pool.id }}, 'выход в маршрут «{{ r.name }}»')">+ Добавить выход</button></div>{% endif %}
   </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Гейт</th><th>Хост</th><th>Приоритет</th><th></th></tr></thead>
+    <tbody>
+    {% for g in gp.gates %}
+      <tr{% if g.job_running %} data-job-running="{{ g.id }}"{% endif %}>
+        <td data-label="Гейт"><div class="stack"><span class="cell-name">{{ g.name }} {{ keybadge(g) }} {{ jobbadge(g) }}</span><small>{{ g.ssh_username }}@{{ g.ssh_host }}:{{ g.ssh_port }}</small></div></td>
+        <td data-label="Хост"><span class="mono">{{ g.public_host }}</span></td>
+        <td data-label="Приоритет">
+          <form method="post" action="/admin/nodes/{{ g.id }}/priority" class="status-form">
+            <input name="priority" type="number" value="{{ g.priority }}" style="width:68px" title="меньше = через этот гейт панель управляет выходами в первую очередь">
+            <button class="btn btn-ghost btn-sm">OK</button>
+          </form>
+        </td>
+        <td data-label="Действия" class="full"><div class="row-actions">
+          <form method="post" action="/admin/nodes/{{ g.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
+          <form method="post" action="/admin/nodes/{{ g.id }}/gate_pool" onsubmit="return confirm('Убрать {{ g.name }} из пула гейтов «{{ gp.name }}»?')"><input type="hidden" name="gate_pool_id" value=""><button class="btn btn-ghost btn-sm">Убрать</button></form>
+          <form method="post" action="/admin/nodes/{{ g.id }}/delete" onsubmit="return confirm('Удалить гейт {{ g.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
+        </div></td>
+      </tr>
+    {% else %}
+      <tr><td class="full muted">Гейтов нет — добавьте («+ Гейт»).</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
 </div>
 {% else %}
-  <div class="panel"><div class="panel-b"><span class="muted">Маршрутов нет. Нужен хотя бы один gate-сервер (добавьте ниже), затем «Создать маршрут».</span></div></div>
+  <div class="panel"><div class="panel-b"><span class="muted">Пулов гейтов нет. Создайте («+ Пул гейтов») или выберите свободный гейт в «Создать маршрут» — пул появится сам.</span></div></div>
 {% endfor %}
 
+{# ------------------------------------------------------- server pools #}
+<h2 style="margin:22px 0 8px">Пулы серверов</h2>
+{% for p in server_pools %}
 <div class="panel">
-  <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center">
-    <h2 style="margin:0">Не привязанные серверы</h2>
-    <button class="btn btn-ghost btn-sm" type="button" onclick="addServer('', null, 'сервер')">+ Добавить сервер</button>
+  <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <h2 style="margin:0">«{{ p.name }}» <span class="badge b-exit">{{ p.protocols_label }}</span>
+      {% if p.routes %}<span class="muted" style="font-size:13px;font-weight:400">маршруты: {{ p.routes|map(attribute='name')|join(', ') }}</span>{% else %}<span class="badge b-warn">не используется маршрутами</span>{% endif %}
+    </h2>
+    <div class="row-actions">
+      <form method="post" action="/admin/pools/{{ p.id }}/reconcile"><button class="btn btn-ghost btn-sm">Синхронизировать</button></form>
+      <button class="btn btn-ghost btn-sm" type="button" onclick="addServer('exit', {{ p.id }}, 'выход в пул «{{ p.name }}»')">+ Выход</button>
+      <form method="post" action="/admin/pools/{{ p.id }}/delete" onsubmit="return confirm('Удалить пул «{{ p.name }}»? Его серверы станут непривязанными.')"><button class="btn btn-ghost btn-sm btn-danger"{% if p.routes %} disabled title="используется маршрутами"{% endif %}>Удалить</button></form>
+    </div>
   </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Выход</th><th>Хост</th><th>Приоритет</th><th>Синхр.</th><th></th></tr></thead>
+    <tbody>
+    {% for n in p.members|sort(attribute='priority') %}
+      <tr{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
+        <td data-label="Выход"><div class="stack"><span class="cell-name">{{ n.name }} {{ keybadge(n) }} {{ jobbadge(n) }}</span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
+        <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
+        <td data-label="Приоритет">
+          <form method="post" action="/admin/nodes/{{ n.id }}/priority" class="status-form">
+            <input name="priority" type="number" value="{{ n.priority }}" style="width:68px" title="меньше = предпочтительнее">
+            <button class="btn btn-ghost btn-sm">OK</button>
+          </form>
+        </td>
+        <td data-label="Синхр.">
+          <a href="/admin/monitor" title="Подробности и история — в мониторинге">
+          {% if n.sync_state == 'synced' %}<span class="badge b-ok b-dot">синхрон</span>
+          {% elif n.sync_state == 'unreachable' %}<span class="badge b-bad b-dot">недоступен</span>
+          {% elif n.sync_state == 'drifted' %}<span class="badge b-warn b-dot">рассинхрон</span>
+          {% else %}<span class="badge b-warn b-dot">ожидает</span>{% endif %}</a>
+          <small class="muted">AWG :{{ n.awg_port }} · 3x-ui {{ '✓' if n.has_xui else '—' }}</small>
+        </td>
+        <td data-label="Действия" class="full"><div class="row-actions">
+          <form method="post" action="/admin/nodes/{{ n.id }}/provision" onsubmit="return confirm('{{ 'Переразвернуть' if n.has_xui else 'Развернуть' }} {{ n.name }} как клон пула ({{ p.protocols_label }})? Несколько минут, идёт в фоне.')"><button class="btn btn-sm"{% if n.job_running %} disabled{% endif %}>{{ '⏳ идёт…' if n.job_running else ('Переразвернуть' if n.has_xui else 'Развернуть') }}</button></form>
+          <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
+          <form method="post" action="/admin/nodes/{{ n.id }}/test" onsubmit="return confirm('Подключиться к {{ n.name }} НАПРЯМУЮ, в обход гейта?\n\nВидимое соединение Хаб→выход. Только для диагностики.')"><input type="hidden" name="direct" value="1"><button class="btn btn-ghost btn-sm btn-danger">Напрямую ⚠</button></form>
+          <form method="post" action="/admin/nodes/{{ n.id }}/pool" onsubmit="return confirm('Убрать {{ n.name }} из пула (в «непривязанные»)?')"><input type="hidden" name="pool_id" value=""><button class="btn btn-ghost btn-sm">Убрать</button></form>
+          <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
+        </div></td>
+      </tr>
+    {% else %}
+      <tr><td class="full muted">Выходов нет — добавьте («+ Выход»).</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% else %}
+  <div class="panel"><div class="panel-b"><span class="muted">Пулов серверов нет. Создайте («+ Пул серверов») или в «Создать маршрут» — пул появится сам.</span></div></div>
+{% endfor %}
+
+{# ----------------------------------------------------------- orphans #}
+<div class="panel" style="margin-top:22px">
+  <div class="panel-h"><h2 style="margin:0">Не привязанные серверы</h2></div>
   <div class="tbl-wrap"><table>
     <thead><tr><th>Имя</th><th>Роль</th><th>Хост</th><th></th></tr></thead>
     <tbody>
     {% for n in orphans %}
       <tr{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
         <td data-label="Имя"><div class="stack"><span class="cell-name">{{ n.name }}</span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
-        <td data-label="Роль"><span class="badge {{ 'b-gate' if n.is_gate else 'b-exit' }}">{{ 'gate' if n.is_gate else 'exit' }}</span>
-          {% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}
-          {{ jobbadge(n) }}</td>
+        <td data-label="Роль"><span class="badge {{ 'b-gate' if n.is_gate else 'b-exit' }}">{{ 'gate' if n.is_gate else 'exit' }}</span> {{ keybadge(n) }} {{ jobbadge(n) }}</td>
         <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
         <td data-label="Действия" class="full"><div class="row-actions">
-          {% if not n.is_gate %}
-          <form method="post" action="/admin/nodes/{{ n.id }}/pool" class="status-form">
-            <select name="pool_id"><option value="">— в маршрут…</option>{% for r in routes %}{% if r.pool %}<option value="{{ r.pool.id }}">{{ r.name }}</option>{% endif %}{% endfor %}</select>
-            <button class="btn btn-ghost btn-sm">Привязать</button>
-          </form>
-          {% elif n.gate_pool_id %}<span class="muted">в пуле гейтов, который не использует ни один маршрут</span>
-          <form method="post" action="/admin/nodes/{{ n.id }}/gate_pool"><button class="btn btn-ghost btn-sm">Вынуть из пула</button></form>
-          {% else %}<span class="muted">добавьте в маршрут («+ Гейт в пул») или выберите в «Создать маршрут»</span>{% endif %}
+          {% if n.is_gate %}
+            {% if gate_pools %}
+            <form method="post" action="/admin/nodes/{{ n.id }}/gate_pool" class="status-form">
+              <select name="gate_pool_id">{% for gp in gate_pools %}<option value="{{ gp.id }}">в пул гейтов «{{ gp.name }}»</option>{% endfor %}</select>
+              <button class="btn btn-ghost btn-sm">Привязать</button>
+            </form>
+            {% else %}<span class="muted">создайте пул гейтов или выберите гейт в «Создать маршрут»</span>{% endif %}
+          {% else %}
+            {% if server_pools %}
+            <form method="post" action="/admin/nodes/{{ n.id }}/pool" class="status-form">
+              <select name="pool_id">{% for p in server_pools %}<option value="{{ p.id }}">в пул «{{ p.name }}» ({{ p.protocols_label }})</option>{% endfor %}</select>
+              <button class="btn btn-ghost btn-sm">Привязать</button>
+            </form>
+            {% else %}<span class="muted">создайте пул серверов или маршрут</span>{% endif %}
+          {% endif %}
           <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
           <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
         </div></td>
       </tr>
     {% else %}
-      <tr><td class="full muted">Нет неразобранных серверов.</td></tr>
+      <tr><td class="full muted">Нет непривязанных серверов.</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
@@ -176,11 +227,12 @@
   </div>
 </div>
 
+{# ----------------------------------------------------------- dialogs #}
 <dialog id="dlg-route">
   <form method="post" action="/admin/park/route">
     <h2 style="margin:0 0 12px">Новый маршрут</h2>
     <div style="display:flex;flex-direction:column;gap:12px">
-      <label>Имя <input name="name" required placeholder="eu"></label>
+      <label>Имя <input name="name" required placeholder="eu-vless"></label>
       <label>Протокол
         <select name="protocol">
           {% for p in protocols %}<option value="{{ p }}">{{ protocol_labels[p] }}</option>{% endfor %}
@@ -191,16 +243,41 @@
           <option value="">новый пул (серверы добавите после)</option>
           {% for sp in server_pools %}<option value="{{ sp.id }}">существующий «{{ sp.name }}» ({{ sp.members|length }} серв.; уже: {{ sp.protocols_label }})</option>{% endfor %}
         </select>
-        <small class="muted">Один сервер может нести несколько протоколов: выберите существующий пул — протокол добавится к его серверам (их нужно будет переразвернуть).</small>
+        <small class="muted">Один сервер может нести несколько протоколов: выберите существующий пул — протокол добавится к его серверам (их нужно будет доразвернуть).</small>
       </label>
       <label>Вход
         <select name="entry" required>
-          {% if gate_pools %}<optgroup label="Существующий пул гейтов">{% for gp in gate_pools %}<option value="gatepool:{{ gp.id }}">«{{ gp.name }}» ({{ gp.members|length }} гейт.){% if gp.routes %} · уже обслуживает: {{ gp.routes|map(attribute='name')|join(', ') }}{% endif %}</option>{% endfor %}</optgroup>{% endif %}
+          {% if gate_pools %}<optgroup label="Пул гейтов">{% for gp in gate_pools %}<option value="gatepool:{{ gp.id }}">«{{ gp.name }}» ({{ gp.members|length }} гейт.){% if gp.routes %} · уже обслуживает: {{ gp.routes|map(attribute='name')|join(', ') }}{% endif %}</option>{% endfor %}</optgroup>{% endif %}
           {% if free_gates %}<optgroup label="Свободный гейт (станет новым пулом)">{% for g in free_gates %}<option value="gate:{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% endfor %}</optgroup>{% endif %}
           <option value="direct">Напрямую, без гейтов</option>
         </select>
       </label>
-      <details><summary class="muted">Дополнительно</summary>
+      <details><summary class="muted">Порты нового пула</summary>
+        <div style="display:flex;gap:12px;margin-top:8px">
+          <label>VLESS порт <input name="vless_port" type="number" value="17771"></label>
+          <label>AWG порт <input name="awg_port" type="number" value="17772"></label>
+        </div>
+      </details>
+    </div>
+    <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Создать</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-gatepool">
+  <form method="post" action="/admin/gatepools">
+    <h2 style="margin:0 0 12px">Новый пул гейтов</h2>
+    <label>Имя <input name="name" required placeholder="ru-a"></label>
+    <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Создать</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-pool">
+  <form method="post" action="/admin/pools">
+    <h2 style="margin:0 0 12px">Новый пул серверов</h2>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label>Имя <input name="name" required placeholder="eu"></label>
+      <div class="sub">Панель сгенерирует общую идентичность пула. Протоколы на серверах определятся маршрутами, которые вы на нём создадите.</div>
+      <details><summary class="muted">Порты</summary>
         <div style="display:flex;gap:12px;margin-top:8px">
           <label>VLESS порт <input name="vless_port" type="number" value="17771"></label>
           <label>AWG порт <input name="awg_port" type="number" value="17772"></label>

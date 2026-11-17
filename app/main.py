@@ -785,15 +785,87 @@ def admin_add_route_gate(
 
 
 @app.post("/admin/nodes/{node_id}/gate_pool")
-def admin_unpool_gate(request: Request, node_id: int, db: Session = Depends(get_db)):
-    """Take a gate out of its gate pool (it stays in the fleet, unassigned)."""
+def admin_set_gate_pool(
+    request: Request, node_id: int, gate_pool_id: str = Form(""), db: Session = Depends(get_db)
+):
+    """Put a gate into a gate pool, or (empty) take it out — it stays in the fleet."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node and node.role == ROLE_GATE:
-        node.gate_pool_id = None
+        gp = db.get(GatePool, int(gate_pool_id)) if gate_pool_id.strip().isdigit() else None
+        node.gate_pool_id = gp.id if gp else None
         db.commit()
-        flash(request, f"«{node.name}» убран из пула гейтов", "success")
+        if gp:
+            flash(request, f"«{node.name}» → пул гейтов «{gp.name}». Поднимите релей пула.", "success")
+        else:
+            flash(request, f"«{node.name}» убран из пула гейтов", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: gate pools --------------------------------------------------
+@app.post("/admin/gatepools")
+def admin_add_gate_pool(request: Request, name: str = Form(...), db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    name = name.strip()
+    if not name:
+        flash(request, "Укажите имя пула гейтов", "error")
+    elif db.query(GatePool).filter_by(name=name).first():
+        flash(request, "Пул гейтов с таким именем уже есть", "error")
+    else:
+        db.add(GatePool(name=name))
+        db.commit()
+        flash(request, f"Пул гейтов «{name}» создан — добавьте в него гейты", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/gatepools/{gp_id}/gates")
+def admin_gate_pool_add_gate(
+    request: Request, gp_id: int, gate_id: str = Form(""), db: Session = Depends(get_db)
+):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gp = db.get(GatePool, gp_id)
+    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if gp and gate and gate.role == ROLE_GATE:
+        gate.gate_pool_id = gp.id
+        db.commit()
+        flash(request, f"«{gate.name}» → пул гейтов «{gp.name}». Поднимите релей пула.", "success")
+    elif gp:
+        flash(request, "Выберите gate-сервер", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/gatepools/{gp_id}/relay")
+def admin_gate_pool_relay(request: Request, gp_id: int, db: Session = Depends(get_db)):
+    """Raise/refresh the relay on every gate of the pool. The relay belongs to the
+    gate pool (it's built from all routes the pool fronts), so it's started here."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gp = db.get(GatePool, gp_id)
+    if gp:
+        _start_relay_jobs(request, db, gp.gates, gp.name)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/gatepools/{gp_id}/delete")
+def admin_delete_gate_pool(request: Request, gp_id: int, db: Session = Depends(get_db)):
+    """Refused while any route uses the pool — deleting it would cut those
+    routes' clients off in one click. Its gates become unassigned."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gp = db.get(GatePool, gp_id)
+    if gp:
+        users = [r.name for r in gp.routes]
+        if users:
+            flash(request, f"Пул гейтов «{gp.name}» используют маршруты: {', '.join(users)} — "
+                           f"сначала смените им вход или удалите их", "error")
+        else:
+            db.query(Node).filter(Node.gate_pool_id == gp.id).update({Node.gate_pool_id: None})
+            db.delete(gp)
+            db.commit()
+            flash(request, f"Пул гейтов «{gp.name}» удалён", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -832,9 +904,14 @@ def admin_delete_route(request: Request, route_id: int, db: Session = Depends(ge
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route:
+        # SQLite doesn't enforce ON DELETE SET NULL — unlink devices by hand so
+        # they show «маршрут не выбран» instead of pointing at a ghost.
+        db.query(Device).filter(Device.route_id == route.id).update(
+            {Device.route_id: None}, synchronize_session=False
+        )
         db.delete(route)
         db.commit()
-        flash(request, "Маршрут удалён", "success")
+        flash(request, "Маршрут удалён (пулы и серверы остались)", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -844,23 +921,31 @@ def admin_provision_relay(request: Request, route_id: int, db: Session = Depends
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route and route.gates and route.pool:
-        # Raising a relay is a long op — background it on EACH gate of the pool, so
-        # every gate reports its own progress and can't be double-fired.
-        def _do(db: Session, gate: Node) -> str:
-            info = node_ops.provision_gate_relay(db, gate)
-            return (f"Релей поднят → пул {info['pool']} "
-                    f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})")
-
-        started, busy = [], []
-        for gate in route.gates:
-            (started if jobs.start_node_job(db, gate, "relay", _do) else busy).append(gate.name)
-        if started:
-            flash(request, f"Подъём релея запущен в фоне: {', '.join(started)} — статус на «Парке».", "success")
-        if busy:
-            flash(request, f"Уже идёт операция: {', '.join(busy)} — дождитесь завершения.", "error")
+        _start_relay_jobs(request, db, route.gates, route.gate_pool.name)
     elif route:
         flash(request, "У маршрута должны быть гейты и пул выходов (прямому маршруту релей не нужен)", "error")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+def _start_relay_jobs(request: Request, db: Session, gates: list[Node], pool_name: str) -> None:
+    """Raising a relay is a long op — background it on EACH gate, so every gate
+    reports its own progress and can't be double-fired."""
+    if not gates:
+        flash(request, f"В пуле гейтов «{pool_name}» нет гейтов", "error")
+        return
+
+    def _do(db: Session, gate: Node) -> str:
+        info = node_ops.provision_gate_relay(db, gate)
+        return (f"Релей поднят → пул {info['pool']} "
+                f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})")
+
+    started, busy = [], []
+    for gate in gates:
+        (started if jobs.start_node_job(db, gate, "relay", _do) else busy).append(gate.name)
+    if started:
+        flash(request, f"Подъём релея запущен в фоне: {', '.join(started)} — статус на «Парке».", "success")
+    if busy:
+        flash(request, f"Уже идёт операция: {', '.join(busy)} — дождитесь завершения.", "error")
 
 
 # --- admin: groups (managed on the «Пользователи и группы» page) --------
@@ -907,12 +992,11 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
     routes = db.query(Route).order_by(Route.name).all()
     all_nodes = db.query(Node).order_by(Node.id).all()
     gate_pools = db.query(GatePool).order_by(GatePool.name).all()
-    used_gate_pools = {r.gate_pool_id for r in routes if r.gate_pool_id}
-    # Unassigned servers: exits outside any pool, gates outside any USED gate pool.
+    # Unassigned servers: exits outside any server pool, gates outside any gate pool.
     orphans = [
         n for n in all_nodes
         if (n.role == ROLE_EXIT and n.pool_id is None)
-        or (n.role == ROLE_GATE and n.gate_pool_id not in used_gate_pools)
+        or (n.role == ROLE_GATE and n.gate_pool_id is None)
     ]
     free_gates = [n for n in all_nodes if n.role == ROLE_GATE and n.gate_pool_id is None]
     groups = db.query(Group).order_by(Group.name).all()
@@ -1021,17 +1105,17 @@ def admin_delete_pool(request: Request, pool_id: int, db: Session = Depends(get_
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     pool = db.get(ExitPool, pool_id)
     if pool:
-        # SQLite doesn't enforce ON DELETE, so detach references by hand: unbind
-        # member nodes, drop routes on this pool (and unlink their devices).
+        users = [r.name for r in pool.routes]
+        if users:
+            # Refused while routes use it: deleting would cut their clients off in
+            # one click (and drop the pool identity their configs are built on).
+            flash(request, f"Пул «{pool.name}» используют маршруты: {', '.join(users)} — "
+                           f"сначала удалите их", "error")
+            return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+        # SQLite doesn't enforce ON DELETE, so detach member nodes by hand.
         db.query(Node).filter(Node.pool_id == pool.id).update(
             {Node.pool_id: None, Node.sync_state: "pending"}
         )
-        dead_routes = [r.id for r in db.query(Route).filter(Route.pool_id == pool.id).all()]
-        if dead_routes:
-            db.query(Device).filter(Device.route_id.in_(dead_routes)).update(
-                {Device.route_id: None}, synchronize_session=False
-            )
-            db.query(Route).filter(Route.id.in_(dead_routes)).delete(synchronize_session=False)
         db.delete(pool)
         db.commit()
         flash(request, "Пул удалён", "success")
