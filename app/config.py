@@ -46,7 +46,9 @@ class Settings:
         # as a container from the official amneziavpn/amneziawg-go image (the
         # same engine the AmneziaVPN app runs), mounting its config dir at the
         # app's /opt/amnezia/awg path so awg.py reads it unchanged.
-        self.awg_image: str = os.environ.get("AWG_IMAGE", "amneziavpn/amneziawg-go:latest")
+        # Pinned like XRAY_VERSION: `latest` would silently move servers to a new
+        # engine. 3.1 engine; it still serves the 2.0 configs of older pools.
+        self.awg_image: str = os.environ.get("AWG_IMAGE", "amneziavpn/amneziawg-go:3.1.20260828")
         self.awg_container: str = os.environ.get("AWG_CONTAINER", "vespn-awg")
         self.awg_conf_dir: str = os.environ.get("AWG_CONF_DIR", "/opt/vespn-awg")
 

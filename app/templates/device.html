@@ -40,7 +40,7 @@
       <div style="min-width:0">
         <ol class="steps">
           {% if is_awg %}
-            <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.</li>
+            <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.{% if route and route.pool and route.pool.awg_version == '3.1' %} Нужна версия приложения <b>5.0.1.5 или новее</b> (протокол AmneziaWG 3.1).{% endif %}</li>
           {% else %}
             <li>Приложение (v2rayNG, OneXray…) → добавить из буфера или по QR. Одна ссылка = один вход: если его заблокируют, подписка выше переживёт это сама, а ссылку придётся взять заново.</li>
           {% endif %}

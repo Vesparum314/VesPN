@@ -147,7 +147,7 @@
 {% for p in server_pools %}
 <div class="panel">
   <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-    <h2 style="margin:0">«{{ p.name }}» <span class="badge b-exit">{{ p.protocols_label }}</span>{% if 'vless' in p.protocols %} <span class="badge b-exit" title="транспорт VLESS">{{ p.vless_transport|upper }}</span>{% endif %}
+    <h2 style="margin:0">«{{ p.name }}» <span class="badge b-exit">{{ p.protocols_label }}</span>{% if 'vless' in p.protocols %} <span class="badge b-exit" title="транспорт VLESS">{{ p.vless_transport|upper }}</span>{% endif %}{% if 'awg' in p.protocols %} <span class="badge b-exit" title="версия AmneziaWG пула; 3.1 нужен AmneziaVPN 5.0.1.5+">AWG {{ p.awg_version }} · UDP {{ p.awg_port }}</span>{% endif %}
       {% if p.routes %}<span class="muted" style="font-size:13px;font-weight:400">маршруты: {{ p.routes|map(attribute='name')|join(', ') }}</span>{% else %}<span class="badge b-warn">не используется маршрутами</span>{% endif %}
     </h2>
     <div class="row-actions">

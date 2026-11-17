@@ -424,6 +424,11 @@ class ExitPool(Base):
         return host if host in names else (names[0] if names else host)
 
     @property
+    def awg_version(self) -> str:
+        """AmneziaWG protocol of the pool: '3.1' (header protection etc.) or '2'."""
+        return "3.1" if self.awg_params.get("HeaderProtectionKey") else "2"
+
+    @property
     def vless_flow(self) -> str:
         """Client flow: Vision only on raw TCP (XHTTP carries no flow)."""
         return "xtls-rprx-vision" if self.vless_transport == VLESS_TCP else ""
@@ -601,9 +606,10 @@ class Route(Base):
 
     def port_for(self, protocol: str) -> int:
         """Port clients dial for `protocol` on this route: the route's own port if
-        set (not for legacy routes, whose configs carry the pool ports), else the
-        pool's server port (VLESS/AWG) or 443 (NaiveProxy)."""
-        if self.client_port and not self.is_legacy:
+        set (not for legacy routes, whose configs carry the pool ports, and not for
+        direct routes — there's no gate to map a port, clients hit the server's own
+        port), else the pool's server port (VLESS/AWG) or 443 (NaiveProxy)."""
+        if self.client_port and not self.is_legacy and not self.is_direct:
             return int(self.client_port)
         if self.pool is not None:
             if protocol == PROTO_VLESS:
