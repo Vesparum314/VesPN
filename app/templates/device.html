@@ -11,6 +11,29 @@
 {% if error %}
   <div class="flash flash-error">{{ error }}</div>
 {% elif cfg %}
+  {% if sub %}
+  <div class="panel"><div class="panel-b">
+    <h2 style="margin:0 0 .5rem">Подписка — рекомендуется</h2>
+    <div class="cfg">
+      <div class="qr"><img src="{{ sub_qr }}" alt="QR подписки" width="200" height="200"></div>
+      <div style="min-width:0">
+        <ol class="steps">
+          <li>Приложение (<b>v2rayNG</b> на Android, <b>OneXray</b> на iPhone/Mac/Windows) → добавить <b>подписку</b> (Subscription / «+ из URL») — отсканируйте QR или вставьте ссылку.</li>
+          <li>Обновите подписку и выберите сервер «… · авто». Если он перестал работать — выберите другой из списка или обновите подписку: панель сама убирает неработающие входы и добавляет новые.</li>
+        </ol>
+        <code class="payload" id="sub_payload">{{ sub }}</code>
+        <div class="dev-actions">
+          <button class="btn btn-primary btn-sm" type="button" onclick="copyText('sub_payload', this)">Копировать ссылку</button>
+          <form method="post" action="/devices/{{ device.id }}/sub/rotate" onsubmit="return confirm('Перевыпустить ссылку подписки? Старая перестанет работать — её придётся заменить в приложении.')" style="display:inline"><button class="btn btn-ghost btn-sm">Перевыпустить ссылку</button></form>
+        </div>
+        {% if sub_items %}<details style="margin-top:8px"><summary class="muted">Что в подписке ({{ sub_items|length }})</summary>
+          <ul style="margin:6px 0 0 18px">{% for i in sub_items %}<li>{{ i.label }} — <span class="mono">{{ i.host }}:{{ i.port }}</span></li>{% endfor %}</ul>
+        </details>{% endif %}
+      </div>
+    </div>
+  </div></div>
+  <h2 style="margin:18px 0 .5rem">Или одной ссылкой</h2>
+  {% endif %}
   <div class="panel"><div class="panel-b">
     <div class="cfg">
       <div class="qr"><img src="{{ qr }}" alt="QR" width="200" height="200"></div>
@@ -19,7 +42,7 @@
           {% if is_awg %}
             <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.</li>
           {% else %}
-            <li>Приложение (v2rayNG, Hiddify, Streisand, NekoBox…) → добавить из буфера или по QR.</li>
+            <li>Приложение (v2rayNG, OneXray…) → добавить из буфера или по QR. Одна ссылка = один вход: если его заблокируют, подписка выше переживёт это сама, а ссылку придётся взять заново.</li>
           {% endif %}
           <li>Готово — включите в приложении. Если перестанет работать, просто переоткройте эту страницу и получите конфиг заново.</li>
         </ol>

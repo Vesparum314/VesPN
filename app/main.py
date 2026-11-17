@@ -26,6 +26,7 @@ from . import jobs
 from . import monitor
 from . import nodes as node_ops
 from . import pool as pool_ops
+from . import subscription as sub_ops
 from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
@@ -441,11 +442,62 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
             ios_qr = qr_data_uri(ios_conf)
         except Exception:
             log.exception("iOS .conf render failed")
+    # VLESS devices also get a subscription: one URL that lists every way in and
+    # follows gate changes by itself (app/subscription.py).
+    sub = sub_qr = None
+    sub_items: list[dict] = []
+    if cfg and device.protocol == PROTO_VLESS:
+        sub_ops.ensure_token(db, device)
+        sub = sub_ops.sub_url(device, str(request.base_url))
+        sub_qr = qr_data_uri(sub)
+        sub_items = sub_ops.entries(db, device)
     return render(
         request, "device.html",
         user=user, device=device, route=route, cfg=cfg, qr=qr, error=error,
         is_awg=(device.protocol == PROTO_AWG), ios_conf=ios_conf, ios_qr=ios_qr,
+        sub=sub, sub_qr=sub_qr, sub_items=sub_items,
     )
+
+
+@app.post("/devices/{device_id}/sub/rotate")
+def device_sub_rotate(request: Request, device_id: int, db: Session = Depends(get_db)):
+    """New subscription URL; the old one stops working at once."""
+    owned = _owned_device(request, db, device_id)
+    if not owned:
+        return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
+    _, device = owned
+    sub_ops.rotate_token(db, device)
+    flash(request, "Ссылка подписки перевыпущена — старая больше не работает. Добавьте новую в приложение.", "success")
+    return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.get("/s/{token}")
+def subscription(request: Request, token: str, format: str = "", db: Session = Depends(get_db)):
+    """A device's subscription (no login: the token is the secret). Unknown token,
+    wrong host or too many requests → a bare 404, so probing learns nothing."""
+    from urllib.parse import urlparse
+
+    not_found = Response(status_code=404)
+    if settings.sub_base_url:
+        want = (urlparse(settings.sub_base_url).hostname or "").lower()
+        if (request.url.hostname or "").lower() != want:
+            return not_found
+    ip = request.client.host if request.client else "?"
+    if not sub_ops.allow(ip):
+        return not_found
+    device = sub_ops.device_by_token(db, token)
+    if device is None:
+        return not_found
+    items = sub_ops.entries(db, device)
+    title = settings.sub_title or settings.brand_name
+    hdrs = sub_ops.headers(device, db, title, settings.sub_update_hours)
+    fmt = sub_ops.pick_format(request.headers.get("user-agent", ""), format)
+    if fmt == sub_ops.FORMAT_SINGBOX:
+        cfg = next((c for c in device.configs if c.uuid), None)
+        body = sub_ops.render_singbox(items, cfg.uuid) if cfg else None
+        if body is not None:
+            return Response(body, media_type="application/json", headers=hdrs)
+    return Response(sub_ops.render_base64(items), media_type="text/plain; charset=utf-8", headers=hdrs)
 
 
 @app.get("/devices/{device_id}/download")

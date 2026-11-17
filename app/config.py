@@ -78,6 +78,13 @@ class Settings:
         # Gate journal + DNS sync cadence (minutes): how precisely a gate ban is dated
         # and how fast a dead gate leaves DNS. Cheap: a TCP probe + one SSH per gate.
         self.journal_minutes: int = int(os.environ.get("JOURNAL_MINUTES", "5"))
+        # Subscriptions: public base URL they are served under (a host of their own,
+        # not the panel's — e.g. https://sub.example.org). Empty = served under the
+        # panel's own address (fine for a private install / testing). When set,
+        # /s/<token> answers ONLY on that host and 404s everywhere else.
+        self.sub_base_url: str = os.environ.get("SUB_BASE_URL", "").rstrip("/")
+        self.sub_update_hours: int = int(os.environ.get("SUB_UPDATE_HOURS", "12"))
+        self.sub_title: str = os.environ.get("SUB_TITLE", "")  # profile name in apps; default BRAND_NAME
 
     @property
     def tg_admin_chats(self) -> list[str]:

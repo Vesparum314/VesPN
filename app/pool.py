@@ -143,6 +143,43 @@ def _pool_configs(db: Session, pool: ExitPool, protocol: str) -> list[IssuedConf
     )
 
 
+def user_vless_routes(db: Session, user) -> list[Route]:
+    """Enabled VLESS-capable routes the user may use — what their VLESS devices'
+    subscriptions list (the device's own route first is up to the caller)."""
+    return [r for r in accessible_routes(db, user) if r.serves(PROTO_VLESS) and r.pool is not None]
+
+
+def device_vless_pools(db: Session, device: Device) -> list[ExitPool]:
+    """Server pools a VLESS device's client must exist on: its own route's pool
+    plus the pool of every VLESS route its owner may use (subscriptions list them
+    all, and one uuid per device works on all of them)."""
+    pools: dict[int, ExitPool] = {}
+    if device.route is not None and device.route.pool is not None:
+        pools[device.route.pool.id] = device.route.pool
+    for r in user_vless_routes(db, device.user):
+        pools.setdefault(r.pool.id, r.pool)
+    return list(pools.values())
+
+
+def pool_vless_configs(db: Session, pool: ExitPool) -> list[IssuedConfig]:
+    """VLESS clients that must exist on `pool`'s servers: configs issued on the
+    pool, plus those of devices whose owner may use some VLESS route on it (they
+    reach it through their subscription). A user who loses access to all of the
+    pool's routes drops out — reconcile then removes the client."""
+    routes = [r for r in pool.routes if r.enabled and r.serves(PROTO_VLESS)]
+    out = []
+    for c in db.query(IssuedConfig).filter(IssuedConfig.protocol == PROTO_VLESS).all():
+        if not c.uuid:
+            continue
+        if c.pool_id == pool.id:
+            out.append(c)
+            continue
+        dev = c.device
+        if dev is not None and any(r.allows(dev.user) for r in routes):
+            out.append(c)
+    return out
+
+
 def _config_name(cfg: IssuedConfig) -> str:
     dev = cfg.device
     try:
@@ -235,7 +272,7 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
                 with n.tunnel(node.xui_port) as lport:
                     xui = XUIClient(f"http://127.0.0.1:{lport}/{node.xui_path}", node.xui_token)
                     inbound = xui.find_vless_inbound()
-                    desired = _pool_configs(db, pool, PROTO_VLESS)
+                    desired = pool_vless_configs(db, pool)
                     desired_emails = {c.identifier for c in desired}
                     # Robust check: don't trust list_client_emails() for "present"
                     # (orphaned clients from an inbound recreate still appear there
@@ -450,6 +487,16 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
                 log.warning("vless fan-out to %s failed: %s", m.name, e)
         if used_node is None:
             raise NodeOpError(f"не удалось выпустить VLESS: {last_err}")
+        # The device's subscription also lists the owner's other VLESS routes: put
+        # the same client on those pools too (best effort — reconcile heals gaps).
+        for other in device_vless_pools(db, device):
+            if other.id == pool.id:
+                continue
+            for m in (other.synced_exits or [x for x in other.members if x.has_xui]):
+                try:
+                    _vless_add(m, email, cid, sub, other.vless_flow)
+                except Exception as e:
+                    log.warning("vless fan-out to %s (pool %s) failed: %s", m.name, other.name, e)
 
         # Label the link by ROUTE + full identifier (route-user-device) — stays
         # meaningful whichever gate/exit carries it.
@@ -513,10 +560,16 @@ def deprovision_device(db: Session, device: Device) -> None:
     """Remove the device's clients/peers from every member of its pool(s).
     Never raises — a dead exit just can't be cleaned, which is fine."""
     for cfg in list(device.configs):
-        pool = db.get(ExitPool, cfg.pool_id) if cfg.pool_id else None
-        if pool is None:
-            continue
-        for m in pool.members:
+        pools: dict[int, ExitPool] = {}
+        home = db.get(ExitPool, cfg.pool_id) if cfg.pool_id else None
+        if home is not None:
+            pools[home.id] = home
+        if cfg.protocol == PROTO_VLESS:
+            # The client was also put on the pools of the owner's other VLESS routes.
+            for p in db.query(ExitPool).all():
+                if PROTO_VLESS in p.protocols:
+                    pools.setdefault(p.id, p)
+        for m in [m for p in pools.values() for m in p.members]:
             try:
                 if cfg.protocol == PROTO_VLESS:
                     if not m.has_xui:
