@@ -46,7 +46,9 @@ class Settings:
         # as a container from the official amneziavpn/amneziawg-go image (the
         # same engine the AmneziaVPN app runs), mounting its config dir at the
         # app's /opt/amnezia/awg path so awg.py reads it unchanged.
-        self.awg_image: str = os.environ.get("AWG_IMAGE", "amneziavpn/amneziawg-go:latest")
+        # Pinned like XRAY_VERSION: `latest` would silently move servers to a new
+        # engine. 3.1 engine; it still serves the 2.0 configs of older pools.
+        self.awg_image: str = os.environ.get("AWG_IMAGE", "amneziavpn/amneziawg-go:3.1.20260828")
         self.awg_container: str = os.environ.get("AWG_CONTAINER", "vespn-awg")
         self.awg_conf_dir: str = os.environ.get("AWG_CONF_DIR", "/opt/vespn-awg")
 
@@ -75,6 +77,25 @@ class Settings:
         self.tg_api_base: str = os.environ.get("TG_API_BASE", "https://api.telegram.org")
         self.tg_backup_hour: int = int(os.environ.get("TG_BACKUP_HOUR", "6"))  # UTC hour for the daily backup
         self.tg_monitor_minutes: int = int(os.environ.get("TG_MONITOR_MINUTES", "60"))  # monitoring cadence
+        # Gate journal + DNS sync cadence (minutes): how precisely a gate ban is dated
+        # and how fast a dead gate leaves DNS. Cheap: a TCP probe + one SSH per gate.
+        self.journal_minutes: int = int(os.environ.get("JOURNAL_MINUTES", "5"))
+        # NaiveProxy servers: Caddy built on the server with the naive fork of
+        # forwardproxy (xcaddy). Builder/runtime images and the fork's git ref.
+        self.naive_builder_image: str = os.environ.get("NAIVE_BUILDER_IMAGE", "caddy:2-builder")
+        self.naive_runtime_image: str = os.environ.get("NAIVE_RUNTIME_IMAGE", "caddy:2")
+        self.naive_forwardproxy_ref: str = os.environ.get("NAIVE_FORWARDPROXY_REF", "naive")
+        # ACME directory for NaiveProxy certificates (DNS-01, issued on the Hub).
+        self.acme_directory: str = os.environ.get(
+            "ACME_DIRECTORY", "https://acme-v02.api.letsencrypt.org/directory"
+        )
+        # Subscriptions: public base URL they are served under (a host of their own,
+        # not the panel's — e.g. https://sub.example.org). Empty = served under the
+        # panel's own address (fine for a private install / testing). When set,
+        # /s/<token> answers ONLY on that host and 404s everywhere else.
+        self.sub_base_url: str = os.environ.get("SUB_BASE_URL", "").rstrip("/")
+        self.sub_update_hours: int = int(os.environ.get("SUB_UPDATE_HOURS", "12"))
+        self.sub_title: str = os.environ.get("SUB_TITLE", "")  # profile name in apps; default BRAND_NAME
 
     @property
     def tg_admin_chats(self) -> list[str]:

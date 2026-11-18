@@ -80,7 +80,10 @@ def collect_traffic(db: Session) -> dict:
             .filter(IssuedConfig.pool_id == pool.id)
             .all()
         )
-        vless = {c.identifier: c for c in cfgs if c.protocol == PROTO_VLESS and c.identifier}
+        # VLESS clients live on every pool their owner reaches via subscription.
+        from .pool import pool_vless_configs
+
+        vless = {c.identifier: c for c in pool_vless_configs(db, pool) if c.identifier}
         awg = {c.identifier: c for c in cfgs if c.protocol == PROTO_AWG and c.identifier}
         if not vless and not awg:
             continue

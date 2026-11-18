@@ -20,18 +20,27 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.status import HTTP_303_SEE_OTHER
 
 from . import appconfig
+from . import dns as dns_ops
 from . import fleetkey
 from . import jobs
 from . import monitor
 from . import nodes as node_ops
 from . import pool as pool_ops
+from . import subscription as sub_ops
 from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
 from .models import (
+    ALL_PROTOCOLS,
+    DEFAULT_CLIENT_PORT,
+    DNS_KINDS,
+    VLESS_TCP,
+    VLESS_XHTTP,
     JOB_RUNNING,
     PROTO_AWG,
+    PROTO_NAIVE,
     PROTO_VLESS,
+    PROTOCOL_LABELS,
     PROTOCOLS,
     ROLE_ADMIN,
     ROLE_CLIENT,
@@ -42,11 +51,15 @@ from .models import (
     USER_ROLES,
     Announcement,
     Device,
+    DnsProvider,
     ExitPool,
+    GatePool,
     Group,
     IssuedConfig,
+    NaiveCert,
     Node,
     Route,
+    RouteProto,
     Setting,
     TrafficStat,
     User,
@@ -367,8 +380,12 @@ def create_device(
     if not route or not route.allows(user):
         flash(request, "Выберите доступный вам маршрут", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    if route.is_blocked:
-        flash(request, "Маршрут временно недоступен — попробуйте позже", "error")
+    if not route.has(protocol):
+        flash(request, f"Маршрут «{route.name}» — для {route.protocol_label}, выберите другой", "error")
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    reason = route.proto_block_reason(protocol)
+    if reason:
+        flash(request, f"Маршрут «{route.name}» сейчас недоступен для этого протокола: {reason}", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     exists = db.query(Device).filter_by(user_id=user.id, name=name, protocol=protocol).first()
     if exists:
@@ -415,6 +432,7 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
     try:
         cfg = node_ops.get_or_issue_config(db, device)
     except Exception as e:
+        db.rollback()  # a failed flush leaves the session unusable for rendering
         error = f"Не удалось создать конфиг: {e}"
         log.exception("issue config failed")
     qr = qr_data_uri(cfg.payload) if cfg else None
@@ -428,11 +446,63 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
             ios_qr = qr_data_uri(ios_conf)
         except Exception:
             log.exception("iOS .conf render failed")
+    # VLESS devices also get a subscription: one URL that lists every way in and
+    # follows gate changes by itself (app/subscription.py).
+    sub = sub_qr = None
+    sub_items: list[dict] = []
+    if cfg and device.protocol in (PROTO_VLESS, PROTO_NAIVE):
+        sub_ops.ensure_token(db, device)
+        sub = sub_ops.sub_url(device, str(request.base_url))
+        sub_qr = qr_data_uri(sub)
+        sub_items = sub_ops.entries(db, device)
     return render(
         request, "device.html",
         user=user, device=device, route=route, cfg=cfg, qr=qr, error=error,
-        is_awg=(device.protocol == PROTO_AWG), ios_conf=ios_conf, ios_qr=ios_qr,
+        is_awg=(device.protocol == PROTO_AWG), is_naive=(device.protocol == PROTO_NAIVE),
+        paused=bool(route and route.has(device.protocol) and not route.serves(device.protocol)),
+        ios_conf=ios_conf, ios_qr=ios_qr,
+        sub=sub, sub_qr=sub_qr, sub_items=sub_items,
     )
+
+
+@app.post("/devices/{device_id}/sub/rotate")
+def device_sub_rotate(request: Request, device_id: int, db: Session = Depends(get_db)):
+    """New subscription URL; the old one stops working at once."""
+    owned = _owned_device(request, db, device_id)
+    if not owned:
+        return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
+    _, device = owned
+    sub_ops.rotate_token(db, device)
+    flash(request, "Ссылка подписки перевыпущена — старая больше не работает. Добавьте новую в приложение.", "success")
+    return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.get("/s/{token}")
+def subscription(request: Request, token: str, format: str = "", db: Session = Depends(get_db)):
+    """A device's subscription (no login: the token is the secret). Unknown token,
+    wrong host or too many requests → a bare 404, so probing learns nothing."""
+    from urllib.parse import urlparse
+
+    not_found = Response(status_code=404)
+    if settings.sub_base_url:
+        want = (urlparse(settings.sub_base_url).hostname or "").lower()
+        if (request.url.hostname or "").lower() != want:
+            return not_found
+    ip = request.client.host if request.client else "?"
+    if not sub_ops.allow(ip):
+        return not_found
+    device = sub_ops.device_by_token(db, token)
+    if device is None:
+        return not_found
+    items = sub_ops.entries(db, device)
+    title = settings.sub_title or settings.brand_name
+    hdrs = sub_ops.headers(device, db, title, settings.sub_update_hours)
+    fmt = sub_ops.pick_format(request.headers.get("user-agent", ""), format)
+    if fmt == sub_ops.FORMAT_SINGBOX:
+        body = sub_ops.render_singbox(items)
+        if body is not None:
+            return Response(body, media_type="application/json", headers=hdrs)
+    return Response(sub_ops.render_base64(items), media_type="text/plain; charset=utf-8", headers=hdrs)
 
 
 @app.get("/devices/{device_id}/download")
@@ -444,6 +514,7 @@ def device_download(request: Request, device_id: int, fmt: str = "", db: Session
     try:
         cfg = node_ops.get_or_issue_config(db, device)
     except Exception:
+        db.rollback()
         return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
     content = cfg.payload
     media = "text/plain"
@@ -592,9 +663,8 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
             if node.pool_id:
                 info = pool_ops.provision_pool_exit(db, node)
                 rec = info.get("reconcile", {})
-                return (f"Развёрнут как клон пула: 3x-ui (:{info['xui_port']}) + "
-                        f"AmneziaWG (UDP :{info['awg_port']}); синхронизация "
-                        f"{'ok' if rec.get('ok') else rec.get('error', '—')}")
+                return (f"Развёрнут как клон пула: {', '.join(info['installed']) or '—'}; "
+                        f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
             info = node_ops.provision_node(db, node)
             return (f"Развёрнута: 3x-ui (порт {info['xui_port']}) + "
                     f"AmneziaWG (UDP {info['awg_port']})")
@@ -603,6 +673,66 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
             flash(request, f"«{node.name}»: раскатка запущена в фоне — статус обновится на «Парке».", "success")
         else:
             flash(request, f"«{node.name}»: раскатка уже идёт — дождитесь завершения.", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/nodes/{node_id}/converge")
+def admin_converge_node(request: Request, node_id: int, db: Session = Depends(get_db)):
+    """«Привести к пулу»: the safe re-provision for a server already serving
+    clients — install only what's missing, refresh NaiveProxy, check the VLESS
+    inbound, reconcile. Background job like «Развернуть»."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    node = db.get(Node, node_id)
+    if node and node.pool_id:
+        def _do(db: Session, node: Node) -> str:
+            info = pool_ops.provision_pool_exit(db, node, only_missing=True)
+            rec = info.get("reconcile", {})
+            return (f"Приведён к пулу: {', '.join(info['installed']) or '—'}; "
+                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
+
+        if jobs.start_node_job(db, node, "provision", _do):
+            flash(request, f"«{node.name}»: приведение к пулу запущено в фоне.", "success")
+        else:
+            flash(request, f"«{node.name}»: операция уже идёт — дождитесь завершения.", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/cert")
+def admin_route_cert(request: Request, route_id: int, db: Session = Depends(get_db)):
+    """Issue (or renew) the certificate of the route's NaiveProxy hostname on the
+    Hub (DNS-01) and push it to the pool's servers — in the background (1–2 min)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    rp = route.proto(PROTO_NAIVE) if route else None
+    if rp is None:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    if not rp.client_host or rp.dns_provider is None:
+        flash(request, "Сначала задайте NaiveProxy имя хоста и DNS-провайдер его зоны (адрес протокола)", "error")
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    import threading
+
+    rp_id = rp.id
+
+    def _work():
+        from . import naive
+        from .db import SessionLocal
+
+        s = SessionLocal()
+        try:
+            r = s.get(RouteProto, rp_id)
+            naive.ensure_cert(s, r, force=True)
+            ok, errs = naive.push_pool(s, r.route.pool)
+            log.info("naive cert %s: pushed to %d servers %s", r.client_host, ok, errs or "")
+        except Exception:
+            log.exception("naive cert issue failed")
+        finally:
+            s.close()
+
+    threading.Thread(target=_work, name="naive-cert", daemon=True).start()
+    flash(request, f"Выпуск сертификата для {rp.client_host} запущен (1–2 мин.) — затем он будет "
+                   f"разослан на серверы пула. Обновите страницу позже.", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -651,31 +781,200 @@ def admin_routes(request: Request, db: Session = Depends(get_db)):
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
-@app.post("/admin/routes")
-def admin_add_route(
-    request: Request,
-    name: str = Form(...),
-    gate_id: str = Form(""),
-    pool_id: str = Form(""),
-    db: Session = Depends(get_db),
+def _gate_pool_of(db: Session, gate: Node) -> GatePool:
+    """The gate's pool, creating a one-gate pool named after it if it has none."""
+    if gate.gate_pool_id:
+        gp = db.get(GatePool, gate.gate_pool_id)
+        if gp:
+            return gp
+    name, n = gate.name, 1
+    while db.query(GatePool).filter_by(name=name).first():
+        n += 1
+        name = f"{gate.name}-{n}"
+    gp = GatePool(name=name)
+    db.add(gp)
+    db.flush()
+    gate.gate_pool_id = gp.id
+    return gp
+
+
+class _EntryError(ValueError):
+    pass
+
+
+def _resolve_entry(db: Session, entry: str) -> int | None:
+    """Parse the route «entry» field into a gate_pool_id (None = direct).
+    'gatepool:<id>' — an existing gate pool; 'gate:<id>' — a gate, pooled on the
+    fly if needed; 'direct' — no gate. Raises _EntryError with a user message."""
+    entry = (entry or "").strip()
+    if entry == "direct":
+        return None
+    kind, _, raw = entry.partition(":")
+    if not raw.isdigit():
+        raise _EntryError("Выберите вход маршрута: пул гейтов, гейт или «напрямую»")
+    if kind == "gatepool":
+        gp = db.get(GatePool, int(raw))
+        if gp is None:
+            raise _EntryError("Пул гейтов не найден")
+        return gp.id
+    if kind == "gate":
+        gate = db.get(Node, int(raw))
+        if gate is None or gate.role != ROLE_GATE:
+            raise _EntryError("Выберите gate-сервер")
+        return _gate_pool_of(db, gate).id
+    raise _EntryError("Непонятный вход маршрута")
+
+
+@app.post("/admin/routes/{route_id}/entry")
+def admin_set_route_entry(
+    request: Request, route_id: int, entry: str = Form(""), db: Session = Depends(get_db)
 ):
+    """Move a route to another gate pool (or make it direct). Clients' configs
+    don't change — only where their hostname/subscription points (DNS and relays
+    of the new pool must be brought up)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if route:
+        try:
+            route.gate_pool_id = _resolve_entry(db, entry)
+        except _EntryError as e:
+            db.rollback()
+            flash(request, str(e), "error")
+        else:
+            db.commit()
+            where = "напрямую" if route.is_direct else f"пул гейтов «{route.gate_pool.name}»"
+            flash(request, f"Маршрут «{route.name}»: вход — {where}. Поднимите релей на гейтах.", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/pool")
+def admin_set_route_pool(
+    request: Request, route_id: int, pool_id: str = Form(""), db: Session = Depends(get_db)
+):
+    """Move a route to another (free) exit pool. The pool's identity is part of
+    client configs: VLESS keeps its uuid but the link changes (subscriptions follow
+    by themselves), AWG configs change — single links / AWG configs must be handed
+    out again. Usually it's simpler to move SERVERS between pools instead."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    pool = db.get(ExitPool, int(pool_id)) if pool_id.strip().isdigit() else None
+    if route and pool and pool.id != route.pool_id:
+        if pool.routes:
+            flash(request, f"Пул выходов «{pool.name}» уже занят маршрутом «{pool.routes[0].name}»", "error")
+        else:
+            route.pool_id = pool.id
+            db.commit()
+            flash(request, f"«{route.name}»: выходы — пул «{pool.name}». Нажмите «Применить». Одиночные "
+                           f"VLESS-ссылки и AWG-конфиги устройств маршрута изменятся (подписки — сами).",
+                  "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/gates")
+def admin_add_route_gate(
+    request: Request, route_id: int, gate_id: str = Form(""), db: Session = Depends(get_db)
+):
+    """Add a gate to the route's gate pool (creating the pool for a direct route)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if route and gate and gate.role == ROLE_GATE:
+        if route.gate_pool_id is None:
+            route.gate_pool_id = _gate_pool_of(db, gate).id
+        else:
+            gate.gate_pool_id = route.gate_pool_id
+        db.commit()
+        flash(request, f"«{gate.name}» → пул гейтов «{route.gate_pool.name}». Поднимите на нём релей.", "success")
+    elif route:
+        flash(request, "Выберите gate-сервер", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/nodes/{node_id}/gate_pool")
+def admin_set_gate_pool(
+    request: Request, node_id: int, gate_pool_id: str = Form(""), db: Session = Depends(get_db)
+):
+    """Put a gate into a gate pool, or (empty) take it out — it stays in the fleet."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    node = db.get(Node, node_id)
+    if node and node.role == ROLE_GATE:
+        gp = db.get(GatePool, int(gate_pool_id)) if gate_pool_id.strip().isdigit() else None
+        node.gate_pool_id = gp.id if gp else None
+        db.commit()
+        if gp:
+            flash(request, f"«{node.name}» → пул гейтов «{gp.name}». Поднимите релей пула.", "success")
+        else:
+            flash(request, f"«{node.name}» убран из пула гейтов", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: gate pools --------------------------------------------------
+@app.post("/admin/gatepools")
+def admin_add_gate_pool(request: Request, name: str = Form(...), db: Session = Depends(get_db)):
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
-    gate_node = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
-    pool = db.get(ExitPool, int(pool_id)) if pool_id.strip().isdigit() else None
     if not name:
-        flash(request, "Укажите имя маршрута", "error")
-    elif db.query(Route).filter_by(name=name).first():
-        flash(request, "Маршрут с таким именем уже есть", "error")
-    elif not gate_node or gate_node.role != ROLE_GATE:
-        flash(request, "Выберите входной сервер (gate)", "error")
-    elif not pool:
-        flash(request, "Выберите пул выходов", "error")
+        flash(request, "Укажите имя пула гейтов", "error")
+    elif db.query(GatePool).filter_by(name=name).first():
+        flash(request, "Пул гейтов с таким именем уже есть", "error")
     else:
-        db.add(Route(name=name, gate_id=gate_node.id, pool_id=pool.id))
+        db.add(GatePool(name=name))
         db.commit()
-        flash(request, f"Маршрут «{name}» создан", "success")
+        flash(request, f"Пул гейтов «{name}» создан — добавьте в него гейты", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/gatepools/{gp_id}/gates")
+def admin_gate_pool_add_gate(
+    request: Request, gp_id: int, gate_id: str = Form(""), db: Session = Depends(get_db)
+):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gp = db.get(GatePool, gp_id)
+    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    if gp and gate and gate.role == ROLE_GATE:
+        gate.gate_pool_id = gp.id
+        db.commit()
+        flash(request, f"«{gate.name}» → пул гейтов «{gp.name}». Поднимите релей пула.", "success")
+    elif gp:
+        flash(request, "Выберите gate-сервер", "error")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/gatepools/{gp_id}/relay")
+def admin_gate_pool_relay(request: Request, gp_id: int, db: Session = Depends(get_db)):
+    """Raise/refresh the relay on every gate of the pool. The relay belongs to the
+    gate pool (it's built from all routes the pool fronts), so it's started here."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gp = db.get(GatePool, gp_id)
+    if gp:
+        _start_relay_jobs(request, db, gp.gates, gp.name)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/gatepools/{gp_id}/delete")
+def admin_delete_gate_pool(request: Request, gp_id: int, db: Session = Depends(get_db)):
+    """Refused while any route uses the pool — deleting it would cut those
+    routes' clients off in one click. Its gates become unassigned."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gp = db.get(GatePool, gp_id)
+    if gp:
+        users = [r.name for r in gp.routes]
+        if users:
+            flash(request, f"Пул гейтов «{gp.name}» используют маршруты: {', '.join(users)} — "
+                           f"сначала смените им вход или удалите их", "error")
+        else:
+            db.query(Node).filter(Node.gate_pool_id == gp.id).update({Node.gate_pool_id: None})
+            db.delete(gp)
+            db.commit()
+            flash(request, f"Пул гейтов «{gp.name}» удалён", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -714,9 +1013,14 @@ def admin_delete_route(request: Request, route_id: int, db: Session = Depends(ge
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
     if route:
+        # SQLite doesn't enforce ON DELETE SET NULL — unlink devices by hand so
+        # they show «маршрут не выбран» instead of pointing at a ghost.
+        db.query(Device).filter(Device.route_id == route.id).update(
+            {Device.route_id: None}, synchronize_session=False
+        )
         db.delete(route)
         db.commit()
-        flash(request, "Маршрут удалён", "success")
+        flash(request, "Маршрут удалён (пулы и серверы остались)", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -725,25 +1029,32 @@ def admin_provision_relay(request: Request, route_id: int, db: Session = Depends
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, route_id)
-    if route and route.gate_node and route.pool:
-        gate = route.gate_node
-        rid = route.id
-
-        # Raising the relay is a long op too — background it on the gate node, so the
-        # «Поднять релей» button reports progress and can't be double-fired.
-        def _do(db: Session, gate: Node) -> str:
-            route = db.get(Route, rid)
-            info = node_ops.provision_gate_for_route(db, route)
-            return (f"Релей поднят → пул {info['pool']} "
-                    f"({len(info['exits'])} exit, демон {info.get('daemon', '?')})")
-
-        if jobs.start_node_job(db, gate, "relay", _do):
-            flash(request, f"«{gate.name}»: подъём релея запущен в фоне — статус на «Парке».", "success")
-        else:
-            flash(request, f"«{gate.name}»: операция уже идёт — дождитесь завершения.", "error")
+    if route and route.gates and route.pool:
+        _start_relay_jobs(request, db, route.gates, route.gate_pool.name)
     elif route:
-        flash(request, "У маршрута должны быть и gate, и пул выходов", "error")
+        flash(request, "У маршрута должны быть гейты и пул выходов (прямому маршруту релей не нужен)", "error")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+def _start_relay_jobs(request: Request, db: Session, gates: list[Node], pool_name: str) -> None:
+    """Raising a relay is a long op — background it on EACH gate, so every gate
+    reports its own progress and can't be double-fired."""
+    if not gates:
+        flash(request, f"В пуле гейтов «{pool_name}» нет гейтов", "error")
+        return
+
+    def _do(db: Session, gate: Node) -> str:
+        info = node_ops.provision_gate_relay(db, gate)
+        sni = f", SNI-роутер {info['sni']}" if info.get("sni") else ""
+        return f"Релей поднят: {info['summary']} (демон {info.get('daemon', '?')}{sni})"
+
+    started, busy = [], []
+    for gate in gates:
+        (started if jobs.start_node_job(db, gate, "relay", _do) else busy).append(gate.name)
+    if started:
+        flash(request, f"Подъём релея запущен в фоне: {', '.join(started)} — статус на «Парке».", "success")
+    if busy:
+        flash(request, f"Уже идёт операция: {', '.join(busy)} — дождитесь завершения.", "error")
 
 
 # --- admin: groups (managed on the «Пользователи и группы» page) --------
@@ -789,46 +1100,322 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     routes = db.query(Route).order_by(Route.name).all()
     all_nodes = db.query(Node).order_by(Node.id).all()
-    route_gate_ids = {r.gate_id for r in routes if r.gate_id}
+    gate_pools = db.query(GatePool).order_by(GatePool.name).all()
+    # Unassigned servers: exits outside any server pool, gates outside any gate pool.
     orphans = [
         n for n in all_nodes
         if (n.role == ROLE_EXIT and n.pool_id is None)
-        or (n.role == ROLE_GATE and n.id not in route_gate_ids)
+        or (n.role == ROLE_GATE and n.gate_pool_id is None)
     ]
-    free_gates = [n for n in all_nodes if n.role == ROLE_GATE and n.id not in route_gate_ids]
+    free_gates = [n for n in all_nodes if n.role == ROLE_GATE and n.gate_pool_id is None]
     groups = db.query(Group).order_by(Group.name).all()
+    exit_pools = db.query(ExitPool).order_by(ExitPool.name).all()
+    rps = [rp for r in routes for rp in r.protos]
+    dev_counts: dict[tuple[int, str], int] = {}
+    for rid, proto in db.query(Device.route_id, Device.protocol).filter(Device.route_id.isnot(None)).all():
+        dev_counts[(rid, proto)] = dev_counts.get((rid, proto), 0) + 1
+    from . import park
+
+    gst = park.gate_states(db)
+    crt = park.certs(db, routes)
+    gp_problems = {gp.id: pool_ops.gate_pool_problem(db, gp.id) for gp in gate_pools if gp.routes}
+    health = {r.id: park.route_health(r, gst, crt) for r in routes}
+    gates_all = [n for n in all_nodes if n.role == ROLE_GATE and n.gate_pool_id is not None]
     return render(request, "admin_park.html", user=admin, routes=routes, orphans=orphans,
-                  free_gates=free_gates, groups=groups,
+                  free_gates=free_gates, gate_pools=gate_pools, groups=groups,
+                  exit_pools=exit_pools,
+                  free_exit_pools=[p for p in exit_pools if not p.routes],
+                  gate_pool_problems=gp_problems,
+                  dns_providers=db.query(DnsProvider).order_by(DnsProvider.name).all(),
+                  dns_kinds=DNS_KINDS,
+                  dns_states={rp.id: dns_ops.get_state(db, rp.id) for rp in rps if rp.dns_provider_id},
+                  naive_certs=crt,
+                  dev_counts=dev_counts,
+                  gst=gst, gate_tip=park.gate_tip, health=health,
+                  ready={r.id: park.readiness(r, crt, gp_problems.get(r.gate_pool_id, "")) for r in routes},
+                  attention=park.attention(routes, gate_pools, orphans, gst, crt),
+                  broken=[r for r in routes if health[r.id]["state"] == "bad"],
+                  # scheme: pools in the order of the routes using them (fewer crossing wires)
+                  scheme_gp=_in_route_order(gate_pools, [r.gate_pool for r in routes]),
+                  scheme_ep=_in_route_order(exit_pools, [r.pool for r in routes]),
+                  dev_total={r.id: sum(n for (rid, _), n in dev_counts.items() if rid == r.id) for r in routes},
+                  live_ids={gid for gid, st in gst.items() if st["live"]},
+                  gates_live=sum(1 for g in gates_all if gst.get(g.id, {}).get("live", True)),
+                  gates_total=len(gates_all),
+                  protocols=ALL_PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
                   fleet_pub=fleetkey.public_line(db), fleet_fp=fleetkey.fingerprint(db),
                   test_result=request.session.pop("_test", None))
 
 
+def _in_route_order(pools: list, used: list) -> list:
+    """`pools` reordered: first as the routes use them, then the unused ones."""
+    out = []
+    for p in used + pools:
+        if p is not None and p not in out:
+            out.append(p)
+    return out
+
+
 @app.post("/admin/park/route")
 def admin_park_create_route(
-    request: Request, name: str = Form(...), gate_id: str = Form(""),
+    request: Request, name: str = Form(...), entry: str = Form(""),
+    protocols: list[str] = Form(default=[]), pool_id: str = Form(""),
+    client_port: str = Form(str(DEFAULT_CLIENT_PORT)),
     vless_port: int = Form(17771), awg_port: int = Form(17772),
     db: Session = Depends(get_db),
 ):
-    """Create a route = gate + a fresh pool (its shared identity). Exits are added after."""
+    """Create a route = exit pool (a free one, or a fresh empty pool named after
+    the route) + entry (gate pool / gate / direct) + the protocols it runs. An exit
+    pool belongs to one route; a gate pool may front several."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     name = name.strip()
-    gate = db.get(Node, int(gate_id)) if gate_id.strip().isdigit() else None
+    protos = [p for p in ALL_PROTOCOLS if p in set(protocols)]
+    pool = db.get(ExitPool, int(pool_id)) if pool_id.strip().isdigit() else None
     if not name:
         flash(request, "Укажите имя маршрута", "error")
-    elif db.query(Route).filter_by(name=name).first() or db.query(ExitPool).filter_by(name=name).first():
+    elif db.query(Route).filter_by(name=name).first() or (
+        pool is None and db.query(ExitPool).filter_by(name=name).first()
+    ):
         flash(request, "Имя уже занято", "error")
-    elif not gate or gate.role != ROLE_GATE:
-        flash(request, "Выберите gate-сервер", "error")
+    elif not protos:
+        flash(request, "Выберите хотя бы один протокол", "error")
+    elif pool_id.strip() and pool is None:
+        flash(request, "Пул выходов не найден", "error")
+    elif pool is not None and pool.routes:
+        flash(request, f"Пул выходов «{pool.name}» уже занят маршрутом «{pool.routes[0].name}»", "error")
     else:
-        pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
-        db.add(Route(name=name, gate_id=gate.id, pool_id=pool.id))
-        db.commit()
-        flash(request, f"Маршрут «{name}» создан. Добавьте выходы и «Поднимите релей».", "success")
+        try:
+            gpid = _resolve_entry(db, entry)
+        except _EntryError as e:
+            db.rollback()
+            flash(request, str(e), "error")
+        else:
+            if pool is None:
+                pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
+            route = Route(name=name, gate_pool_id=gpid, pool_id=pool.id)
+            db.add(route)
+            db.flush()
+            ok_port = client_port.strip().isdigit() and 0 < int(client_port) < 65536
+            cport = int(client_port) if ok_port else DEFAULT_CLIENT_PORT
+            for p in protos:
+                db.add(RouteProto(route_id=route.id, protocol=p, enabled=True,
+                                  client_port=None if gpid is None else cport))
+            db.commit()
+            labels = " + ".join(PROTOCOL_LABELS[p] for p in protos)
+            flash(request, f"Маршрут «{name}» ({labels}) создан. Дальше: выходы в пул «{pool.name}», "
+                           f"адреса протоколов, доступ — и «Применить».", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
-# --- admin: pools -------------------------------------------------------
+def _after_proto_change(request: Request, db: Session, route: Route) -> str:
+    """After a protocol was paused/resumed/removed: sync the pool's servers (drop or
+    restore accounts) and rebuild the relay of the gate pool — in the background."""
+    import threading
+
+    pool_id = route.pool_id
+    if pool_id and route.pool and route.pool.members:
+        def _sync():
+            from .db import SessionLocal
+
+            s = SessionLocal()
+            try:
+                p = s.get(ExitPool, pool_id)
+                if p is not None:
+                    pool_ops.reconcile_pool(s, p)
+            except Exception:
+                log.exception("reconcile after protocol change failed")
+            finally:
+                s.close()
+
+        threading.Thread(target=_sync, name="proto-sync", daemon=True).start()
+    if route.gate_pool and route.gates:
+        problem = pool_ops.gate_pool_problem(db, route.gate_pool_id)
+        if problem:
+            return f"релей не пересобран: {problem}"
+        _start_relay_jobs(request, db, route.gates, route.gate_pool.name)
+        return "серверы синхронизируются, релей пересобирается"
+    return "серверы синхронизируются"
+
+
+@app.post("/admin/routes/{route_id}/protos/add")
+def admin_route_proto_add(
+    request: Request, route_id: int, protocol: str = Form(""), db: Session = Depends(get_db)
+):
+    """Add a protocol to the route. It goes onto the servers with «Применить»."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if route and protocol in ALL_PROTOCOLS and not route.has(protocol):
+        db.add(RouteProto(route_id=route.id, protocol=protocol, enabled=True,
+                          client_port=None if route.is_direct else DEFAULT_CLIENT_PORT))
+        db.commit()
+        flash(request, f"«{route.name}»: добавлен {PROTOCOL_LABELS[protocol]}. Задайте адрес и нажмите "
+                       f"«Применить» — протокол встанет на серверы, гейты пересоберут релей.", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/protos/{protocol}/toggle")
+def admin_route_proto_toggle(
+    request: Request, route_id: int, protocol: str, db: Session = Depends(get_db)
+):
+    """The protocol switch of a route (every route shows all three):
+    - off → on: a protocol the route doesn't have is added; a paused one resumes;
+    - on → off: with devices on it — paused (configs stay; the gate stops
+      forwarding it, servers drop its accounts, subscriptions leave it out);
+      without devices — removed from the route (nothing to keep)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if not route or protocol not in ALL_PROTOCOLS:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    label = PROTOCOL_LABELS[protocol]
+    rp = route.proto(protocol)
+    if rp is None:
+        db.add(RouteProto(route_id=route.id, protocol=protocol, enabled=True,
+                          client_port=None if route.is_direct else DEFAULT_CLIENT_PORT))
+        db.commit()
+        db.refresh(route)
+        flash(request, f"«{route.name}»: {label} включён. Задайте адрес и нажмите «Применить» — "
+                       f"протокол встанет на серверы, гейты пересоберут релей.", "success")
+    elif not rp.enabled:
+        rp.enabled = True
+        db.commit()
+        flash(request, f"«{route.name}»: {label} снова включён; {_after_proto_change(request, db, route)}.",
+              "success")
+    else:
+        used = db.query(Device).filter(Device.route_id == route.id, Device.protocol == protocol).count()
+        if used:
+            rp.enabled = False
+            what = f"на паузе — конфиги {used} устр. сохранены"
+        else:
+            db.delete(rp)
+            what = "выключен"
+        db.commit()
+        db.refresh(route)
+        flash(request, f"«{route.name}»: {label} {what}; {_after_proto_change(request, db, route)}.", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/protos/{protocol}/delete")
+def admin_route_proto_delete(
+    request: Request, route_id: int, protocol: str, db: Session = Depends(get_db)
+):
+    """Remove a paused protocol that no device of the route uses. It stays installed
+    on the servers (harmless) until they are reinstalled."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    rp = route.proto(protocol) if route else None
+    if rp is None:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    used = db.query(Device).filter(Device.route_id == route.id, Device.protocol == protocol).count()
+    if rp.enabled:
+        flash(request, f"Сначала приостановите {rp.label} на «{route.name}»", "error")
+    elif used:
+        flash(request, f"{rp.label} на «{route.name}» используют устройства ({used}) — удалить нельзя; "
+                       f"он может оставаться приостановленным", "error")
+    else:
+        db.delete(rp)
+        db.commit()
+        flash(request, f"«{route.name}»: {PROTOCOL_LABELS.get(protocol, protocol)} убран из маршрута", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/protos/{protocol}/address")
+def admin_route_proto_address(
+    request: Request, route_id: int, protocol: str, client_host: str = Form(""),
+    client_port: str = Form(""), dns_provider_id: str = Form(""), db: Session = Depends(get_db),
+):
+    """What client configs name for this protocol of the route: hostname
+    (optionally kept in sync with a DNS provider) and port. Already issued configs
+    keep what they had until re-issued; subscriptions update by themselves."""
+    from . import journal
+
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    rp = route.proto(protocol) if route else None
+    if rp is None:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    host = client_host.strip().rstrip(".").lower()
+    port = int(client_port) if client_port.strip().isdigit() else None
+    p = db.get(DnsProvider, int(dns_provider_id)) if dns_provider_id.strip().isdigit() else None
+    if port is not None and not 1 <= port <= 65535:
+        flash(request, "Порт — от 1 до 65535", "error")
+    elif p and not host:
+        flash(request, "Для DNS-синхронизации укажите имя хоста", "error")
+    elif p and host != p.zone and not host.endswith("." + p.zone):
+        flash(request, f"Имя {host} не в зоне {p.zone} провайдера «{p.name}»", "error")
+    else:
+        rp.client_host = host
+        rp.client_port = port
+        rp.dns_provider_id = p.id if p else None
+        db.commit()
+        msg = f"«{route.name}» · {rp.label}: {rp.host or '—'}:{rp.port}"
+        st = {}
+        if p:
+            st = dns_ops.sync_proto(db, rp, journal.live_gate_ids(db), force=True)
+            msg += (f"; DNS → {', '.join(st.get('ips', []))}" if not st.get("error")
+                    else f"; DNS не обновлён: {st['error']}")
+        if not route.is_direct:
+            msg += ". На гейтах это вступит в силу после «Применить»"
+        flash(request, msg, "error" if st.get("error") else "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/apply")
+def admin_route_apply(request: Request, route_id: int, db: Session = Depends(get_db)):
+    """«Применить»: bring the route's servers to its protocols (new servers are
+    installed, deployed ones only get what's missing — nothing working is
+    reinstalled) and rebuild the relay on its gates. Background jobs per node."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    route = db.get(Route, route_id)
+    if not route:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    pool = route.pool
+    nrp = route.proto(PROTO_NAIVE)
+    if pool is None or not pool.members:
+        flash(request, f"В пуле выходов маршрута «{route.name}» нет серверов", "error")
+    elif not route.protos:
+        flash(request, f"У маршрута «{route.name}» нет протоколов", "error")
+    elif nrp is not None and (not nrp.client_host or db.get(NaiveCert, nrp.client_host.lower()) is None):
+        flash(request, "Сначала задайте NaiveProxy имя хоста и выпустите сертификат — "
+                       "без него NaiveProxy на серверах не запустить", "error")
+    else:
+        def _do(db: Session, node: Node) -> str:
+            deployed = node.has_xui or node.key_installed
+            info = pool_ops.provision_pool_exit(db, node, only_missing=deployed)
+            rec = info.get("reconcile", {})
+            verb = "Приведён к маршруту" if deployed else "Развёрнут"
+            return (f"{verb}: {', '.join(info['installed']) or '—'}; "
+                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
+
+        started, busy = [], []
+        for n in pool.members:
+            (started if jobs.start_node_job(db, n, "provision", _do) else busy).append(n.name)
+        if started:
+            flash(request, f"«{route.name}»: раскатка на {', '.join(started)} запущена в фоне.", "success")
+        if busy:
+            flash(request, f"Уже идёт операция: {', '.join(busy)} — дождитесь завершения.", "error")
+        if not route.is_direct:
+            problem = pool_ops.gate_pool_problem(db, route.gate_pool_id)
+            if problem:
+                flash(request, f"Релей пула гейтов «{route.gate_pool.name}» не собрать: {problem}", "error")
+            else:
+                _start_relay_jobs(request, db, route.gates, route.gate_pool.name)
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/routes/{route_id}/reconcile")
+def admin_route_reconcile(request: Request, route_id: int, db: Session = Depends(get_db)):
+    route = db.get(Route, route_id)
+    if not _require_staff(request, db) or not route or not route.pool:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    return admin_reconcile_pool(request, route.pool_id, db)
+
+
 @app.get("/admin/pools", response_class=HTMLResponse)
 def admin_pools(request: Request, db: Session = Depends(get_db)):
     # merged into «Парк»
@@ -852,7 +1439,42 @@ def admin_add_pool(
         flash(request, "Пул с таким именем уже есть", "error")
     else:
         pool = pool_ops.create_pool(db, name, vless_port=vless_port, awg_port=awg_port)
-        flash(request, f"Пул «{pool.name}» создан (идентичность сгенерирована)", "success")
+        flash(request, f"Пул выходов «{pool.name}» создан — добавьте в него серверы", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/pools/{pool_id}/vless")
+def admin_pool_vless(
+    request: Request, pool_id: int, transport: str = Form(VLESS_XHTTP), xhttp_path: str = Form(""),
+    reality_target: str = Form(""), reality_names: str = Form(""), db: Session = Depends(get_db),
+):
+    """VLESS settings of a server pool: transport and Reality masquerade. They are
+    part of every client config — after a change the servers must be redeployed and
+    the pool's VLESS configs re-issued (subscriptions pick it up by themselves)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    pool = db.get(ExitPool, pool_id)
+    if not pool:
+        return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+    target = reality_target.strip()
+    names = [n for n in reality_names.replace(",", " ").split() if n]
+    path = xhttp_path.strip()
+    if transport not in (VLESS_TCP, VLESS_XHTTP):
+        flash(request, "Неизвестный транспорт", "error")
+    elif target and (":" not in target or not target.rsplit(":", 1)[1].isdigit()):
+        flash(request, "Сайт-маска — в виде host:port, например www.example.com:443", "error")
+    elif path and not path.startswith("/"):
+        flash(request, "Путь XHTTP начинается с «/»", "error")
+    else:
+        pool.vless_transport = transport
+        if transport == VLESS_XHTTP:
+            pool.xhttp_path = path or pool.xhttp_path or ("/" + __import__("secrets").token_hex(6))
+        pool.reality_target = target
+        pool.reality_names = names
+        db.commit()
+        flash(request, f"VLESS пула «{pool.name}»: {transport.upper()}, маска {pool.reality_dest}. "
+                       f"Переразверните серверы пула и поднимите релей пулов гейтов; выданные "
+                       f"VLESS-конфиги пула нужно перевыпустить.", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -878,17 +1500,17 @@ def admin_delete_pool(request: Request, pool_id: int, db: Session = Depends(get_
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     pool = db.get(ExitPool, pool_id)
     if pool:
-        # SQLite doesn't enforce ON DELETE, so detach references by hand: unbind
-        # member nodes, drop routes on this pool (and unlink their devices).
+        users = [r.name for r in pool.routes]
+        if users:
+            # Refused while routes use it: deleting would cut their clients off in
+            # one click (and drop the pool identity their configs are built on).
+            flash(request, f"Пул «{pool.name}» используют маршруты: {', '.join(users)} — "
+                           f"сначала удалите их", "error")
+            return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+        # SQLite doesn't enforce ON DELETE, so detach member nodes by hand.
         db.query(Node).filter(Node.pool_id == pool.id).update(
             {Node.pool_id: None, Node.sync_state: "pending"}
         )
-        dead_routes = [r.id for r in db.query(Route).filter(Route.pool_id == pool.id).all()]
-        if dead_routes:
-            db.query(Device).filter(Device.route_id.in_(dead_routes)).update(
-                {Device.route_id: None}, synchronize_session=False
-            )
-            db.query(Route).filter(Route.id.in_(dead_routes)).delete(synchronize_session=False)
         db.delete(pool)
         db.commit()
         flash(request, "Пул удалён", "success")
@@ -905,6 +1527,74 @@ def admin_monitor(request: Request, db: Session = Depends(get_db)):
     history = [(n, monitor.node_history(db, n.id, limit=12)) for n in nodes_all]
     return render(request, "admin_monitor.html", user=admin,
                   snap=monitor.get_state(db), tg=appconfig.tg_config(db), history=history)
+
+
+@app.get("/admin/journal", response_class=HTMLResponse)
+def admin_journal(request: Request, days: int = 30, db: Session = Depends(get_db)):
+    """Gate journal: per gate — reachable from the Hub / from abroad, since when,
+    traffic and clients while it lived, recent flips (see app/journal.py)."""
+    from . import journal
+
+    admin = _require_staff(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    days = max(1, min(int(days), 90))
+    gates = db.query(Node).filter(Node.role == ROLE_GATE).order_by(Node.id).all()
+    reports = [journal.gate_report(db, g, days) for g in gates]
+    return render(request, "admin_journal.html", user=admin, reports=reports, days=days,
+                  every=settings.journal_minutes)
+
+
+@app.post("/admin/journal/run")
+def admin_journal_run(request: Request, db: Session = Depends(get_db)):
+    """Take a journal sample now (in the background: one SSH per gate)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    import threading
+    from . import tgbot
+
+    threading.Thread(target=tgbot._journal_cycle, name="journal-now", daemon=True).start()
+    flash(request, "Замер запущен — обновите страницу через минуту", "success")
+    return RedirectResponse("/admin/journal", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: DNS providers + route client address ------------------------
+@app.post("/admin/dns")
+def admin_add_dns(
+    request: Request, name: str = Form(...), kind: str = Form(...), zone: str = Form(...),
+    token: str = Form(""), db: Session = Depends(get_db),
+):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    name, zone = name.strip(), zone.strip().rstrip(".").lower()
+    if not name or not zone or kind not in DNS_KINDS or not token.strip():
+        flash(request, "Укажите имя, тип, зону и API-токен", "error")
+    elif db.query(DnsProvider).filter_by(name=name).first():
+        flash(request, "DNS-провайдер с таким именем уже есть", "error")
+    else:
+        p = DnsProvider(name=name, kind=kind, zone=zone)
+        p.token = token.strip()  # encrypted via setter
+        db.add(p)
+        db.commit()
+        flash(request, f"DNS-провайдер «{name}» ({zone}) добавлен", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/dns/{pid}/delete")
+def admin_delete_dns(request: Request, pid: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    p = db.get(DnsProvider, pid)
+    if p:
+        users = sorted({rp.route.name for rp in
+                        db.query(RouteProto).filter(RouteProto.dns_provider_id == p.id).all()})
+        if users:
+            flash(request, f"DNS-провайдер «{p.name}» используют маршруты: {', '.join(users)}", "error")
+        else:
+            db.delete(p)
+            db.commit()
+            flash(request, f"DNS-провайдер «{p.name}» удалён", "success")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/monitor/check")

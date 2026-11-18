@@ -36,9 +36,29 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from .node_ssh import SSHNode
 
 # obfuscation keys we carry into client configs (order used in the .conf text)
-PARAM_ORDER = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
-               "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]
+PARAM_ORDER_V2 = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
+                  "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]
+# AmneziaWG 3.x additions — same names in awg0.conf, the client .conf and the
+# AmneziaVPN app's JSON (verified against amnezia-client configKeys.h and its
+# server/client templates). HeaderProtectionKey is what makes a config 3.x.
+V3_KEYS = ["HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout",
+           "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts",
+           "RandomTrailers", "DisableCookies"]
+PARAM_ORDER = PARAM_ORDER_V2 + V3_KEYS
 _PARAM_SET = set(PARAM_ORDER)
+# amnezia-client defaults for 3.1 (protocolConstants.h); ranges are "a-b".
+V3_DEFAULTS = {
+    "ContentPaddingAddition": "10-100",
+    "RekeyAfterTime": "100-120",
+    "RekeyTimeout": "3-7",
+    "RejectAfterTime": "150-180",
+    "KeepaliveTimeout": "5-15",
+    "MaxHandshakeAttempts": "15-20",
+    "RandomTrailers": "on",
+    "DisableCookies": "on",
+}
+KEEPALIVE_V2 = "25"
+KEEPALIVE_V3 = "25-35"  # 3.x takes a range: the keepalive period itself varies
 DEFAULT_CONF_DIR = "/opt/amnezia/awg"
 DEFAULT_DNS1 = "1.1.1.1"
 DEFAULT_DNS2 = "1.0.0.1"
@@ -80,31 +100,64 @@ def gen_psk() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
-def gen_obfuscation_params() -> dict:
-    """Per-server AmneziaWG **2.0** obfuscation set, randomized so no two of our
-    servers share a DPI signature. H1..H4 are four distinct, non-overlapping
-    RANGES high in the uint32 space (well clear of the 1..4 real WireGuard
-    message types) and S1..S4 are all >= 12 — both are what makes the AmneziaVPN
-    app treat the config as AmneziaWG 2.0 (header protection) rather than
-    "legacy". Jmax stays under the client MTU. I1..I5 (optional client-side junk
-    signatures) are left empty."""
+def is_v3(params: dict) -> bool:
+    """A 3.x parameter set (header protection on)."""
+    return bool(params.get("HeaderProtectionKey"))
+
+
+def protocol_version(params: dict) -> str:
+    """What the AmneziaVPN app's `protocol_version` says for this set."""
+    return "3.1" if is_v3(params) else "2"
+
+
+def quic_like_i1() -> str:
+    """A signature packet shaped like a QUIC Initial (long header, version 1,
+    8-byte DCID, empty SCID, ~1.2 KB of random payload), sent before each
+    handshake so the flow opens like HTTP/3. Only tags every amneziawg-go client
+    knows (<b>, <r>) — an unknown tag makes the app reject the whole config."""
+    first = secrets.choice(["c0", "c1", "c2", "c3"])  # long header, Initial, PN length 1..4
+    return f"<b 0x{first}0000000108><r 8><b 0x00><r {secrets.SystemRandom().randint(1150, 1180)}>"
+
+
+def gen_obfuscation_params(version: str = "3.1") -> dict:
+    """Per-server AmneziaWG obfuscation set, randomized so no two of our servers
+    share a DPI signature.
+
+    2.0 base: H1..H4 are four distinct, non-overlapping RANGES high in the uint32
+    space (clear of the 1..4 real WireGuard message types); S1..S4 >= 12 (required
+    by header protection); S4 <= 32 (transport padding limit); S1+56 != S2 (else
+    init and response would be the same size). Jmax stays under the client MTU.
+
+    3.1 (default) adds header protection (a random key — header bytes look
+    random), content padding, randomized protocol timers, random trailers and no
+    cookie replies — the amnezia-client defaults — plus an I1 signature packet
+    shaped like QUIC. Needs AmneziaVPN 5.0.1.5+ on clients."""
     rnd = secrets.SystemRandom()
     jmin = rnd.randint(8, 25)
     jmax = rnd.randint(jmin + 30, 120)
     hv = sorted(rnd.sample(range(16, 2 ** 31 - 1), 8))
-    return {
+    s1 = rnd.randint(15, 90)
+    s2 = rnd.randint(15, 90)
+    while s2 == s1 + 56:
+        s2 = rnd.randint(15, 90)
+    params = {
         "Jc": str(rnd.randint(4, 12)),
         "Jmin": str(jmin),
         "Jmax": str(jmax),
-        "S1": str(rnd.randint(15, 90)),
-        "S2": str(rnd.randint(15, 90)),
-        "S3": str(rnd.randint(15, 90)),
-        "S4": str(rnd.randint(15, 90)),
+        "S1": str(s1),
+        "S2": str(s2),
+        "S3": str(rnd.randint(15, 60)),
+        "S4": str(rnd.randint(12, 32)),
         "H1": f"{hv[0]}-{hv[1]}",
         "H2": f"{hv[2]}-{hv[3]}",
         "H3": f"{hv[4]}-{hv[5]}",
         "H4": f"{hv[6]}-{hv[7]}",
     }
+    if version.startswith("3"):
+        params["HeaderProtectionKey"] = gen_keypair()[0]  # `awg genkey` format
+        params.update(V3_DEFAULTS)
+        params["I1"] = quic_like_i1()
+    return params
 
 
 def render_server_conf(priv: str, listen_port: int, params: dict,
@@ -122,6 +175,9 @@ def render_server_conf(priv: str, listen_port: int, params: dict,
     ]
     for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"):
         lines.append(f"{k} = {params.get(k, '')}")
+    for k in V3_KEYS:  # 3.x: active on the server too (empty = not a 3.x set)
+        if params.get(k):
+            lines.append(f"{k} = {params[k]}")
     for k in ("I1", "I2", "I3", "I4", "I5"):
         lines.append(f"# {k} = {params.get(k, '')}")
     return "\n".join(lines) + "\n"
@@ -138,12 +194,24 @@ class AWGServer:
     listen_port: int
     subnet_prefix: str          # e.g. "10.8.1"
     cidr: int
-    params: dict = field(default_factory=dict)   # Jc..I5 (strings; missing -> "")
+    params: dict = field(default_factory=dict)   # Jc..I5 + 3.x keys (strings; missing -> "")
     used_hosts: set[int] = field(default_factory=set)
-    protocol_version: str = "2"
 
     def p(self, key: str) -> str:
         return self.params.get(key, "")
+
+    @property
+    def protocol_version(self) -> str:
+        return protocol_version(self.params)
+
+    @property
+    def keepalive(self) -> str:
+        return KEEPALIVE_V3 if is_v3(self.params) else KEEPALIVE_V2
+
+    def client_params(self) -> list[str]:
+        """Params that go into client configs: the full 2.0 set always (as the app
+        exports it), 3.x keys only when set."""
+        return PARAM_ORDER_V2 + [k for k in V3_KEYS if self.p(k)]
 
 
 def server_from_identity(
@@ -178,7 +246,7 @@ def _wg_config_text(server: AWGServer, priv: str, address: str, host: str) -> st
         "DNS = $PRIMARY_DNS, $SECONDARY_DNS",
         f"PrivateKey = {priv}",
     ]
-    for k in PARAM_ORDER:
+    for k in server.client_params():
         lines.append(f"{k} = {server.p(k)}")
     lines += [
         "",
@@ -187,7 +255,7 @@ def _wg_config_text(server: AWGServer, priv: str, address: str, host: str) -> st
         f"PresharedKey = {server.psk}",
         "AllowedIPs = 0.0.0.0/0, ::/0",
         f"Endpoint = {host}:{server.listen_port}",
-        "PersistentKeepalive = 25",
+        f"PersistentKeepalive = {server.keepalive}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -197,7 +265,7 @@ def build_amnezia_dict(
     description: str, dns1: str = DEFAULT_DNS1, dns2: str = DEFAULT_DNS2,
 ) -> dict:
     """Build the JSON document the AmneziaVPN app expects (pre-encoding)."""
-    param_fields = {k: server.p(k) for k in PARAM_ORDER}
+    param_fields = {k: server.p(k) for k in server.client_params()}
 
     inner = {
         **param_fields,
@@ -209,7 +277,7 @@ def build_amnezia_dict(
         "config": _wg_config_text(server, priv, address, host),
         "hostName": host,
         "mtu": DEFAULT_MTU,
-        "persistent_keep_alive": "25",
+        "persistent_keep_alive": server.keepalive,
         "port": server.listen_port,
         "psk_key": server.psk,
         "server_pub_key": server.server_pubkey,
@@ -313,7 +381,7 @@ def client_conf_from_vpn(
         f"PresharedKey = {g('psk_key')}",
         "AllowedIPs = 0.0.0.0/0, ::/0",
         f"Endpoint = {endpoint_host}:{port}",
-        "PersistentKeepalive = 25",
+        f"PersistentKeepalive = {g('persistent_keep_alive') or KEEPALIVE_V2}",
     ]
     return "\n".join(lines) + "\n"
 
