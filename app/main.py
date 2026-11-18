@@ -352,11 +352,14 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     if not user:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
     routes = pool_ops.accessible_routes(db, user)  # routes this client may use
-    usable = [r for r in routes if not r.is_blocked]
+    # Per route: the protocols a new device can get there right now (on, not
+    # blocked) — the form offers only these after the route is picked.
+    choices = [(r, [p for p in r.active_protocols if not r.proto_block_reason(p)]) for r in routes]
+    choices = [(r, ps) for r, ps in choices if ps]
     return render(
         request, "dashboard.html",
-        user=user, devices=user.devices, protocols=PROTOCOLS,
-        service_ready=bool(usable), routes=routes,
+        user=user, devices=user.devices, protocols=PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
+        service_ready=bool(choices), choices=choices,
     )
 
 
@@ -698,6 +701,13 @@ def admin_converge_node(request: Request, node_id: int, db: Session = Depends(ge
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
+# NaiveProxy certificates being issued right now (route protocol ids) and the last
+# failure per protocol — in-process state (one uvicorn worker), shown on «Парк».
+_CERT_BUSY: set[int] = set()
+_CERT_ERR: dict[int, str] = {}
+_CERT_LOCK = __import__("threading").Lock()
+
+
 @app.post("/admin/routes/{route_id}/cert")
 def admin_route_cert(request: Request, route_id: int, db: Session = Depends(get_db)):
     """Issue (or renew) the certificate of the route's NaiveProxy hostname on the
@@ -714,6 +724,13 @@ def admin_route_cert(request: Request, route_id: int, db: Session = Depends(get_
     import threading
 
     rp_id = rp.id
+    with _CERT_LOCK:
+        if rp_id in _CERT_BUSY:
+            # A second issue would race the first one for the same TXT record.
+            flash(request, f"Сертификат для {rp.client_host} уже выпускается — дождитесь окончания.", "error")
+            return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+        _CERT_BUSY.add(rp_id)
+        _CERT_ERR.pop(rp_id, None)
 
     def _work():
         from . import naive
@@ -725,14 +742,17 @@ def admin_route_cert(request: Request, route_id: int, db: Session = Depends(get_
             naive.ensure_cert(s, r, force=True)
             ok, errs = naive.push_pool(s, r.route.pool)
             log.info("naive cert %s: pushed to %d servers %s", r.client_host, ok, errs or "")
-        except Exception:
+        except Exception as e:
             log.exception("naive cert issue failed")
+            _CERT_ERR[rp_id] = str(e)[:300]
         finally:
             s.close()
+            with _CERT_LOCK:
+                _CERT_BUSY.discard(rp_id)
 
     threading.Thread(target=_work, name="naive-cert", daemon=True).start()
-    flash(request, f"Выпуск сертификата для {rp.client_host} запущен (1–2 мин.) — затем он будет "
-                   f"разослан на серверы пула. Обновите страницу позже.", "success")
+    flash(request, f"Выпуск сертификата для {rp.client_host} запущен — 1–2 минуты, страница обновится "
+                   f"сама; затем сертификат разошлётся на серверы пула.", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -742,9 +762,9 @@ def admin_park_status(request: Request, db: Session = Depends(get_db)):
     auto-reloads once a running job leaves this list, so the final result badge shows
     without a manual refresh."""
     if not _require_staff(request, db):
-        return JSONResponse({"running": []}, status_code=403)
+        return JSONResponse({"running": [], "certs": []}, status_code=403)
     running = [nid for (nid,) in db.query(Node.id).filter(Node.job_state == JOB_RUNNING).all()]
-    return JSONResponse({"running": running})
+    return JSONResponse({"running": running, "certs": sorted(_CERT_BUSY)})
 
 
 @app.post("/admin/nodes/{node_id}/delete")
@@ -1129,11 +1149,11 @@ def admin_park(request: Request, db: Session = Depends(get_db)):
                   dns_providers=db.query(DnsProvider).order_by(DnsProvider.name).all(),
                   dns_kinds=DNS_KINDS,
                   dns_states={rp.id: dns_ops.get_state(db, rp.id) for rp in rps if rp.dns_provider_id},
-                  naive_certs=crt,
+                  naive_certs=crt, cert_busy=set(_CERT_BUSY), cert_err=dict(_CERT_ERR),
                   dev_counts=dev_counts,
                   gst=gst, gate_tip=park.gate_tip, health=health,
                   ready={r.id: park.readiness(r, crt, gp_problems.get(r.gate_pool_id, "")) for r in routes},
-                  attention=park.attention(routes, gate_pools, orphans, gst, crt),
+                  attention=park.attention(routes, gate_pools, orphans, gst, crt, set(_CERT_BUSY)),
                   broken=[r for r in routes if health[r.id]["state"] == "bad"],
                   # scheme: pools in the order of the routes using them (fewer crossing wires)
                   scheme_gp=_in_route_order(gate_pools, [r.gate_pool for r in routes]),

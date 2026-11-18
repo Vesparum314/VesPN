@@ -482,7 +482,7 @@
           {% if rp %}
             <span class="addr">{{ rp.host or '—' }}:{{ rp.port }}</span>
             {% if rp.dns_provider %}{% if ds and ds.error %}<span class="badge b-bad" title="{{ ds.error }}">DNS ✗</span>{% elif ds and ds.ips %}<span class="badge b-ok" title="{{ ds.ips|join(', ') }} · {{ ds.at }}">DNS ✓</span>{% else %}<span class="badge b-warn">DNS …</span>{% endif %}{% endif %}
-            {% if pr == 'naive' %}{% if nc %}<span class="badge b-ok" title="до {{ nc.not_after.strftime('%d.%m.%Y') }}">серт. ✓</span>{% else %}<span class="badge b-warn">нет серт.</span>{% endif %}{% endif %}
+            {% if pr == 'naive' %}{% if rp.id in cert_busy %}<span class="badge b-warn b-dot">⏳ серт. выпускается</span>{% elif nc %}<span class="badge b-ok" title="до {{ nc.not_after.strftime('%d.%m.%Y') }}">серт. ✓</span>{% elif cert_err.get(rp.id) %}<span class="badge b-bad" title="{{ cert_err[rp.id] }}">серт. ✗</span>{% else %}<span class="badge b-warn">нет серт.</span>{% endif %}{% endif %}
             <span class="muted" style="font-size:12px">{{ nd }} устр.</span>
             <button class="btn btn-ghost btn-xs" type="button" data-tog="pb-{{ r.id }}-{{ pr }}">Изменить</button>
           {% else %}<span class="muted" style="font-size:12.5px">выключен{% if nd %} · {{ nd }} устр.{% endif %}</span>{% endif %}
@@ -519,7 +519,9 @@
           <form method="post" action="/admin/routes/{{ r.id }}/cert" class="iform">
             <span class="sub3">Сертификат</span>
             <span class="muted" style="font-size:12.5px;flex:1">{% if nc %}действует до {{ nc.not_after.strftime('%d.%m.%Y') }}; {% endif %}выпускается на Хабе через DNS-01 (провайдер выше), продлевается сам за 30 дней до конца.</span>
-            <button class="btn btn-xs">{{ 'Перевыпустить' if nc else 'Выпустить' }} сертификат</button>
+            {% if rp.id in cert_busy %}<button class="btn btn-xs" disabled>⏳ выпускается…</button>
+            {% else %}<button class="btn btn-xs">{{ 'Перевыпустить' if nc else 'Выпустить' }} сертификат</button>{% endif %}
+            {% if cert_err.get(rp.id) %}<span class="warnline" style="padding:0;flex-basis:100%">Последний выпуск не удался: {{ cert_err[rp.id] }}</span>{% endif %}
           </form>
           {% endif %}
         </div>
@@ -781,16 +783,19 @@ function addServer(role, poolId, title){
 
   // Auto-refresh while a background rollout runs: reload once a running node
   // finishes, so its result (and the flash) appear without a manual refresh.
+  // Same for a NaiveProxy certificate being issued.
   var running = Array.prototype.map.call(document.querySelectorAll('[data-job-running]'),
     function(e){ return parseInt(e.getAttribute('data-job-running'), 10); }).filter(function(v){ return !isNaN(v); });
-  if (running.length) {
+  var certs = {{ cert_busy|list|tojson }};
+  if (running.length || certs.length) {
     var iv = setInterval(function(){
       fetch('/admin/park/status', {headers:{'Accept':'application/json'}, credentials:'same-origin'})
         .then(function(r){ return r.ok ? r.json() : null; })
         .then(function(d){
           if (!d) return;
-          var still = d.running || [];
-          if (running.some(function(id){ return still.indexOf(id) < 0; })) { clearInterval(iv); location.reload(); }
+          var still = d.running || [], stillC = d.certs || [];
+          if (running.some(function(id){ return still.indexOf(id) < 0; }) ||
+              certs.some(function(id){ return stillC.indexOf(id) < 0; })) { clearInterval(iv); location.reload(); }
         }).catch(function(){});
     }, 5000);
   }

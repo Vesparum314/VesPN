@@ -226,6 +226,7 @@ def install(node: SSHNode, db: Session, pool: ExitPool) -> dict:
     tag = image_tag()
     rc, _, _ = node.run(f"docker image inspect {shlex.quote(tag)} >/dev/null 2>&1", timeout=30)
     if rc != 0:
+        node.run(f"mkdir -p {BASE}/build", timeout=20)
         _put_file(node, f"{BASE}/build/Dockerfile", _DOCKERFILE.format(
             builder=settings.naive_builder_image, runtime=settings.naive_runtime_image,
             ref=settings.naive_forwardproxy_ref))
