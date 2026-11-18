@@ -139,7 +139,7 @@ def readiness(r: Route, crt: dict, relay_problem: str) -> list[dict]:
 
 
 def attention(routes: list[Route], gate_pools: list[GatePool], orphans: list[Node],
-              gst: dict[int, dict], crt: dict) -> list[dict]:
+              gst: dict[int, dict], crt: dict, cert_busy: set[int] | None = None) -> list[dict]:
     """[{sev, name, text, detail, actions: [{label, post|open|tab}]}] — most severe
     first. Every item names what's wrong and offers the action that fixes it."""
     out: list[dict] = []
@@ -169,9 +169,13 @@ def attention(routes: list[Route], gate_pools: list[GatePool], orphans: list[Nod
                 out.append({"sev": "warn", "name": r.name, "text": "у NaiveProxy не задано имя хоста",
                             "detail": "На него выпускается сертификат", "actions": [{"label": "Открыть маршрут", "open": r.id}]})
             elif not crt.get(nrp.id):
-                out.append({"sev": "warn", "name": r.name, "text": f"нет сертификата для {nrp.client_host}",
-                            "detail": "Без него NaiveProxy на серверах не запустить",
-                            "actions": [{"label": "Выпустить сертификат", "post": f"/admin/routes/{r.id}/cert"}]})
+                busy = nrp.id in (cert_busy or set())
+                out.append({"sev": "warn", "name": r.name,
+                            "text": f"{'выпускается' if busy else 'нет'} сертификат для {nrp.client_host}",
+                            "detail": "Займёт 1–2 минуты, страница обновится сама" if busy
+                                      else "Без него NaiveProxy на серверах не запустить",
+                            "actions": [] if busy else
+                                       [{"label": "Выпустить сертификат", "post": f"/admin/routes/{r.id}/cert"}]})
         for s in (r.pool.members if r.pool else []):
             if s.sync_state != "synced" and not s.job_running:
                 what = "недоступен" if s.sync_state == "unreachable" else "не развёрнут"

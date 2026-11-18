@@ -23,7 +23,7 @@
       {% for d in u.devices %}
         {% set s = stats.get(d.id) %}
         <tr>
-          <td data-label="Конфиг"><span class="badge b-{{ d.protocol }} b-dot">{{ 'VLESS' if d.protocol=='vless' else 'AWG' }}</span> {{ d.name }}</td>
+          <td data-label="Конфиг"><span class="badge b-{{ d.protocol }} b-dot">{{ {'vless':'VLESS','awg':'AWG','naive':'Naive'}.get(d.protocol, d.protocol) }}</span> {{ d.name }}</td>
           <td data-label="Маршрут">{{ d.route.name if d.route else '—' }}</td>
           <td data-label="За день">{% if s %}{{ s.up_today|hbytes }} / {{ s.down_today|hbytes }}{% else %}<span class="muted">—</span>{% endif %}</td>
           <td data-label="Всего">{% if s %}{{ s.up_total|hbytes }} / {{ s.down_total|hbytes }}{% else %}<span class="muted">—</span>{% endif %}</td>
