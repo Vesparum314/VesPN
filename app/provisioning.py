@@ -198,7 +198,11 @@ def _gen_short_ids() -> list[str]:
 def _build_inbound_payload(
     name: str, priv: str, pub: str,
     short_ids: list[str] | None = None, spider_x: str | None = None, port: int | None = None,
+    transport: str = "tcp", xhttp_path: str = "", target: str = "", server_names: list[str] | None = None,
 ) -> dict:
+    """The 3x-ui inbound for VLESS-Reality. `transport` 'tcp' = raw TCP (+Vision
+    flow on clients), 'xhttp' = XHTTP (mode auto → stream-one under Reality).
+    `target`/`server_names` override the template's masquerade site."""
     tpl = json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
     ss = tpl["streamSettings"]
     rs = ss["realitySettings"]
@@ -206,6 +210,19 @@ def _build_inbound_payload(
     rs.setdefault("settings", {})["publicKey"] = pub
     rs["shortIds"] = short_ids if short_ids is not None else _gen_short_ids()
     rs["settings"]["spiderX"] = spider_x or ("/" + secrets.token_hex(8))
+    if target:
+        rs["target"] = target
+        rs.pop("dest", None)
+    if server_names:
+        rs["serverNames"] = list(server_names)
+    if transport == "xhttp":
+        ss["network"] = "xhttp"
+        ss.pop("tcpSettings", None)
+        ss["xhttpSettings"] = {
+            "path": xhttp_path or ("/" + secrets.token_hex(6)),
+            "host": "",
+            "mode": "auto",
+        }
     # 3x-ui's add endpoint takes settings/streamSettings/sniffing as JSON strings
     return {
         "up": 0,
@@ -227,15 +244,20 @@ def create_vless_inbound(
     node: SSHNode, xui_path: str, xui_port: int, xui_token: str, name: str = "VPN",
     priv: str | None = None, pub: str | None = None,
     short_ids: list[str] | None = None, spider_x: str | None = None, port: int | None = None,
+    transport: str = "tcp", xhttp_path: str = "", target: str = "",
+    server_names: list[str] | None = None,
 ) -> int:
     """Create the VLESS inbound if none exists yet; return its inbound id.
 
     Standalone: Reality keys are generated on the node (`xray x25519`). For a POOL
     exit the caller passes the pool's shared Reality identity (priv/pub/shortIds/
-    spiderX/port) so every member is a clone and one link works against all."""
+    spiderX/port) and its transport/masquerade, so every member is a clone and one
+    link works against all."""
     if not (priv and pub):
         priv, pub = _xray_x25519(node)
-    payload = _build_inbound_payload(name, priv, pub, short_ids, spider_x, port)
+    payload = _build_inbound_payload(
+        name, priv, pub, short_ids, spider_x, port, transport, xhttp_path, target, server_names
+    )
     with node.tunnel(xui_port) as lport:
         xui = XUIClient(f"http://127.0.0.1:{lport}/{xui_path}", xui_token)
         existing = None
@@ -249,8 +271,9 @@ def create_vless_inbound(
             # a node that was set up standalone), replace it — otherwise the clone
             # would serve the pool's client UUIDs under the wrong server key and
             # configs would fail there after a failover.
-            if xui.inbound_reality_private(existing.inbound_id) == priv:
-                return existing.inbound_id  # already the pool identity
+            if (xui.inbound_reality_private(existing.inbound_id) == priv
+                    and xui.inbound_network(existing.inbound_id) == transport):
+                return existing.inbound_id  # already the pool identity and transport
             xui.del_inbound(existing.inbound_id)
         xui.add_inbound(payload)
         return xui.find_vless_inbound().inbound_id
@@ -368,153 +391,6 @@ def install_amneziawg(
     }
 
 
-# --------------------------------------------------------------------------
-# Gate relay: turn a node into a transparent L4 forwarder to an exit POOL. The
-# gate never decrypts — it DNATs the service ports straight through to a healthy
-# pool member, so client → gate:PORT → exit:PORT → internet (the client's
-# VLESS/AWG obfuscation rides along unchanged). A tiny daemon health-checks the
-# pool and keeps the nftables map pointed only at live members, so a dead/banned
-# exit auto-fails-over with no client reconfiguration.
-# --------------------------------------------------------------------------
-_RELAY_DAEMON = r'''#!/usr/bin/env python3
-"""VesPN gate relay daemon. Reads the pool member list (in priority order) the
-panel pushes to /etc/vespn-relay/members.json, TCP-probes each exit's VLESS port
-with hysteresis, and rewrites our own nftables table so DNAT points at the single
-highest-priority HEALTHY member (active/standby: all traffic to the preferred
-exit, failing down to the next only when it dies). The gate forwards ciphertext
-only; it never decrypts."""
-import json, os, socket, subprocess, sys, time
-
-CONF = "/etc/vespn-relay/members.json"
-NFT_FILE = "/run/vespn-relay.nft"
-UP, DOWN = 2, 2  # consecutive probes needed to flip a member up/down
-
-
-def load():
-    try:
-        with open(CONF) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def tcp_ok(ip, port, timeout=2.0):
-    try:
-        s = socket.create_connection((ip, int(port)), timeout=timeout)
-        s.close()
-        return True
-    except Exception:
-        return False
-
-
-def build_nft(exits, tcp_ports, udp_ports):
-    lines = [
-        "add table ip vespn_relay",
-        "flush table ip vespn_relay",
-        "add chain ip vespn_relay pre { type nat hook prerouting priority dstnat; policy accept; }",
-        "add chain ip vespn_relay post { type nat hook postrouting priority srcnat; policy accept; }",
-    ]
-    k = len(exits)
-
-    def dnat(proto, port):
-        if k == 1:
-            return "add rule ip vespn_relay pre %s dport %d dnat to %s" % (proto, port, exits[0])
-        mp = ", ".join("%d : %s" % (i, e) for i, e in enumerate(exits))
-        return ("add rule ip vespn_relay pre %s dport %d dnat to jhash ip saddr mod %d map { %s }"
-                % (proto, port, k, mp))
-
-    if k:
-        for p in tcp_ports:
-            lines.append(dnat("tcp", int(p)))
-        for p in udp_ports:
-            lines.append(dnat("udp", int(p)))
-        lines.append("add rule ip vespn_relay post ip daddr { %s } masquerade" % ", ".join(exits))
-    return "\n".join(lines) + "\n"
-
-
-def apply_nft(text):
-    with open(NFT_FILE, "w") as f:
-        f.write(text)
-    subprocess.run(["nft", "-f", NFT_FILE], check=False)
-
-
-def main():
-    state = {}
-    last_active = None
-    while True:
-        cfg = load()
-        exits = list(cfg.get("exits", []))  # already in priority order (lower index = preferred)
-        tcp_ports = cfg.get("tcp_ports", [])
-        udp_ports = cfg.get("udp_ports", [])
-        probe = int(cfg.get("probe_port") or (tcp_ports[0] if tcp_ports else 0) or 22)
-        interval = int(cfg.get("interval", 5))
-        for ip in exits:
-            st = state.setdefault(ip, {"up": False, "s": 0, "f": 0})
-            if tcp_ok(ip, probe):
-                st["s"] += 1; st["f"] = 0
-                if not st["up"] and st["s"] >= UP:
-                    st["up"] = True
-            else:
-                st["f"] += 1; st["s"] = 0
-                if st["up"] and st["f"] >= DOWN:
-                    st["up"] = False
-        for ip in list(state):
-            if ip not in exits:
-                del state[ip]
-        healthy = [ip for ip in exits if state.get(ip, {}).get("up")]
-        # Active/standby: route ALL traffic to the highest-priority healthy member
-        # (first in the list). Fall down to the next only when it goes down.
-        active = healthy[:1]
-        if active != last_active:
-            apply_nft(build_nft(active, tcp_ports, udp_ports))
-            last_active = active
-            sys.stderr.write("vespn-relay: active=%r (healthy=%r)\n" % (active, healthy))
-            sys.stderr.flush()
-        time.sleep(interval)
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-_RELAY_SERVICE = """[Unit]
-Description=VesPN gate relay daemon (health-checked nftables DNAT to the exit pool)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/vespn-relay-daemon.py
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-def _relay_members(exits, tcp_ports, udp_ports, probe_port=None, interval=5) -> dict:
-    exits = [str(e) for e in exits]
-    tcp_ports = [int(p) for p in tcp_ports]
-    udp_ports = [int(p) for p in udp_ports]
-    return {
-        "exits": exits,
-        "tcp_ports": tcp_ports,
-        "udp_ports": udp_ports,
-        "probe_port": int(probe_port) if probe_port else (tcp_ports[0] if tcp_ports else 0),
-        "interval": int(interval),
-    }
-
-
-def push_gate_members(node: SSHNode, exits, tcp_ports, udp_ports, probe_port=None, interval=5) -> dict:
-    """Update ONLY the member list on an already-set-up gate; the daemon picks it
-    up on its next cycle (used when the pool's membership/health changes)."""
-    members = _relay_members(exits, tcp_ports, udp_ports, probe_port, interval)
-    node.run("mkdir -p /etc/vespn-relay", timeout=20)
-    _put_file(node, "/etc/vespn-relay/members.json", json.dumps(members, indent=2) + "\n")
-    return members
-
-
 TG_PROXY_PORT = 8666  # localhost-only Telegram reverse-proxy port on each exit
 
 
@@ -543,40 +419,3 @@ def install_telegram_proxy(node: SSHNode, port: int = TG_PROXY_PORT,
     node.run("sleep 3", timeout=10)
     _rc, st, _ = node.run(f"docker ps --filter name={shlex.quote(container)} --format '{{{{.Status}}}}'", timeout=15)
     return {"container": container, "port": int(port), "status": st.strip()}
-
-
-def install_gate_relay(node: SSHNode, exits, tcp_ports, udp_ports, probe_port=None, interval=5) -> dict:
-    """Set `node` up as a health-checked L4 relay to the exit pool: install the
-    daemon + systemd unit, push the member list, enable ip_forward. Idempotent —
-    re-running just refreshes the files and restarts the daemon."""
-    members = _relay_members(exits, tcp_ports, udp_ports, probe_port, interval)
-    if not members["tcp_ports"] and not members["udp_ports"]:
-        raise ProvisionError("no ports to relay")
-
-    node.run(
-        "command -v nft >/dev/null 2>&1 || (apt-get update && apt-get install -y nftables) >/dev/null 2>&1; "
-        "command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y python3) >/dev/null 2>&1; true",
-        timeout=300,
-    )
-    disable_fail2ban(node)  # must never ban the exits it relays to or the panel
-    _put_file(node, "/etc/sysctl.d/99-vespn-relay.conf", "net.ipv4.ip_forward=1\n")
-    node.run("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1", timeout=20)
-    node.run("mkdir -p /etc/vespn-relay", timeout=20)
-    _put_file(node, "/etc/vespn-relay/members.json", json.dumps(members, indent=2) + "\n")
-    _put_file(node, "/usr/local/bin/vespn-relay-daemon.py", _RELAY_DAEMON)
-    _put_file(node, "/etc/systemd/system/vespn-relay.service", _RELAY_SERVICE)
-    rc, out, err = node.run(
-        "chmod +x /usr/local/bin/vespn-relay-daemon.py && systemctl daemon-reload && "
-        "systemctl enable vespn-relay.service >/dev/null 2>&1 && "
-        "systemctl restart vespn-relay.service 2>&1",
-        timeout=60,
-    )
-    if rc != 0:
-        raise ProvisionError(f"relay daemon setup failed:\n{(err or out)[-700:]}")
-    node.run("sleep 3", timeout=10)
-    _rc, status, _ = node.run("systemctl is-active vespn-relay.service 2>&1", timeout=15)
-    _rc, rules, _ = node.run("nft list table ip vespn_relay 2>&1", timeout=20)
-    return {
-        "exits": members["exits"], "tcp": members["tcp_ports"], "udp": members["udp_ports"],
-        "daemon": status.strip(), "rules": rules.strip(),
-    }

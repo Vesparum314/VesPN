@@ -1,13 +1,190 @@
 {% extends "base.html" %}
 {% block title %}Парк — {{ brand }}{% endblock %}
 {% block content %}
-{% macro jobbadge(n) %}{% set jl = {'provision':'развёртывание','relay':'релей'} %}{% if n.job_running %}<span class="badge b-warn b-dot" title="идёт {{ jl.get(n.job_kind, n.job_kind or 'операция') }}…">⏳ {{ jl.get(n.job_kind, n.job_kind or 'операция') }}…</span>{% elif n.job_state == 'error' %}<span class="badge b-bad b-dot" title="{{ n.job_message }}">✗ {{ jl.get(n.job_kind, 'операция') }} не удалась</span>{% elif n.job_state == 'done' %}<span class="badge b-ok b-dot" title="{{ n.job_message }}">✓ {{ jl.get(n.job_kind, 'готово') }}</span>{% endif %}{% endmacro %}
-<div class="head">
+{% macro jobbadge(n) %}{% set jl = {'provision':'раскатка','relay':'релей'} %}{% if n.job_running %}<span class="badge b-warn b-dot" title="идёт {{ jl.get(n.job_kind, n.job_kind or 'операция') }}…">⏳ {{ jl.get(n.job_kind, n.job_kind or 'операция') }}…</span>{% elif n.job_state == 'error' %}<span class="badge b-bad b-dot" title="{{ n.job_message }}">✗ {{ jl.get(n.job_kind, 'операция') }}</span>{% elif n.job_state == 'done' %}<span class="badge b-ok b-dot" title="{{ n.job_message }}">✓ {{ jl.get(n.job_kind, 'готово') }}</span>{% endif %}{% endmacro %}
+{% macro keybadge(n) %}{% if not n.key_installed %}<span class="badge b-warn" title="пока по паролю — ключ парка встанет при раскатке">🔒 пароль</span>{% endif %}{% endmacro %}
+{% macro gdot(g) %}{% set st = gst.get(g.id, {}) %}{{ 'ok' if st.get('live', True) and st.get('probed') else ('warn' if not st.get('probed') else 'bad') }}{% endmacro %}
+{% macro gchip(g) %}<span class="srv" title="{{ gate_tip(g, gst.get(g.id)) }}"><span class="sdot {{ gdot(g) }}"></span>{{ g.name }}</span>{% endmacro %}
+{% macro sdot(n) %}{{ 'ok' if n.sync_state == 'synced' else ('bad' if n.sync_state == 'unreachable' else 'warn') }}{% endmacro %}
+{% macro schip(n) %}<span class="srv" title="{{ n.public_host }} · {{ {'synced':'развёрнут','unreachable':'недоступен','drifted':'рассинхрон'}.get(n.sync_state, 'не развёрнут') }}"><span class="sdot {{ sdot(n) }}"></span>{{ n.name }}</span>{% endmacro %}
+{% macro ppill(rp) %}<span class="pill {{ rp.protocol if rp.enabled else 'paused' }}" title="{{ rp.label }}{{ ' — на паузе' if not rp.enabled }}">{{ rp.label }}</span>{% endmacro %}
+{% macro more(label='Ещё действия') %}<details class="more"><summary aria-label="{{ label }}" title="{{ label }}">⋯</summary><div class="menu">{{ caller() }}</div></details>{% endmacro %}
+{% set state_word = {'ok':'работает','warn':'требует внимания','bad':'не работает','off':'выключен'} %}
+{% set state_badge = {'ok':'b-ok','warn':'b-warn','bad':'b-bad','off':'b-exit'} %}
+<style>
+  .park .ph{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .park .ph .state{font-size:14px;color:var(--fg-soft);margin-top:2px}
+  .park .ph .state .bad{color:var(--bad);font-weight:600}
+  .park .btn-xs{padding:4px 9px;font-size:12.5px;border-radius:7px}
+  .park select,.park input:not([type=checkbox]){padding:4px 8px;font-size:13px;border-radius:7px}
+  .park form{margin:0}
+  .grow{flex:1}
+  .mono-s{font-family:var(--font-mono);font-size:12.5px}
+  /* attention */
+  .attn{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--panel);margin-bottom:12px;overflow:hidden}
+  .attn-row{display:flex;align-items:center;gap:10px;padding:7px 12px;border-top:1px solid var(--border);font-size:13.5px;flex-wrap:wrap}
+  .attn-row:first-child{border-top:0}
+  .attn-row .sev{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+  .sev.bad{background:var(--bad)} .sev.warn{background:var(--warn)}
+  .attn-row .what{flex:1;min-width:240px}
+  .attn-row .what small{color:var(--muted);display:block;font-size:12px}
+  .attn-row .acts{display:flex;gap:6px;flex-wrap:wrap}
+  .attn-more{padding:5px 12px}
+  .attn-more .btn{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:var(--muted)}
+  /* segmented */
+  .seg{display:inline-flex;max-width:100%;overflow-x:auto;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:3px;gap:2px}
+  .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-weight:600;font-size:13.5px;padding:6px 12px;border-radius:7px;cursor:pointer;display:inline-flex;gap:6px;align-items:center;white-space:nowrap}
+  .seg button[aria-selected="true"]{background:var(--panel);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+  .seg .n{font-size:11px;background:var(--panel-3);border-radius:999px;padding:0 6px;color:var(--muted)}
+  .seg .n.bad{background:var(--bad-bg);color:var(--bad)}
+  .seg-s button{padding:4px 11px;font-size:12.5px}
+  .tabs{margin-bottom:12px}
+  .rtool{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  /* dots, pills, chips */
+  .sdot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto;background:var(--muted)}
+  .sdot.ok{background:var(--ok)} .sdot.bad{background:var(--bad)} .sdot.warn{background:var(--warn)} .sdot.off{background:var(--border-strong)}
+  .pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--panel-3);color:var(--fg-soft);white-space:nowrap}
+  .pill.vless{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
+  .pill.awg{background:var(--ok-bg);color:var(--ok)}
+  .pill.naive{background:var(--warn-bg);color:var(--warn)}
+  .pill.paused{background:transparent;border:1px dashed var(--border-strong);color:var(--muted)}
+  .pill.paused::after{content:"пауза";font-weight:500;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em}
+  .pill.none{background:transparent;border:1px solid var(--border);color:var(--muted);font-weight:500}
+  .srv{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:12.5px;white-space:nowrap}
+  /* route list */
+  .rlist{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}
+  .rrow{display:grid;grid-template-columns:minmax(120px,1.1fr) minmax(150px,1.3fr) minmax(170px,1.5fr) minmax(150px,1.4fr) 60px 100px;
+    gap:12px;align-items:center;padding:9px 14px;border:0;border-top:1px solid var(--border);cursor:pointer;text-align:left;width:100%;background:transparent;font:inherit;color:inherit}
+  .rrow:first-child{border-top:0}
+  .rrow:hover{background:var(--panel-2)}
+  .rrow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .rrow[aria-expanded="true"]{background:var(--accent-weak)}
+  .rhead{cursor:default;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);padding-block:7px}
+  .rhead:hover{background:transparent}
+  .rname{font-family:var(--font-mono);font-weight:600;font-size:14px;display:flex;align-items:center;gap:7px;min-width:0}
+  .cellwrap{display:flex;flex-wrap:wrap;gap:5px;align-items:center;min-width:0}
+  .hopname{font-size:12.5px;color:var(--muted);margin-right:2px}
+  .ready{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .ready .bar{flex:1;height:5px;border-radius:3px;background:var(--panel-3);overflow:hidden;min-width:34px}
+  .ready .bar i{display:block;height:100%;background:var(--ok)}
+  .ready.part .bar i{background:var(--warn)}
+  .empty-l{padding:14px;color:var(--muted);font-size:14px}
+  /* scheme */
+  .board{position:relative;display:grid;grid-template-columns:minmax(200px,1fr) minmax(220px,1.05fr) minmax(200px,1fr);column-gap:64px;align-items:start}
+  .board svg.wires{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+  .bcol{display:flex;flex-direction:column;gap:10px;position:relative;z-index:1;min-width:0}
+  .bnode{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:8px 10px;transition:opacity .12s,border-color .12s}
+  .bnode h3{font-family:var(--font-mono);font-size:13.5px;display:flex;align-items:center;gap:6px}
+  .bnode .sub2{font-size:12px;color:var(--muted)}
+  .bnode .list{display:flex;flex-direction:column;gap:3px;margin-top:6px}
+  .bnode.route{cursor:pointer;border-width:1.5px;text-align:left;font:inherit;color:inherit;width:100%}
+  .bnode.route:hover,.bnode.route:focus-visible{border-color:var(--accent);outline:none}
+  .bnode.route .pp{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+  .bnode.route .warnl{color:var(--bad);font-size:12px;margin-top:4px}
+  .bnode.route .via{display:none;font-size:12px;color:var(--muted);margin-top:4px}
+  .board.focus .bnode:not(.hl){opacity:.35}
+  .wire{fill:none;stroke:var(--border-strong);stroke-width:2}
+  .wire.ok{stroke:color-mix(in srgb,var(--ok) 70%,transparent)}
+  .wire.bad{stroke:var(--bad);stroke-dasharray:5 5}
+  .wire.off{stroke-dasharray:2 5}
+  .board.focus .wire:not(.hl){opacity:.12}
+  .wire.hl{stroke-width:3}
+  .bnode.free{opacity:.75;border-style:dashed}
+  .colh{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:2px 2px 6px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:10px 2px 0}
+  .legend span{display:inline-flex;gap:6px;align-items:center}
+  .legend i{display:inline-block;width:22px;height:0;border-top:2px solid}
+  /* servers & pools */
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
+  .pcard{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px}
+  .pcard-h{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+  .pcard-h h3{font-size:14px;font-family:var(--font-mono)}
+  .pcard-h .for{font-size:12.5px;color:var(--muted)}
+  .srow{display:flex;align-items:center;gap:8px;padding:6px 12px;border-top:1px solid var(--border);font-size:13px;flex-wrap:wrap}
+  .pcard-h+.srow,.warnline+.srow{border-top:0}
+  .srow .meta{color:var(--muted);font-size:12px}
+  .srow .ctl{margin-left:auto;display:flex;gap:6px;align-items:center}
+  .prio{width:68px}
+  .tray{background:var(--panel);border:1px dashed var(--border-strong);border-radius:var(--radius-sm);padding:6px 0;margin-bottom:12px}
+  .tray .colh{padding:2px 12px 4px;margin:0}
+  .warnline{color:var(--bad);font-size:12.5px;padding:4px 12px}
+  /* ⋯ menu */
+  .more{position:relative;display:inline-block}
+  .more>summary{list-style:none;cursor:pointer;width:28px;height:26px;border-radius:7px;display:grid;place-items:center;color:var(--muted);border:1px solid var(--border)}
+  .more>summary::-webkit-details-marker{display:none}
+  .more>summary:hover,.more[open]>summary{color:var(--fg);background:var(--panel-2);border-color:var(--border-strong)}
+  .more .menu{position:absolute;right:0;top:30px;z-index:20;min-width:220px;background:var(--panel);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow);padding:4px}
+  .more .menu button,.more .menu a{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--fg);font:inherit;font-size:13px;padding:7px 10px;border-radius:7px;cursor:pointer;text-decoration:none}
+  .more .menu button:hover,.more .menu a:hover{background:var(--panel-2)}
+  .more .menu .danger{color:var(--bad)}
+  .more .menu hr{border:0;border-top:1px solid var(--border);margin:4px 0}
+  .more .menu .note{padding:6px 10px;font-size:12px;color:var(--muted)}
+  /* drawer */
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:30;opacity:0;pointer-events:none;transition:opacity .15s}
+  .scrim.on{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;bottom:0;width:min(580px,100vw);background:var(--panel);border-left:1px solid var(--border-strong);
+    z-index:31;transform:translateX(100%);visibility:hidden;transition:transform .18s ease-out,visibility .18s;display:flex;flex-direction:column;box-shadow:-20px 0 50px rgba(0,0,0,.25)}
+  .drawer.on{transform:none;visibility:visible}
+  .dr-h{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .dr-h h2{font-family:var(--font-mono);font-size:18px}
+  .dr-b{padding:12px 16px;overflow:auto;flex:1;display:flex;flex-direction:column;gap:16px}
+  .dr-sec h4{font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 6px;font-family:var(--font-display)}
+  .pathbox{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:8px;align-items:stretch}
+  .hopb{border:1px solid var(--border);border-radius:10px;padding:8px 10px;background:var(--panel-2);display:flex;flex-direction:column;gap:6px;min-width:0}
+  .hopb select{width:100%}
+  .hopb .lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  .hopb .list{display:flex;flex-direction:column;gap:3px}
+  .arrowc{align-self:center;color:var(--muted);font-size:18px}
+  .proto{border:1px solid var(--border);border-radius:10px;margin-bottom:8px}
+  .proto.absent{border-style:dashed}
+  .proto-h{display:flex;align-items:center;gap:8px;padding:7px 10px;flex-wrap:wrap}
+  .proto-h .addr{font-family:var(--font-mono);font-size:12.5px}
+  .proto-b{border-top:1px solid var(--border);padding:10px;display:flex;flex-direction:column;gap:10px;background:var(--panel-2);border-radius:0 0 10px 10px}
+  .iform{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+  .iform label{display:flex;flex-direction:column;gap:2px;font-size:12px;color:var(--muted)}
+  .iform .sub3{flex-basis:100%;font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  .switch{position:relative;width:34px;height:20px;border-radius:999px;background:var(--border-strong);border:0;cursor:pointer;flex:0 0 auto;padding:0}
+  .switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--panel);transition:left .12s}
+  .switch[aria-checked="true"]{background:var(--ok)}
+  .switch.paused{background:var(--warn)}
+  .switch[aria-checked="true"]::after{left:16px}
+  .switch:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .rdy{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .rdy li{display:flex;gap:9px;align-items:flex-start;padding:6px 10px;border-top:1px solid var(--border);font-size:13.5px}
+  .rdy li:first-child{border-top:0}
+  .rdy .mk{width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:11px;font-weight:700;flex:0 0 auto;margin-top:1px}
+  .mk.ok{background:var(--ok-bg);color:var(--ok)} .mk.no{background:var(--bad-bg);color:var(--bad)}
+  .rdy .t{flex:1}
+  .rdy .t small{display:block;color:var(--muted);font-size:12px}
+  .groups{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .groups label{flex-direction:row;align-items:center;gap:5px;border:1px solid var(--border);border-radius:999px;padding:3px 10px;font-size:13px;cursor:pointer;color:var(--fg)}
+  .dr-f{padding:10px 16px;border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap}
+  @media (max-width:900px){
+    .rrow{grid-template-columns:minmax(0,1fr) minmax(0,1fr);row-gap:6px}
+    .rhead{display:none}
+    .two{grid-template-columns:1fr}
+    .board{grid-template-columns:minmax(0,1fr);row-gap:14px}
+    .board svg.wires{display:none}
+    .bnode.route .via{display:block}
+  }
+  @media (max-width:620px){.attn-row .what{min-width:0;flex-basis:100%}}
+  @media (prefers-reduced-motion:reduce){.drawer,.scrim,.switch::after{transition:none}}
+</style>
+
+<div class="park">
+<div class="ph">
   <div>
     <h1>Парк</h1>
-    <div class="sub">Маршрут = гейт (вход, RU) + его выходы с общей идентичностью. Выход управляется и обслуживается <b>только через свой гейт</b>. Клиент дертит гейт, тот переключается между живыми выходами.</div>
+    <div class="state">{{ routes|length }} {{ 'маршрут' if routes|length % 10 == 1 and routes|length % 100 != 11 else ('маршрута' if routes|length % 10 in [2,3,4] and routes|length % 100 not in [12,13,14] else 'маршрутов') }}
+      · {% if broken %}<span class="bad">не работают: {{ broken|map(attribute='name')|join(', ') }}</span>{% elif routes %}все включённые работают{% else %}пока нет{% endif %}
+      {% if gates_total %} · гейтов отвечает из РФ: <b>{{ gates_live }} из {{ gates_total }}</b>{% endif %}</div>
   </div>
-  <button class="btn btn-primary" type="button" onclick="document.getElementById('dlg-route').showModal()">Создать маршрут</button>
+  <div class="row-actions">
+    <button class="btn btn-ghost btn-sm" type="button" onclick="addServer('', null, 'сервер')">+ Сервер</button>
+    <button class="btn btn-ghost btn-sm" type="button" onclick="document.getElementById('dlg-gatepool').showModal()">+ Пул гейтов</button>
+    <button class="btn btn-ghost btn-sm" type="button" onclick="document.getElementById('dlg-pool').showModal()">+ Пул выходов</button>
+    <button class="btn btn-primary btn-sm" type="button" onclick="document.getElementById('dlg-route').showModal()">Создать маршрут</button>
+  </div>
 </div>
 
 {% if test_result %}
@@ -16,136 +193,396 @@
     {% if test_result.detail %}<span class="muted">— {{ test_result.detail }}</span>{% endif %}</div>
 {% endif %}
 
-{% for r in routes %}
-<div class="panel">
-  <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-    <h2 style="margin:0">Маршрут «{{ r.name }}»
-      {% if r.enabled %}<span class="badge b-ok">включён</span>{% else %}<span class="badge b-exit">выключен</span>{% endif %}
-      {% if r.is_blocked %}<span class="badge b-bad" title="{{ r.block_reason }}">не работает</span>{% endif %}
-    </h2>
-    <div class="row-actions">
-      {% if r.gate_node and r.pool %}
-      <form method="post" action="/admin/routes/{{ r.id }}/provision_relay" onsubmit="return confirm('Поднять/обновить релей на {{ r.gate_node.name }}?')"{% if r.gate_node.job_running %} data-job-running="{{ r.gate_node.id }}"{% endif %}><button class="btn btn-sm"{% if r.gate_node.job_running %} disabled{% endif %}>{{ '⏳ релей…' if r.gate_node.job_running else 'Поднять релей' }}</button></form>
-      <form method="post" action="/admin/pools/{{ r.pool.id }}/reconcile"><button class="btn btn-ghost btn-sm">Синхронизировать</button></form>
-      {% endif %}
-      <form method="post" action="/admin/routes/{{ r.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Выключить' if r.enabled else 'Включить' }}</button></form>
-      <form method="post" action="/admin/routes/{{ r.id }}/delete" onsubmit="return confirm('Удалить маршрут «{{ r.name }}»? Устройства на нём останутся без маршрута.')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
+{# --------------------------------------------- what needs attention #}
+{% if attention %}
+{% set SHOW = 3 %}
+<div class="attn" aria-label="Требует внимания">
+  {% for a in attention %}
+  <div class="attn-row"{% if loop.index > SHOW %} data-extra hidden{% endif %}>
+    <span class="sev {{ a.sev }}"></span>
+    <div class="what">{% if a.name %}<b class="mono-s">{{ a.name }}</b> {% endif %}{{ a.text }}<small>{{ a.detail }}</small></div>
+    <div class="acts">{% for x in a.actions %}
+      {% if x.post %}<form method="post" action="{{ x.post }}"><button class="btn btn-xs {{ '' if loop.first else 'btn-ghost' }}">{{ x.label }}</button></form>
+      {% elif x.href %}<a class="btn btn-ghost btn-xs" href="{{ x.href }}">{{ x.label }}</a>
+      {% elif x.open %}<button class="btn btn-xs {{ '' if loop.first else 'btn-ghost' }}" type="button" data-route="{{ x.open }}">{{ x.label }}</button>
+      {% elif x.tab %}<button class="btn btn-xs {{ '' if loop.first else 'btn-ghost' }}" type="button" data-go-tab="{{ x.tab }}">{{ x.label }}</button>{% endif %}
+    {% endfor %}</div>
+  </div>
+  {% endfor %}
+  {% if attention|length > SHOW %}
+  <div class="attn-row attn-more"><button class="btn btn-ghost btn-xs" type="button" data-more-attn>Ещё {{ attention|length - SHOW }}: {% for a in attention[SHOW:] %}{{ a.name }} {{ a.text }}{{ ' · ' if not loop.last }}{% endfor %}</button></div>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="seg tabs" role="tablist" aria-label="Разделы парка">
+  <button role="tab" type="button" data-tab="routes" aria-selected="true">Маршруты <span class="n">{{ routes|length }}</span></button>
+  <button role="tab" type="button" data-tab="servers" aria-selected="false">Серверы и пулы {% if orphans %}<span class="n bad">{{ orphans|length }} без пула</span>{% endif %}</button>
+  <button role="tab" type="button" data-tab="dns" aria-selected="false">DNS и ключ парка</button>
+</div>
+
+{# ------------------------------------------------------------ routes #}
+<section id="tab-routes">
+  <div class="rtool">
+    <div class="seg seg-s" role="tablist" aria-label="Вид маршрутов">
+      <button role="tab" type="button" data-view="list" aria-selected="true">Список</button>
+      <button role="tab" type="button" data-view="scheme" aria-selected="false">Схема</button>
+    </div>
+    <span class="muted" id="viewhint" style="font-size:12.5px"></span>
+  </div>
+
+  <div class="rlist" id="rlist">
+    {% if routes %}
+    <div class="rrow rhead" aria-hidden="true"><span>Маршрут</span><span>Протоколы</span><span>Вход</span><span>Выходы</span><span>Устр.</span><span>Готовность</span></div>
+    {% endif %}
+    {% for r in routes %}
+    {% set h = health[r.id] %}{% set rd = ready[r.id] %}{% set okn = rd|selectattr('ok')|list|length %}
+    {% set busy = ((r.pool.members if r.pool else [])|selectattr('job_running')|list + r.gates|selectattr('job_running')|list)|first %}
+    <button type="button" class="rrow" data-route="{{ r.id }}" aria-expanded="false" title="{{ h.probs|join('; ') }}"{% if busy %} data-job-running="{{ busy.id }}"{% endif %}>
+      <span class="rname"><span class="sdot {{ h.state }}"></span>{{ r.name }}</span>
+      <span class="cellwrap">{% for rp in r.protos_sorted %}{{ ppill(rp) }}{% else %}<span class="muted">—</span>{% endfor %}</span>
+      <span class="cellwrap">{% if r.is_direct %}<span class="hopname">напрямую</span>{% else %}<span class="hopname">{{ r.gate_pool.name }}</span>{% for g in r.gates %}{{ gchip(g) }}{% else %}<span class="muted">нет гейтов</span>{% endfor %}{% endif %}</span>
+      <span class="cellwrap"><span class="hopname">{{ r.pool.name if r.pool else '—' }}</span>{% for n in (r.pool.members|sort(attribute='priority') if r.pool else []) %}{{ schip(n) }}{% else %}<span class="muted">нет серверов</span>{% endfor %}</span>
+      <span class="mono-s">{{ dev_total[r.id] }}</span>
+      <span class="ready {{ 'part' if okn < rd|length }}">{% if busy %}<span class="badge b-warn b-dot">⏳ применяется</span>{% else %}<span class="bar"><i style="width:{{ (100 * okn / rd|length)|round|int }}%"></i></span>{{ okn }}/{{ rd|length }}{% endif %}</span>
+    </button>
+    {% else %}
+    <div class="empty-l">Маршрутов нет. Добавьте серверы, разложите их по пулам («Серверы и пулы»), затем «Создать маршрут».</div>
+    {% endfor %}
+  </div>
+
+  <div id="schemeview" hidden>
+    <div class="board" id="board">
+      <svg class="wires" id="wires" aria-hidden="true"></svg>
+      <div class="bcol"><div class="colh">Пулы гейтов · RU</div>
+        {% for gp in scheme_gp %}{% set live = gp.gates|selectattr('id', 'in', live_ids)|list %}
+        <div class="bnode{{ ' free' if not gp.routes }}" id="bg-{{ gp.id }}">
+          <h3><span class="sdot {{ 'ok' if live else 'bad' }}"></span>{{ gp.name }}</h3>
+          <div class="sub2">{{ live|length }} из {{ gp.gates|length }} отвечают из РФ</div>
+          <div class="list">{% for g in gp.gates %}{{ gchip(g) }}{% endfor %}</div>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="bcol"><div class="colh">Маршруты</div>
+        {% for r in routes %}{% set h = health[r.id] %}
+        <button type="button" class="bnode route" data-route="{{ r.id }}" id="br-{{ r.id }}"
+                data-gp="{{ 'bg-' ~ r.gate_pool_id if r.gate_pool_id else '' }}" data-ep="{{ 'be-' ~ r.pool_id if r.pool_id else '' }}"
+                data-in="{{ 'ok' if h.live else 'bad' }}" data-out="{{ 'off' if not r.active_protocols else ('ok' if h.deployed else 'bad') }}">
+          <h3><span class="sdot {{ h.state }}"></span>{{ r.name }}</h3>
+          <div class="pp">{% for rp in r.protos_sorted %}{{ ppill(rp) }}{% endfor %}</div>
+          <div class="via">{{ 'напрямую' if r.is_direct else 'гейты «' ~ r.gate_pool.name ~ '»' }} → выходы «{{ r.pool.name if r.pool else '—' }}»</div>
+          {% if h.probs %}<div class="warnl">{{ h.probs[0] }}{% if h.probs|length > 1 %} · ещё {{ h.probs|length - 1 }}{% endif %}</div>{% endif %}
+        </button>
+        {% endfor %}
+      </div>
+      <div class="bcol"><div class="colh">Пулы выходов</div>
+        {% for p in scheme_ep %}{% set dep = p.members|selectattr('sync_state', 'equalto', 'synced')|list %}
+        <div class="bnode{{ ' free' if not p.routes }}" id="be-{{ p.id }}">
+          <h3><span class="sdot {{ 'ok' if dep else 'warn' }}"></span>{{ p.name }}</h3>
+          <div class="sub2">{% if p.routes %}развёрнуто {{ dep|length }} из {{ p.members|length }}{% else %}свободен — можно отдать маршруту{% endif %}</div>
+          <div class="list">{% for n in p.members|sort(attribute='priority') %}{{ schip(n) }}{% endfor %}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="legend">
+      <span><i style="border-color:color-mix(in srgb,var(--ok) 70%,transparent)"></i>путь работает</span>
+      <span><i style="border-color:var(--bad);border-top-style:dashed"></i>вход недоступен из РФ / нет развёрнутых выходов</span>
+      <span><i style="border-color:var(--border-strong);border-top-style:dotted"></i>все протоколы на паузе</span>
     </div>
   </div>
-  <div class="panel-b">
-    <div class="sub" style="margin-bottom:10px">Гейт: <b>{{ r.gate_node.name if r.gate_node else '— не задан' }}</b>{% if r.gate_node %} <span class="mono">{{ r.gate_node.public_host }}</span> {{ jobbadge(r.gate_node) }}{% endif %} · адрес для клиентов: <span class="mono">{{ r.host or '—' }}</span></div>
+</section>
 
-    <form method="post" action="/admin/routes/{{ r.id }}/groups" class="status-form" style="margin-bottom:10px;flex-wrap:wrap">
-      <span class="muted">Доступ (группы):</span>
-      {% if groups %}
-        {% for g in groups %}<label class="check" style="display:inline-flex"><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g in r.groups }}> {{ g.name }}</label>{% endfor %}
-        <button class="btn btn-ghost btn-sm">Сохранить доступ</button>
-      {% else %}<span class="muted">групп нет — вкладка «Пользователи»</span>{% endif %}
-      {% if not r.groups %}<span class="badge b-warn">без групп → никому</span>{% endif %}
-    </form>
-
-    <div class="tbl-wrap"><table>
-      <thead><tr><th>Выход</th><th>Хост</th><th>Приоритет</th><th>Синхр.</th><th></th></tr></thead>
-      <tbody>
-      {% if r.pool %}
-        {% for n in r.pool.members|sort(attribute='priority') %}
-        <tr{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
-          <td data-label="Выход"><div class="stack"><span class="cell-name">{{ n.name }}
-            {% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}
-            {{ jobbadge(n) }}
-          </span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
-          <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
-          <td data-label="Приоритет">
-            <form method="post" action="/admin/nodes/{{ n.id }}/priority" class="status-form">
-              <input name="priority" type="number" value="{{ n.priority }}" style="width:68px" title="меньше = предпочтительнее">
-              <button class="btn btn-ghost btn-sm">OK</button>
-            </form>
-          </td>
-          <td data-label="Синхр.">
-            <a href="/admin/monitor" title="Подробности и история — в мониторинге">
-            {% if n.sync_state == 'synced' %}<span class="badge b-ok b-dot">синхрон</span>
-            {% elif n.sync_state == 'unreachable' %}<span class="badge b-bad b-dot">недоступен</span>
-            {% elif n.sync_state == 'drifted' %}<span class="badge b-warn b-dot">рассинхрон</span>
-            {% else %}<span class="badge b-warn b-dot">ожидает</span>{% endif %}</a>
-            <small class="muted">AWG :{{ n.awg_port }} · 3x-ui {{ '✓' if n.has_xui else '—' }}</small>
-          </td>
-          <td data-label="Действия" class="full"><div class="row-actions">
-            <form method="post" action="/admin/nodes/{{ n.id }}/provision" onsubmit="return confirm('Развернуть {{ n.name }} как клон пула (3x-ui + AmneziaWG + TG-прокси + харденинг)? Несколько минут, идёт в фоне.')"><button class="btn btn-sm"{% if n.job_running %} disabled{% endif %}>{{ '⏳ идёт…' if n.job_running else ('Переразвернуть' if n.has_xui else 'Развернуть') }}</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/test" onsubmit="return confirm('Подключиться к {{ n.name }} НАПРЯМУЮ, в обход гейта?\n\nВидимое соединение Хаб→выход. Только для диагностики.')"><input type="hidden" name="direct" value="1"><button class="btn btn-ghost btn-sm btn-danger">Напрямую ⚠</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/pool" onsubmit="return confirm('Убрать {{ n.name }} из маршрута (в «неразобранные»)?')"><input type="hidden" name="pool_id" value=""><button class="btn btn-ghost btn-sm">Убрать</button></form>
-            <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить ноду {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
-          </div></td>
-        </tr>
-        {% else %}
-        <tr><td class="full muted">Выходов нет — добавьте.</td></tr>
-        {% endfor %}
-      {% endif %}
-      </tbody>
-    </table></div>
-    {% if r.pool %}<div style="margin-top:10px"><button class="btn btn-ghost btn-sm" type="button" onclick="addServer('exit', {{ r.pool.id }}, 'выход в маршрут «{{ r.name }}»')">+ Добавить выход</button></div>{% endif %}
-  </div>
-</div>
-{% else %}
-  <div class="panel"><div class="panel-b"><span class="muted">Маршрутов нет. Нужен хотя бы один gate-сервер (добавьте ниже), затем «Создать маршрут».</span></div></div>
-{% endfor %}
-
-<div class="panel">
-  <div class="panel-h" style="display:flex;justify-content:space-between;align-items:center">
-    <h2 style="margin:0">Не привязанные серверы</h2>
-    <button class="btn btn-ghost btn-sm" type="button" onclick="addServer('', null, 'сервер')">+ Добавить сервер</button>
-  </div>
-  <div class="tbl-wrap"><table>
-    <thead><tr><th>Имя</th><th>Роль</th><th>Хост</th><th></th></tr></thead>
-    <tbody>
+{# ---------------------------------------------------- servers & pools #}
+<section id="tab-servers" hidden>
+  {% if orphans %}
+  <div class="tray">
+    <div class="colh">Не в пулах — разложите</div>
     {% for n in orphans %}
-      <tr{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
-        <td data-label="Имя"><div class="stack"><span class="cell-name">{{ n.name }}</span><small>{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}</small></div></td>
-        <td data-label="Роль"><span class="badge {{ 'b-gate' if n.is_gate else 'b-exit' }}">{{ 'gate' if n.is_gate else 'exit' }}</span>
-          {% if n.key_installed %}<span class="badge b-ok b-dot" title="панель управляет по ключу парка">🔑 ключ</span>{% else %}<span class="badge b-warn b-dot" title="пока по паролю — ключ встанет при раскатке">🔒 пароль</span>{% endif %}
-          {{ jobbadge(n) }}</td>
-        <td data-label="Хост"><span class="mono">{{ n.public_host }}</span></td>
-        <td data-label="Действия" class="full"><div class="row-actions">
-          {% if not n.is_gate %}
-          <form method="post" action="/admin/nodes/{{ n.id }}/pool" class="status-form">
-            <select name="pool_id"><option value="">— в маршрут…</option>{% for r in routes %}{% if r.pool %}<option value="{{ r.pool.id }}">{{ r.name }}</option>{% endif %}{% endfor %}</select>
-            <button class="btn btn-ghost btn-sm">Привязать</button>
-          </form>
-          {% else %}<span class="muted">используйте как гейт в «Создать маршрут»</span>{% endif %}
-          <form method="post" action="/admin/nodes/{{ n.id }}/test"><button class="btn btn-ghost btn-sm">Проверить</button></form>
-          <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить {{ n.name }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
-        </div></td>
-      </tr>
-    {% else %}
-      <tr><td class="full muted">Нет неразобранных серверов.</td></tr>
+    <div class="srow"{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
+      <span class="badge {{ 'b-gate' if n.is_gate else 'b-exit' }}">{{ 'гейт' if n.is_gate else 'выход' }}</span>
+      <span class="srv" title="{{ n.ssh_username }}@{{ n.ssh_host }}:{{ n.ssh_port }}">{{ n.name }}</span>
+      <span class="meta mono-s">{{ n.public_host }}</span> {{ keybadge(n) }} {{ jobbadge(n) }}
+      <div class="ctl">
+        {% if n.is_gate %}
+          {% if gate_pools %}<form method="post" action="/admin/nodes/{{ n.id }}/gate_pool" class="status-form">
+            <select name="gate_pool_id" aria-label="Пул гейтов">{% for gp in gate_pools %}<option value="{{ gp.id }}">в «{{ gp.name }}»</option>{% endfor %}</select>
+            <button class="btn btn-xs">Добавить в пул</button></form>
+          {% else %}<span class="meta">сначала «+ Пул гейтов»</span>{% endif %}
+        {% else %}
+          {% if exit_pools %}<form method="post" action="/admin/nodes/{{ n.id }}/pool" class="status-form">
+            <select name="pool_id" aria-label="Пул выходов">{% for p in exit_pools %}<option value="{{ p.id }}">в «{{ p.name }}»</option>{% endfor %}</select>
+            <button class="btn btn-xs">Добавить в пул</button></form>
+          {% else %}<span class="meta">сначала «+ Пул выходов»</span>{% endif %}
+        {% endif %}
+        {% call more() %}
+          <form method="post" action="/admin/nodes/{{ n.id }}/test"><button>Проверить SSH</button></form><hr>
+          <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить {{ n.name }}?')"><button class="danger">Удалить сервер</button></form>
+        {% endcall %}
+      </div>
+    </div>
     {% endfor %}
-    </tbody>
-  </table></div>
-</div>
-
-<div class="panel">
-  <div class="panel-h"><h2 style="margin:0">Ключ парка</h2></div>
-  <div class="panel-b">
-    <div class="sub" style="margin-bottom:8px">Один SSH-ключ, которым панель управляет всеми нодами. Приватная часть хранится на Хабе (в БД, зашифровано) и наружу не отдаётся. Публичную часть панель сама ставит на ноду при раскатке; её же можно вставить при создании VM, тогда пароль root не понадобится вовсе.</div>
-    <div class="sub">Отпечаток: <span class="mono">{{ fleet_fp }}</span></div>
-    <label style="margin-top:8px">Публичный ключ (для <span class="mono">authorized_keys</span> / вставки при создании VM)
-      <textarea id="fleet-pub" readonly rows="2" class="mono" style="width:100%;resize:vertical">{{ fleet_pub }}</textarea>
-    </label>
-    <button class="btn btn-ghost btn-sm" type="button" onclick="navigator.clipboard.writeText(document.getElementById('fleet-pub').value); this.innerText='Скопировано ✓'">Скопировать публичный ключ</button>
   </div>
+  {% endif %}
+
+  <div class="two">
+    <div>
+      <div class="colh">Пулы гейтов · RU <button class="btn btn-ghost btn-xs" type="button" onclick="document.getElementById('dlg-gatepool').showModal()">+ Пул гейтов</button></div>
+      {% for gp in gate_pools %}{% set gbusy = gp.gates|selectattr('job_running')|list %}
+      <div class="pcard">
+        <div class="pcard-h">
+          <h3>{{ gp.name }}</h3>
+          <span class="for">{% if gp.routes %}→ {{ gp.routes|map(attribute='name')|join(', ') }}{% else %}не используется{% endif %}</span>
+          <span class="grow"></span>
+          {% if free_gates %}<form method="post" action="/admin/gatepools/{{ gp.id }}/gates" class="status-form">
+            <select name="gate_id" aria-label="Свободный гейт">{% for g in free_gates %}<option value="{{ g.id }}">{{ g.name }}</option>{% endfor %}</select>
+            <button class="btn btn-ghost btn-xs">+ Гейт</button></form>{% endif %}
+          {% call more() %}
+            {% if gp.routes and gp.gates and not gate_pool_problems.get(gp.id) %}<form method="post" action="/admin/gatepools/{{ gp.id }}/relay" onsubmit="return confirm('Пересобрать релей на всех гейтах пула «{{ gp.name }}»?')"><button{% if gbusy %} disabled{% endif %}>Пересобрать релей</button></form><hr>{% endif %}
+            <form method="post" action="/admin/gatepools/{{ gp.id }}/delete" onsubmit="return confirm('Удалить пул гейтов «{{ gp.name }}»? Гейты станут непривязанными.')"><button class="danger"{% if gp.routes %} disabled title="используется маршрутами"{% endif %}>Удалить пул</button></form>
+          {% endcall %}
+        </div>
+        {% if gate_pool_problems.get(gp.id) %}<div class="warnline">Релей не собрать: {{ gate_pool_problems[gp.id] }}</div>{% endif %}
+        {% for g in gp.gates %}{% set st = gst.get(g.id, {}) %}
+        <div class="srow"{% if g.job_running %} data-job-running="{{ g.id }}"{% endif %}>
+          {{ gchip(g) }}<span class="meta mono-s">{{ g.public_host }}</span>
+          <span class="meta">{% if not st.get('probed') %}журнал ещё не проверял{% elif st.live %}{% if st.clients is not none %}{{ st.clients }} клиент.{% else %}отвечает{% endif %}{% else %}не отвечает из РФ{% if st.since %} с {{ st.since }}{% endif %}{% endif %}</span>
+          {{ keybadge(g) }} {{ jobbadge(g) }}
+          <div class="ctl">
+            <form method="post" action="/admin/nodes/{{ g.id }}/priority" class="status-form" title="приоритет: меньше — через этот гейт панель управляет выходами в первую очередь">
+              <input name="priority" type="number" value="{{ g.priority }}" class="prio" aria-label="Приоритет"><button class="btn btn-ghost btn-xs">OK</button></form>
+            {% call more() %}
+              <form method="post" action="/admin/nodes/{{ g.id }}/test"><button>Проверить SSH</button></form>
+              <form method="post" action="/admin/nodes/{{ g.id }}/gate_pool" onsubmit="return confirm('Убрать {{ g.name }} из пула «{{ gp.name }}»?')"><input type="hidden" name="gate_pool_id" value=""><button>Убрать из пула</button></form><hr>
+              <form method="post" action="/admin/nodes/{{ g.id }}/delete" onsubmit="return confirm('Удалить гейт {{ g.name }}?')"><button class="danger">Удалить сервер</button></form>
+            {% endcall %}
+          </div>
+        </div>
+        {% else %}<div class="srow meta">Гейтов нет — «+ Гейт» или «Добавить в пул» у сервера без пула.</div>{% endfor %}
+      </div>
+      {% else %}<div class="pcard"><div class="srow meta">Пулов гейтов нет — «+ Пул гейтов».</div></div>{% endfor %}
+    </div>
+
+    <div>
+      <div class="colh">Пулы выходов <button class="btn btn-ghost btn-xs" type="button" onclick="document.getElementById('dlg-pool').showModal()">+ Пул выходов</button></div>
+      {% for p in exit_pools %}
+      <div class="pcard">
+        <div class="pcard-h">
+          <h3>{{ p.name }}</h3>
+          <span class="for">{% if p.routes %}→ {{ p.routes|map(attribute='name')|join(', ') }}{% else %}<span class="badge b-warn">свободен</span>{% endif %}</span>
+          {% for pr in p.protocols %}<span class="pill {{ pr }}">{{ protocol_labels[pr] }}</span>{% endfor %}
+          <span class="grow"></span>
+          <button class="btn btn-ghost btn-xs" type="button" onclick="addServer('exit', {{ p.id }}, 'выход в пул «{{ p.name }}»')">+ Выход</button>
+          {% call more() %}
+            <div class="note">Порты на серверах: VLESS {{ p.vless_port }} · AWG UDP {{ p.awg_port }}</div><hr>
+            <form method="post" action="/admin/pools/{{ p.id }}/delete" onsubmit="return confirm('Удалить пул «{{ p.name }}»? Его серверы станут непривязанными.')"><button class="danger"{% if p.routes %} disabled title="используется маршрутом"{% endif %}>Удалить пул</button></form>
+          {% endcall %}
+        </div>
+        {% for n in p.members|sort(attribute='priority') %}
+        <div class="srow"{% if n.job_running %} data-job-running="{{ n.id }}"{% endif %}>
+          {{ schip(n) }}<span class="meta mono-s">{{ n.public_host }}</span>
+          <span class="meta">{% if n.sync_state == 'synced' %}развёрнут{% elif n.sync_state == 'unreachable' %}недоступен{% elif n.sync_state == 'drifted' %}рассинхрон{% else %}не развёрнут{% endif %}{% if n.has_xui or n.key_installed %} · AWG :{{ n.awg_port }} · 3x-ui {{ '✓' if n.has_xui else '—' }}{% endif %}</span>
+          {{ keybadge(n) }} {{ jobbadge(n) }}
+          <div class="ctl">
+            <form method="post" action="/admin/nodes/{{ n.id }}/priority" class="status-form" title="приоритет: меньше — основной, остальные — резерв">
+              <input name="priority" type="number" value="{{ n.priority }}" class="prio" aria-label="Приоритет"><button class="btn btn-ghost btn-xs">OK</button></form>
+            {% call more() %}
+              <form method="post" action="/admin/nodes/{{ n.id }}/test"><button>Проверить через гейт</button></form>
+              <form method="post" action="/admin/nodes/{{ n.id }}/test" onsubmit="return confirm('Подключиться к {{ n.name }} НАПРЯМУЮ, в обход гейта?\n\nВидимое соединение Хаб→выход. Только для диагностики.')"><input type="hidden" name="direct" value="1"><button>Проверить напрямую ⚠</button></form>
+              <form method="post" action="/admin/nodes/{{ n.id }}/pool" onsubmit="return confirm('Убрать {{ n.name }} из пула «{{ p.name }}»?')"><input type="hidden" name="pool_id" value=""><button>Убрать из пула</button></form><hr>
+              <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить сервер {{ n.name }}?')"><button class="danger">Удалить сервер</button></form>
+            {% endcall %}
+          </div>
+        </div>
+        {% else %}<div class="srow meta">Пусто — «+ Выход» или «Добавить в пул» у сервера без пула.</div>{% endfor %}
+      </div>
+      {% else %}<div class="pcard"><div class="srow meta">Пулов выходов нет — «+ Пул выходов».</div></div>{% endfor %}
+    </div>
+  </div>
+</section>
+
+{# ------------------------------------------------------ DNS & fleet key #}
+<section id="tab-dns" hidden>
+  <div class="two">
+    <div>
+      <div class="colh">DNS-провайдеры <button class="btn btn-ghost btn-xs" type="button" onclick="document.getElementById('dlg-dns').showModal()">+ DNS-провайдер</button></div>
+      <div class="pcard">
+        <div class="srow meta" style="border-top:0">Зона с API-доступом: панель держит A-записи имён протоколов маршрутов на живых входах; для NaiveProxy через неё же выпускается сертификат.</div>
+        {% for d in dns_providers %}
+        <div class="srow"><b>{{ d.name }}</b><span class="badge b-exit">{{ d.kind }}</span><span class="mono-s muted">{{ d.zone }}</span>
+          <div class="ctl">{% call more() %}<form method="post" action="/admin/dns/{{ d.id }}/delete" onsubmit="return confirm('Удалить DNS-провайдер {{ d.name }}? Записи в зоне останутся.')"><button class="danger">Удалить</button></form>{% endcall %}</div></div>
+        {% else %}<div class="srow meta">Провайдеров нет.</div>{% endfor %}
+      </div>
+    </div>
+    <div>
+      <div class="colh">Ключ парка</div>
+      <div class="pcard"><div class="srow" style="flex-direction:column;align-items:stretch;border-top:0">
+        <span class="meta">Один SSH-ключ, которым панель управляет всеми серверами; приватная часть — на Хабе (в БД, зашифровано). Публичную часть панель ставит на сервер при раскатке; её же можно вставить при создании VM — тогда пароль root не нужен. Отпечаток <span class="mono-s">{{ fleet_fp }}</span>.</span>
+        <textarea id="fleet-pub" readonly rows="2" class="mono" style="width:100%;resize:vertical">{{ fleet_pub }}</textarea>
+        <button class="btn btn-ghost btn-xs" type="button" style="align-self:flex-start" onclick="navigator.clipboard.writeText(document.getElementById('fleet-pub').value); this.innerText='Скопировано ✓'">Скопировать публичный ключ</button>
+      </div></div>
+    </div>
+  </div>
+</section>
 </div>
 
+{# ------------------------------------------- route cards (drawer bodies) #}
+{% for r in routes %}
+{% set h = health[r.id] %}{% set p = r.pool %}
+{% set rbusy = ((p.members if p else [])|selectattr('job_running')|list + r.gates|selectattr('job_running')|list) %}
+<template id="rt-{{ r.id }}">
+  <div class="dr-h">
+    <h2>{{ r.name }}</h2><span class="badge {{ state_badge[h.state] }}">{{ state_word[h.state] }}</span>
+    <span class="grow"></span>
+    <form method="post" action="/admin/routes/{{ r.id }}/apply" onsubmit="return confirm('Применить «{{ r.name }}»: поставить протоколы маршрута на его выходы (новые серверы разворачиваются, работающие только дополняются — ничего не переустанавливается) и пересобрать релей на гейтах?')">
+      <button class="btn btn-primary btn-xs"{% if rbusy %} disabled{% endif %}>{{ '⏳ применяется…' if rbusy else 'Применить' }}</button></form>
+    <button class="iconbtn" type="button" data-close aria-label="Закрыть" style="width:30px;height:30px">✕</button>
+  </div>
+  <div class="dr-b">
+    {% if h.probs %}<div class="flash flash-error" style="margin:0">{{ h.probs|join(' · ') }}</div>{% endif %}
+
+    <section class="dr-sec"><h4>Путь клиента</h4>
+      <div class="pathbox">
+        <div class="hopb"><span class="lbl">Вход</span>
+          <form method="post" action="/admin/routes/{{ r.id }}/entry">
+            <select name="entry" aria-label="Вход" data-orig="{{ 'gatepool:' ~ r.gate_pool_id if r.gate_pool_id else 'direct' }}"
+                    data-confirm="Сменить вход маршрута «{{ r.name }}»? Конфиги клиентов не меняются (имена в DNS переедут на новые гейты); затем — «Применить».">
+              {% for gp in gate_pools %}<option value="gatepool:{{ gp.id }}" {{ 'selected' if gp.id == r.gate_pool_id }}>гейты «{{ gp.name }}»</option>{% endfor %}
+              <option value="direct" {{ 'selected' if r.is_direct }}>напрямую</option>
+            </select></form>
+          <div class="list">{% for g in r.gates %}{{ gchip(g) }}{% else %}{% if r.is_direct %}<span class="muted" style="font-size:12.5px">клиенты идут на серверы пула</span>{% else %}<span class="muted">в пуле нет гейтов</span>{% endif %}{% endfor %}</div>
+        </div>
+        <span class="arrowc">→</span>
+        <div class="hopb"><span class="lbl">Выходы</span>
+          <form method="post" action="/admin/routes/{{ r.id }}/pool">
+            <select name="pool_id" aria-label="Пул выходов" data-orig="{{ r.pool_id or '' }}"
+                    data-confirm="Перевести «{{ r.name }}» на другой пул выходов? У нового пула свои ключи: одиночные VLESS-ссылки и AWG-конфиги устройств маршрута изменятся (подписки обновятся сами). Обычно проще переложить серверы между пулами. Затем — «Применить».">
+              {% if p %}<option value="{{ p.id }}" selected>пул «{{ p.name }}»</option>{% endif %}
+              {% for ep in free_exit_pools %}<option value="{{ ep.id }}">пул «{{ ep.name }}» (свободен)</option>{% endfor %}
+            </select></form>
+          <div class="list">{% for n in (p.members|sort(attribute='priority') if p else []) %}{{ schip(n) }}{% else %}<span class="muted">в пуле нет серверов</span>{% endfor %}</div>
+        </div>
+      </div>
+      {% if r.gate_pool_id and gate_pool_problems.get(r.gate_pool_id) %}<div class="warnline" style="padding:6px 0 0">Релей не собрать: {{ gate_pool_problems[r.gate_pool_id] }}</div>{% endif %}
+    </section>
+
+    <section class="dr-sec"><h4>Протоколы</h4>
+      {% for pr in protocols %}
+      {% set rp = r.proto(pr) %}{% set nd = dev_counts.get((r.id, pr), 0) %}
+      {% set lbl = protocol_labels[pr] %}
+      {% if rp %}{% set ds = dns_states.get(rp.id) %}{% set nc = naive_certs.get(rp.id) %}{% endif %}
+      <div class="proto{{ '' if rp else ' absent' }}">
+        <div class="proto-h">
+          <form method="post" action="/admin/routes/{{ r.id }}/protos/{{ pr }}/toggle"
+                onsubmit="return confirm('{% if not rp %}Включить {{ lbl }} на «{{ r.name }}»? Затем задайте адрес и нажмите «Применить» — протокол встанет на серверы.{% elif not rp.enabled %}Снова включить {{ lbl }} на «{{ r.name }}»? Учётки вернутся на серверы, гейт снова пропустит протокол.{% elif nd %}Выключить {{ lbl }} на «{{ r.name }}»? На нём {{ nd }} устр. — протокол встанет на паузу: конфиги сохранятся и заработают после включения.{% else %}Выключить {{ lbl }} на «{{ r.name }}»? Устройств на нём нет.{% endif %}')">
+            <button class="switch{{ ' paused' if rp and not rp.enabled }}" role="switch" aria-checked="{{ 'true' if rp and rp.enabled else 'false' }}" aria-label="{{ lbl }}: {{ 'включён' if rp and rp.enabled else ('на паузе' if rp else 'выключен') }}"></button></form>
+          {% if rp %}{{ ppill(rp) }}{% else %}<span class="pill none">{{ lbl }}</span>{% endif %}
+          {% if rp and p %}{% if pr == 'vless' %}<span class="muted" style="font-size:12px">{{ p.vless_transport|upper }}</span>{% elif pr == 'awg' %}<span class="muted" style="font-size:12px">{{ p.awg_version }}</span>{% endif %}{% endif %}
+          <span class="grow"></span>
+          {% if rp %}
+            <span class="addr">{{ rp.host or '—' }}:{{ rp.port }}</span>
+            {% if rp.dns_provider %}{% if ds and ds.error %}<span class="badge b-bad" title="{{ ds.error }}">DNS ✗</span>{% elif ds and ds.ips %}<span class="badge b-ok" title="{{ ds.ips|join(', ') }} · {{ ds.at }}">DNS ✓</span>{% else %}<span class="badge b-warn">DNS …</span>{% endif %}{% endif %}
+            {% if pr == 'naive' %}{% if nc %}<span class="badge b-ok" title="до {{ nc.not_after.strftime('%d.%m.%Y') }}">серт. ✓</span>{% else %}<span class="badge b-warn">нет серт.</span>{% endif %}{% endif %}
+            <span class="muted" style="font-size:12px">{{ nd }} устр.</span>
+            <button class="btn btn-ghost btn-xs" type="button" data-tog="pb-{{ r.id }}-{{ pr }}">Изменить</button>
+          {% else %}<span class="muted" style="font-size:12.5px">выключен{% if nd %} · {{ nd }} устр.{% endif %}</span>{% endif %}
+        </div>
+        {% if rp %}
+        <div class="proto-b" id="pb-{{ r.id }}-{{ pr }}" hidden>
+          <form method="post" action="/admin/routes/{{ r.id }}/protos/{{ pr }}/address" class="iform">
+            <span class="sub3">Адрес для клиентов</span>
+            <label style="flex:1;min-width:200px">Имя хоста <input name="client_host" value="{{ rp.client_host }}" placeholder="{{ 'обязательно для NaiveProxy' if pr == 'naive' else 'пусто = IP первого входа' }}"></label>
+            <label>Порт <input name="client_port" type="number" value="{{ rp.client_port or '' }}" style="width:84px" placeholder="сервера"{% if r.is_direct %} disabled title="у прямого маршрута — порт сервера"{% endif %}></label>
+            <label>DNS-синхронизация
+              <select name="dns_provider_id"><option value="">— не вести</option>{% for d in dns_providers %}<option value="{{ d.id }}" {{ 'selected' if d.id == rp.dns_provider_id }}>{{ d.name }} ({{ d.zone }})</option>{% endfor %}</select></label>
+            <button class="btn btn-xs">Сохранить адрес</button>
+            {% if ds and ds.error %}<span class="warnline" style="padding:0;flex-basis:100%">Ошибка DNS: {{ ds.error }}</span>{% elif ds and ds.ips %}<small class="muted" style="flex-basis:100%">В DNS сейчас: {{ ds.ips|join(', ') }}</small>{% endif %}
+          </form>
+          {% if pr == 'vless' and p %}
+          <form method="post" action="/admin/pools/{{ p.id }}/vless" class="iform"
+                onsubmit="return confirm('Это часть клиентских конфигов: после смены — «Применить» и перевыпуск VLESS-конфигов маршрута. Продолжить?')">
+            <span class="sub3">Настройки VLESS</span>
+            <label>Транспорт
+              <select name="transport">
+                <option value="xhttp" {{ 'selected' if p.vless_transport == 'xhttp' }}>XHTTP + Reality</option>
+                <option value="tcp" {{ 'selected' if p.vless_transport == 'tcp' }}>TCP + Reality + Vision (старый)</option>
+              </select></label>
+            <label>Путь XHTTP <input name="xhttp_path" value="{{ p.xhttp_path }}" style="width:110px" placeholder="/случайный"></label>
+            <label style="flex:1;min-width:180px">Сайт-маска (host:port) <input name="reality_target" value="{{ p.reality_target }}" placeholder="{{ p.reality_dest }}"></label>
+            <label style="flex-basis:100%">SNI, на которые отвечает сервер (через пробел; удобно — сайт «по соседству» с гейтом)
+              <input name="reality_names" class="mono" value="{{ p.reality_names_json|replace('[','')|replace(']','')|replace('"','')|replace(',', ' ') }}" placeholder="по умолчанию из шаблона"></label>
+            <button class="btn btn-xs">Сохранить VLESS</button>
+            <small class="muted" style="flex-basis:100%">Сейчас: {{ p.vless_transport|upper }}{% if p.vless_transport == 'xhttp' %} {{ p.xhttp_path }}{% endif %} · маска {{ p.reality_dest }} · SNI в конфигах {{ p.reality_sni }}</small>
+          </form>
+          {% endif %}
+          {% if pr == 'naive' %}
+          <form method="post" action="/admin/routes/{{ r.id }}/cert" class="iform">
+            <span class="sub3">Сертификат</span>
+            <span class="muted" style="font-size:12.5px;flex:1">{% if nc %}действует до {{ nc.not_after.strftime('%d.%m.%Y') }}; {% endif %}выпускается на Хабе через DNS-01 (провайдер выше), продлевается сам за 30 дней до конца.</span>
+            <button class="btn btn-xs">{{ 'Перевыпустить' if nc else 'Выпустить' }} сертификат</button>
+          </form>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+      <small class="muted">Выключение протокола, на котором есть устройства, ставит его на паузу — конфиги сохраняются.</small>
+    </section>
+
+    <section class="dr-sec"><h4>Готовность</h4>
+      <ul class="rdy">{% for s in ready[r.id] %}
+        <li><span class="mk {{ 'ok' if s.ok else 'no' }}">{{ '✓' if s.ok else '!' }}</span><span class="t">{{ s.t }}<small>{{ s.d }}</small></span></li>
+      {% endfor %}</ul>
+    </section>
+
+    <section class="dr-sec"><h4>Доступ</h4>
+      <form method="post" action="/admin/routes/{{ r.id }}/groups" class="groups">
+        {% if groups %}
+          {% for g in groups %}<label><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g in r.groups }}> {{ g.name }}</label>{% endfor %}
+          <button class="btn btn-ghost btn-xs">Сохранить доступ</button>
+        {% else %}<span class="muted">Групп нет — вкладка «Пользователи».</span>{% endif %}
+      </form>
+    </section>
+  </div>
+  <div class="dr-f">
+    <form method="post" action="/admin/routes/{{ r.id }}/reconcile"><button class="btn btn-ghost btn-xs" title="Сверить учётки клиентов на выходах с панелью">Синхронизировать учётки</button></form>
+    <form method="post" action="/admin/routes/{{ r.id }}/toggle"><button class="btn btn-ghost btn-xs">{{ 'Выключить маршрут' if r.enabled else 'Включить маршрут' }}</button></form>
+    <span class="grow"></span>
+    <form method="post" action="/admin/routes/{{ r.id }}/delete" onsubmit="return confirm('Удалить маршрут «{{ r.name }}»? Устройства на нём останутся без маршрута; пулы и серверы останутся.')"><button class="btn btn-ghost btn-xs btn-danger">Удалить маршрут</button></form>
+  </div>
+</template>
+{% endfor %}
+<div class="scrim" id="scrim"></div>
+<aside class="drawer park" id="drawer" role="dialog" aria-modal="true" aria-label="Маршрут"></aside>
+
+{# ----------------------------------------------------------- dialogs #}
 <dialog id="dlg-route">
   <form method="post" action="/admin/park/route">
     <h2 style="margin:0 0 12px">Новый маршрут</h2>
     <div style="display:flex;flex-direction:column;gap:12px">
-      <label>Имя <input name="name" required placeholder="eu"></label>
-      <label>Гейт (вход)
-        <select name="gate_id" required>
-          {% for g in free_gates %}<option value="{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% else %}<option value="" disabled selected>нет свободных gate — добавьте сервер с ролью gate</option>{% endfor %}
+      <label>Имя <input name="name" required placeholder="eu-1"></label>
+      <label>Вход
+        <select name="entry" required>
+          {% if gate_pools %}<optgroup label="Пул гейтов">{% for gp in gate_pools %}<option value="gatepool:{{ gp.id }}">«{{ gp.name }}» ({{ gp.gates|length }} гейт.){% if gp.routes %} · уже обслуживает: {{ gp.routes|map(attribute='name')|join(', ') }}{% endif %}</option>{% endfor %}</optgroup>{% endif %}
+          {% if free_gates %}<optgroup label="Свободный гейт (станет новым пулом)">{% for g in free_gates %}<option value="gate:{{ g.id }}">{{ g.name }} · {{ g.public_host }}</option>{% endfor %}</optgroup>{% endif %}
+          <option value="direct">Напрямую, без гейтов</option>
         </select>
       </label>
-      <details><summary class="muted">Дополнительно</summary>
+      <label>Выходы
+        <select name="pool_id">
+          {% for ep in free_exit_pools %}<option value="{{ ep.id }}">пул «{{ ep.name }}» ({{ ep.members|length }} серв.)</option>{% endfor %}
+          <option value="">новый пустой пул (серверы добавите после)</option>
+        </select>
+        <small class="muted">Только свободные пулы: пул выходов принадлежит одному маршруту.</small>
+      </label>
+      <fieldset style="border:0;padding:0;margin:0"><legend>Протоколы</legend>
+        {% for pr in protocols %}<label class="check" style="display:inline-flex;margin-right:12px"><input type="checkbox" name="protocols" value="{{ pr }}"> {{ protocol_labels[pr] }}</label>{% endfor %}
+        <small class="muted" style="display:block">Остальные можно включить потом в карточке маршрута.</small>
+      </fieldset>
+      <label>Порт для клиентов <input name="client_port" type="number" value="443">
+        <small class="muted">Через гейт: VLESS и NaiveProxy — TCP (гейт разводит их по SNI), AmneziaWG — UDP. У прямого маршрута не используется (клиенты идут на порт сервера).</small>
+      </label>
+      <details><summary class="muted">Порты на серверах (для нового пула)</summary>
         <div style="display:flex;gap:12px;margin-top:8px">
           <label>VLESS порт <input name="vless_port" type="number" value="17771"></label>
           <label>AWG порт <input name="awg_port" type="number" value="17772"></label>
@@ -156,18 +593,60 @@
   </form>
 </dialog>
 
+<dialog id="dlg-gatepool">
+  <form method="post" action="/admin/gatepools">
+    <h2 style="margin:0 0 12px">Новый пул гейтов</h2>
+    <label>Имя <input name="name" required placeholder="ru-a"></label>
+    <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Создать</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-pool">
+  <form method="post" action="/admin/pools">
+    <h2 style="margin:0 0 12px">Новый пул выходов</h2>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label>Имя <input name="name" required placeholder="eu"></label>
+      <details><summary class="muted">Порты на серверах</summary>
+        <div style="display:flex;gap:12px;margin-top:8px">
+          <label>VLESS порт <input name="vless_port" type="number" value="17771"></label>
+          <label>AWG порт <input name="awg_port" type="number" value="17772"></label>
+        </div>
+        <small class="muted">У прямого маршрута клиенты подключаются на эти порты (для AWG на UDP 443 задайте 443).</small>
+      </details>
+    </div>
+    <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Создать</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-dns">
+  <form method="post" action="/admin/dns">
+    <h2 style="margin:0 0 12px">Новый DNS-провайдер</h2>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label>Имя <input name="name" required placeholder="gates"></label>
+      <label>Тип
+        <select name="kind">{% for k in dns_kinds %}<option value="{{ k }}">{{ {'cloudflare':'Cloudflare','desec':'deSEC','dynv6':'dynv6'}.get(k, k) }}</option>{% endfor %}</select>
+      </label>
+      <label>Зона <input name="zone" required placeholder="example.dedyn.io"></label>
+      <label>API-токен <input name="token" type="password" required autocomplete="off">
+        <small class="muted">Хранится в БД зашифрованным. Права — только на эту зону (Cloudflare: «Edit zone DNS»).</small>
+      </label>
+    </div>
+    <div class="dev-actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Добавить</button> <button class="btn btn-ghost" type="button" onclick="this.closest('dialog').close()">Отмена</button></div>
+  </form>
+</dialog>
+
 <dialog id="dlg-server">
   <form method="post" action="/admin/nodes">
     <input type="hidden" name="pool_id" id="srv-pool" value="">
     <h2 style="margin:0 0 12px" id="srv-title">Добавить сервер</h2>
     <div style="display:flex;flex-direction:column;gap:12px">
-      <label>Имя <input name="name" required placeholder="vespn-exit-de-1 / vespn-gate-ru-1"></label>
+      <label>Имя <input name="name" required placeholder="exit-de-1 / gate-ru-1"></label>
       <label id="srv-role-wrap">Роль
-        <select name="role" id="srv-role"><option value="exit">exit — выход (зарубеж)</option><option value="gate">gate — вход/релей (RU)</option></select>
+        <select name="role" id="srv-role"><option value="exit">выход (за рубежом)</option><option value="gate">гейт (вход в RU)</option></select>
       </label>
       <label>Публичный IP (для клиентов) <input name="public_host" required placeholder="203.0.113.10"></label>
       <label>SSH пароль (root) <input name="ssh_password" type="password" placeholder="пароль root — только для первичной раскатки">
-        <small class="muted">Нужен лишь для первого коннекта: при раскатке панель поставит на ноду <b>ключ парка</b> и дальше ходит по ключу. Можно оставить пустым, если ключ парка уже на ноде (напр. вставлен при создании VM).</small>
+        <small class="muted">Нужен лишь для первого подключения: при раскатке панель поставит на сервер <b>ключ парка</b> и дальше ходит по ключу. Можно оставить пустым, если ключ парка уже на сервере (вставлен при создании VM).</small>
       </label>
       <details><summary class="muted">Дополнительно</summary>
         <div style="display:flex;flex-direction:column;gap:12px;margin-top:8px">
@@ -195,26 +674,126 @@ function addServer(role, poolId, title){
   d.showModal();
 }
 
-// Auto-refresh «Парк» while a background rollout is running: poll the status
-// endpoint and reload once a node that was running finishes, so its result badge
-// (and the flash) appear without a manual refresh.
 (function(){
-  var running = Array.prototype.map.call(
-    document.querySelectorAll('[data-job-running]'),
-    function(e){ return parseInt(e.getAttribute('data-job-running'), 10); }
-  ).filter(function(v){ return !isNaN(v); });
-  if(!running.length) return;
-  var iv = setInterval(function(){
-    fetch('/admin/park/status', {headers:{'Accept':'application/json'}, credentials:'same-origin'})
-      .then(function(r){ return r.ok ? r.json() : null; })
-      .then(function(d){
-        if(!d) return;
-        var still = d.running || [];
-        var finished = running.some(function(id){ return still.indexOf(id) < 0; });
-        if(finished){ clearInterval(iv); location.reload(); }
-      })
-      .catch(function(){});
-  }, 5000);
+  // Per-browser memory: open tab, routes view, open route card (survives the
+  // reload after a form post, so the admin stays where they were).
+  function get(store, k, d){ try { return store.getItem(k) || d; } catch(e) { return d; } }
+  function put(store, k, v){ try { if (v == null) store.removeItem(k); else store.setItem(k, v); } catch(e) {} }
+  var L = window.localStorage, S = window.sessionStorage;
+
+  /* tabs */
+  function showTab(name){
+    document.querySelectorAll('[data-tab]').forEach(function(b){ b.setAttribute('aria-selected', b.getAttribute('data-tab') === name ? 'true' : 'false'); });
+    ['routes','servers','dns'].forEach(function(t){ document.getElementById('tab-' + t).hidden = t !== name; });
+    put(L, 'vespn.park.tab', name);
+    if (name === 'routes' && !document.getElementById('schemeview').hidden) draw();
+  }
+  document.querySelectorAll('[data-tab]').forEach(function(b){ b.addEventListener('click', function(){ showTab(b.getAttribute('data-tab')); }); });
+
+  /* list / scheme */
+  var board = document.getElementById('board'), svg = document.getElementById('wires');
+  function curve(a, b){ var mx = (a.x + b.x) / 2; return 'M' + a.x + ',' + a.y + ' C' + mx + ',' + a.y + ' ' + mx + ',' + b.y + ' ' + b.x + ',' + b.y; }
+  function draw(){
+    if (!board || board.offsetParent === null) return;
+    var o = board.getBoundingClientRect(), out = [];
+    function P(el, side){ var b = el.getBoundingClientRect(); return {x: (side === 'r' ? b.right : b.left) - o.left, y: b.top - o.top + Math.min(24, b.height / 2)}; }
+    document.querySelectorAll('.bnode.route').forEach(function(n){
+      var id = n.getAttribute('data-route'), g = n.getAttribute('data-gp'), e = n.getAttribute('data-ep');
+      if (g && document.getElementById(g)) out.push('<path class="wire ' + n.getAttribute('data-in') + '" data-for="' + id + '" d="' + curve(P(document.getElementById(g), 'r'), P(n, 'l')) + '"/>');
+      if (e && document.getElementById(e)) out.push('<path class="wire ' + n.getAttribute('data-out') + '" data-for="' + id + '" d="' + curve(P(n, 'r'), P(document.getElementById(e), 'l')) + '"/>');
+    });
+    svg.innerHTML = out.join('');
+  }
+  function focus(n){
+    board.classList.toggle('focus', !!n);
+    document.querySelectorAll('.bnode, .wire').forEach(function(x){ x.classList.remove('hl'); });
+    if (!n) return;
+    n.classList.add('hl');
+    [n.getAttribute('data-gp'), n.getAttribute('data-ep')].forEach(function(id){ var el = id && document.getElementById(id); if (el) el.classList.add('hl'); });
+    document.querySelectorAll('.wire[data-for="' + n.getAttribute('data-route') + '"]').forEach(function(w){ w.classList.add('hl'); });
+  }
+  document.querySelectorAll('.bnode.route').forEach(function(n){
+    ['mouseenter','focus'].forEach(function(ev){ n.addEventListener(ev, function(){ focus(n); }); });
+    ['mouseleave','blur'].forEach(function(ev){ n.addEventListener(ev, function(){ focus(null); }); });
+  });
+  function setView(v){
+    document.querySelectorAll('[data-view]').forEach(function(x){ x.setAttribute('aria-selected', x.getAttribute('data-view') === v ? 'true' : 'false'); });
+    document.getElementById('rlist').hidden = v !== 'list';
+    document.getElementById('schemeview').hidden = v !== 'scheme';
+    document.getElementById('viewhint').textContent = v === 'scheme'
+      ? 'Наведите на маршрут — подсветится его путь; нажмите — откроется карточка.'
+      : 'Нажмите на маршрут — откроется карточка.';
+    put(L, 'vespn.park.view', v);
+    if (v === 'scheme') draw();
+  }
+  document.querySelectorAll('[data-view]').forEach(function(x){ x.addEventListener('click', function(){ setView(x.getAttribute('data-view')); }); });
+  window.addEventListener('resize', draw);
+  if (document.fonts) document.fonts.ready.then(draw);
+
+  /* route card (drawer) */
+  var drawer = document.getElementById('drawer'), scrim = document.getElementById('scrim'), lastFocus = null;
+  function openRoute(id){
+    var t = document.getElementById('rt-' + id);
+    if (!t) { put(S, 'vespn.park.route', null); return; }
+    lastFocus = document.activeElement;
+    drawer.innerHTML = '';
+    drawer.appendChild(t.content.cloneNode(true));
+    drawer.classList.add('on'); scrim.classList.add('on');
+    document.querySelectorAll('.rrow[data-route]').forEach(function(b){ b.setAttribute('aria-expanded', b.getAttribute('data-route') === String(id) ? 'true' : 'false'); });
+    put(S, 'vespn.park.route', String(id));
+    var c = drawer.querySelector('[data-close]'); if (c) c.focus();
+  }
+  function closeRoute(){
+    drawer.classList.remove('on'); scrim.classList.remove('on');
+    document.querySelectorAll('.rrow[data-route]').forEach(function(b){ b.setAttribute('aria-expanded', 'false'); });
+    put(S, 'vespn.park.route', null);
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+  }
+  scrim.addEventListener('click', closeRoute);
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape' && drawer.classList.contains('on')) closeRoute(); });
+
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    var r = t.closest('[data-route]');
+    if (r && !drawer.contains(r)) { openRoute(r.getAttribute('data-route')); return; }
+    if (t.closest('[data-close]')) { closeRoute(); return; }
+    var tg = t.closest('[data-tog]');
+    if (tg) { var el = document.getElementById(tg.getAttribute('data-tog')); if (el) el.hidden = !el.hidden; return; }
+    var gt = t.closest('[data-go-tab]');
+    if (gt) { showTab(gt.getAttribute('data-go-tab')); return; }
+    if (t.closest('[data-more-attn]')) {
+      document.querySelectorAll('[data-extra]').forEach(function(x){ x.hidden = false; });
+      t.closest('.attn-row').remove(); return;
+    }
+    document.querySelectorAll('details.more[open]').forEach(function(d){ if (!d.contains(t)) d.open = false; });
+  });
+  // big switches (entry / exit pool) inside the card: confirm, else put the old value back
+  document.addEventListener('change', function(e){
+    var s = e.target;
+    if (!s.matches || !s.matches('select[data-confirm]')) return;
+    if (confirm(s.getAttribute('data-confirm'))) s.form.submit(); else s.value = s.getAttribute('data-orig');
+  });
+
+  showTab(get(L, 'vespn.park.tab', 'routes'));
+  setView(get(L, 'vespn.park.view', 'list'));
+  var keep = get(S, 'vespn.park.route', null);
+  if (keep) openRoute(keep);
+
+  // Auto-refresh while a background rollout runs: reload once a running node
+  // finishes, so its result (and the flash) appear without a manual refresh.
+  var running = Array.prototype.map.call(document.querySelectorAll('[data-job-running]'),
+    function(e){ return parseInt(e.getAttribute('data-job-running'), 10); }).filter(function(v){ return !isNaN(v); });
+  if (running.length) {
+    var iv = setInterval(function(){
+      fetch('/admin/park/status', {headers:{'Accept':'application/json'}, credentials:'same-origin'})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){
+          if (!d) return;
+          var still = d.running || [];
+          if (running.some(function(id){ return still.indexOf(id) < 0; })) { clearInterval(iv); location.reload(); }
+        }).catch(function(){});
+    }, 5000);
+  }
 })();
 </script>
 {% endblock %}

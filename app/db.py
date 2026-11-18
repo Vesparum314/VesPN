@@ -56,6 +56,8 @@ def init_db() -> None:
     _rebuild_changed_tables()
     Base.metadata.create_all(bind=engine)
     _add_columns()
+    _migrate_route_gates()
+    _migrate_route_protocols()
     _reset_orphaned_jobs()
     _seed_default_group()
     _migrate_announcement()
@@ -154,6 +156,101 @@ def _add_columns() -> None:
                 )
         if "created_by" not in cols("users"):
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN created_by INTEGER")
+        # Gate pools, per-protocol routes, client host/port per route, subscriptions.
+        if "gate_pool_id" not in cols("nodes"):
+            conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN gate_pool_id INTEGER")
+        rcols = cols("routes")
+        if "protocol" not in rcols:
+            # '' = legacy route serving VLESS + AmneziaWG, which is what existing ones do.
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN protocol VARCHAR(16) NOT NULL DEFAULT ''")
+        if "gate_pool_id" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN gate_pool_id INTEGER")
+        if "client_host" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN client_host VARCHAR(255) NOT NULL DEFAULT ''")
+        if "client_port" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN client_port INTEGER")
+        if "dns_provider_id" not in rcols:
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN dns_provider_id INTEGER")
+        if "sub_token" not in cols("devices"):
+            # SQLite can't ADD a UNIQUE column — add it, then the same unique index
+            # create_all builds on a fresh DB (NULLs don't collide).
+            conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN sub_token VARCHAR(64)")
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_devices_sub_token ON devices (sub_token)"
+            )
+        if "secret_enc" not in cols("issued_configs"):
+            conn.exec_driver_sql("ALTER TABLE issued_configs ADD COLUMN secret_enc VARCHAR(512)")
+        # VLESS transport + Reality masquerade per server pool. Existing pools keep
+        # TCP+Vision (their issued configs say so); new pools get XHTTP.
+        pcols = cols("exit_pools")
+        if "vless_transport" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN vless_transport VARCHAR(16) NOT NULL DEFAULT 'tcp'")
+        if "xhttp_path" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN xhttp_path VARCHAR(64) NOT NULL DEFAULT ''")
+        if "reality_target" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN reality_target VARCHAR(255) NOT NULL DEFAULT ''")
+        if "reality_names_json" not in pcols:
+            conn.exec_driver_sql("ALTER TABLE exit_pools ADD COLUMN reality_names_json TEXT NOT NULL DEFAULT '[]'")
+
+
+def _migrate_route_gates() -> None:
+    """One-time: routes used to point at ONE gate node (`routes.gate_id`). Move each
+    such gate into a gate pool (reusing the pool if the gate is already in one) and
+    point the route at that pool. `gate_id` stays in old tables, unused."""
+    with engine.begin() as conn:
+        rcols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(routes)")]
+        if "gate_id" not in rcols:
+            return  # fresh DB: never had single-gate routes
+        rows = conn.exec_driver_sql(
+            "SELECT r.id, r.gate_id, n.name, n.gate_pool_id FROM routes r "
+            "JOIN nodes n ON n.id = r.gate_id "
+            "WHERE r.gate_id IS NOT NULL AND r.gate_pool_id IS NULL"
+        ).fetchall()
+        for route_id, gate_id, gate_name, gate_pool_id in rows:
+            if gate_pool_id is None:
+                # The gate may have been pooled by an earlier row of this loop.
+                gate_pool_id = conn.exec_driver_sql(
+                    "SELECT gate_pool_id FROM nodes WHERE id = :g", {"g": gate_id}
+                ).fetchone()[0]
+            if gate_pool_id is None:
+                name, n = gate_name, 1
+                while conn.exec_driver_sql(
+                    "SELECT 1 FROM gate_pools WHERE name = :n", {"n": name}
+                ).fetchone():
+                    n += 1
+                    name = f"{gate_name}-{n}"
+                conn.exec_driver_sql("INSERT INTO gate_pools (name) VALUES (:n)", {"n": name})
+                gate_pool_id = conn.exec_driver_sql(
+                    "SELECT id FROM gate_pools WHERE name = :n", {"n": name}
+                ).fetchone()[0]
+                conn.exec_driver_sql(
+                    "UPDATE nodes SET gate_pool_id = :p WHERE id = :g", {"p": gate_pool_id, "g": gate_id}
+                )
+            conn.exec_driver_sql(
+                "UPDATE routes SET gate_pool_id = :p WHERE id = :r", {"p": gate_pool_id, "r": route_id}
+            )
+
+
+def _migrate_route_protocols() -> None:
+    """One-time per route: protocols moved from `routes.protocol` (one per route,
+    '' = legacy VLESS + AmneziaWG) with one address per route into
+    `route_protocols` (several per route, an address each). A legacy route gets
+    VLESS and AWG with no own port (its configs carry the pool ports). Migrated
+    routes are marked `protocol = '*'` (new routes are created with it)."""
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT id, protocol, client_host, client_port, dns_provider_id FROM routes "
+            "WHERE protocol != '*'"
+        ).fetchall()
+        for rid, proto, host, port, dns_id in rows:
+            protos = ["vless", "awg"] if not proto else [proto]
+            for p in protos:
+                conn.exec_driver_sql(
+                    "INSERT INTO route_protocols (route_id, protocol, enabled, client_host, "
+                    "client_port, dns_provider_id) VALUES (:r, :p, 1, :h, :port, :d)",
+                    {"r": rid, "p": p, "h": host or "", "port": port if proto else None, "d": dns_id},
+                )
+            conn.exec_driver_sql("UPDATE routes SET protocol = '*' WHERE id = :r", {"r": rid})
 
 
 def _reset_orphaned_jobs() -> None:

@@ -4,22 +4,55 @@
 <a class="back" href="/">← К устройствам</a>
 <div class="head">
   <div>
-    <h1>{{ device.name }} <span class="badge b-{{ device.protocol }}" style="vertical-align:middle">{{ 'VLESS' if device.protocol == 'vless' else 'AmneziaWG' }}</span></h1>
+    <h1>{{ device.name }} <span class="badge b-{{ device.protocol }}" style="vertical-align:middle">{{ {'vless':'VLESS','awg':'AmneziaWG','naive':'NaiveProxy'}.get(device.protocol, device.protocol) }}</span></h1>
   </div>
 </div>
 
+{% if paused %}
+  <div class="flash flash-info">Этот протокол на маршруте временно приостановлен — конфиг сохранён и заработает снова после включения, перевыпускать ничего не нужно.</div>
+{% endif %}
 {% if error %}
   <div class="flash flash-error">{{ error }}</div>
 {% elif cfg %}
+  {% if sub %}
+  <div class="panel"><div class="panel-b">
+    <h2 style="margin:0 0 .5rem">Подписка — рекомендуется</h2>
+    <div class="cfg">
+      <div class="qr"><img src="{{ sub_qr }}" alt="QR подписки" width="200" height="200"></div>
+      <div style="min-width:0">
+        <ol class="steps">
+          {% if is_naive %}
+          <li>Приложение <b>Karing</b> (Android, iPhone, Mac, Windows) → добавить <b>подписку</b> по ссылке или QR.</li>
+          <li>Karing сам выбирает рабочий вход (группа «auto») и переключается, если какой-то заблокируют; панель сама добавляет новые входы и убирает неработающие.</li>
+          {% else %}
+          <li>Приложение (<b>v2rayNG</b> на Android, <b>OneXray</b> на iPhone/Mac/Windows) → добавить <b>подписку</b> (Subscription / «+ из URL») — отсканируйте QR или вставьте ссылку.</li>
+          <li>Обновите подписку и выберите сервер «… · авто». Если он перестал работать — выберите другой из списка или обновите подписку: панель сама убирает неработающие входы и добавляет новые.</li>
+          {% endif %}
+        </ol>
+        <code class="payload" id="sub_payload">{{ sub }}</code>
+        <div class="dev-actions">
+          <button class="btn btn-primary btn-sm" type="button" onclick="copyText('sub_payload', this)">Копировать ссылку</button>
+          <form method="post" action="/devices/{{ device.id }}/sub/rotate" onsubmit="return confirm('Перевыпустить ссылку подписки? Старая перестанет работать — её придётся заменить в приложении.')" style="display:inline"><button class="btn btn-ghost btn-sm">Перевыпустить ссылку</button></form>
+        </div>
+        {% if sub_items %}<details style="margin-top:8px"><summary class="muted">Что в подписке ({{ sub_items|length }})</summary>
+          <ul style="margin:6px 0 0 18px">{% for i in sub_items %}<li>{{ i.label }} — <span class="mono">{{ i.host }}:{{ i.port }}</span></li>{% endfor %}</ul>
+        </details>{% endif %}
+      </div>
+    </div>
+  </div></div>
+  <h2 style="margin:18px 0 .5rem">Или одной ссылкой</h2>
+  {% endif %}
   <div class="panel"><div class="panel-b">
     <div class="cfg">
       <div class="qr"><img src="{{ qr }}" alt="QR" width="200" height="200"></div>
       <div style="min-width:0">
         <ol class="steps">
           {% if is_awg %}
-            <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.</li>
+            <li><b>Android / ПК:</b> приложение <b>AmneziaVPN</b> → <b>+</b> → «Активировать по ссылке/QR»: отсканируйте QR или вставьте строку <code>vpn://</code>. <b>Для iPhone</b> — блок ниже.{% if route and route.pool and route.pool.awg_version == '3.1' %} Нужна версия приложения <b>5.0.1.5 или новее</b> (протокол AmneziaWG 3.1).{% endif %}</li>
+          {% elif is_naive %}
+            <li>Приложение <b>Karing</b> или <b>NekoBox</b> (Android) → добавить из буфера или по QR (ссылка <code>naive+https://</code>). Держите приложение обновлённым: устаревшая версия Chromium внутри — сама по себе заметный признак.</li>
           {% else %}
-            <li>Приложение (v2rayNG, Hiddify, Streisand, NekoBox…) → добавить из буфера или по QR.</li>
+            <li>Приложение (v2rayNG, OneXray…) → добавить из буфера или по QR. Одна ссылка = один вход: если его заблокируют, подписка выше переживёт это сама, а ссылку придётся взять заново.</li>
           {% endif %}
           <li>Готово — включите в приложении. Если перестанет работать, просто переоткройте эту страницу и получите конфиг заново.</li>
         </ol>
