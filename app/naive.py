@@ -29,7 +29,7 @@ from urllib.parse import quote
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .models import PROTO_NAIVE, ExitPool, NaiveCert, Route
+from .models import PROTO_NAIVE, ExitPool, NaiveCert, RouteProto
 from .node_ssh import SSHNode
 from .provisioning import ProvisionError, _put_file, install_docker
 
@@ -87,20 +87,22 @@ def needs_cert(db: Session, domain: str) -> bool:
     return exp - datetime.now(timezone.utc) < RENEW_BEFORE
 
 
-def ensure_cert(db: Session, route: Route, force: bool = False) -> NaiveCert:
-    """The route's certificate, issuing/renewing it on the Hub if missing or due."""
+def ensure_cert(db: Session, rp: RouteProto, force: bool = False) -> NaiveCert:
+    """Certificate of a route's NaiveProxy hostname (`rp` = the route's NaiveProxy
+    protocol), issuing/renewing it on the Hub if missing or due."""
     from . import acme
 
-    domain = (route.client_host or "").lower()
+    name = rp.route.name
+    domain = (rp.client_host or "").lower()
     if not domain:
-        raise ProvisionError(f"у маршрута «{route.name}» нет имени хоста — не на что выпускать сертификат")
-    if route.dns_provider is None:
+        raise ProvisionError(f"у NaiveProxy маршрута «{name}» нет имени хоста — не на что выпускать сертификат")
+    if rp.dns_provider is None:
         raise ProvisionError(
-            f"у маршрута «{route.name}» не выбран DNS-провайдер — сертификат выпускается через DNS-01"
+            f"у NaiveProxy маршрута «{name}» не выбран DNS-провайдер — сертификат выпускается через DNS-01"
         )
     if not force and not needs_cert(db, domain):
         return cert_for(db, domain)
-    cert_pem, key_pem = acme.issue(db, route.dns_provider, domain)
+    cert_pem, key_pem = acme.issue(db, rp.dns_provider, domain)
     row = cert_for(db, domain) or NaiveCert(domain=domain, cert_pem="", key_enc="",
                                             not_after=datetime.now(timezone.utc))
     row.cert_pem = cert_pem
@@ -113,8 +115,14 @@ def ensure_cert(db: Session, route: Route, force: bool = False) -> NaiveCert:
 
 
 # --- desired state ------------------------------------------------------
-def pool_routes(pool: ExitPool) -> list[Route]:
-    return [r for r in pool.routes if r.protocol == PROTO_NAIVE and r.client_host]
+def pool_routes(pool: ExitPool) -> list[RouteProto]:
+    """NaiveProxy protocols (with a hostname) of the routes on the pool."""
+    out = []
+    for r in pool.routes:
+        rp = r.proto(PROTO_NAIVE)
+        if rp is not None and rp.client_host:
+            out.append(rp)
+    return out
 
 
 def pool_users(db: Session, pool: ExitPool, exclude: set[int] | None = None) -> list[tuple[str, str]]:
@@ -279,14 +287,14 @@ def push_pool(db: Session, pool: ExitPool, exclude: set[int] | None = None) -> t
 def renew_all(db: Session) -> list[str]:
     """Daily: renew certificates that are due and push them. Returns messages."""
     msgs = []
-    for r in db.query(Route).filter(Route.protocol == PROTO_NAIVE).all():
-        if not r.client_host or r.dns_provider is None or r.pool is None:
+    for r in db.query(RouteProto).filter(RouteProto.protocol == PROTO_NAIVE).all():
+        if not r.client_host or r.dns_provider is None or r.route.pool is None:
             continue
         if not needs_cert(db, r.client_host):
             continue
         try:
             ensure_cert(db, r)
-            ok, errs = push_pool(db, r.pool)
+            ok, errs = push_pool(db, r.route.pool)
             msgs.append(f"{r.client_host}: сертификат обновлён, разослан на {ok} серв."
                         + (f"; ошибки: {'; '.join(errs)}" if errs else ""))
         except Exception as e:

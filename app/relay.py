@@ -73,18 +73,18 @@ def route_services(route) -> list[Service]:
         return []
     group = str(pool.id)
     out: list[Service] = []
-    for proto in route.protocols:
+    for proto in route.active_protocols:  # a paused protocol isn't forwarded
+        rp = route.proto(proto)
+        own = int(rp.client_port) if rp.client_port else None
         if proto == "vless":
-            port = route.client_port if (route.client_port and not route.is_legacy) else pool.vless_port
-            out.append(Service(route.name, "tcp", int(port), group, int(pool.vless_port),
+            out.append(Service(route.name, "tcp", own or int(pool.vless_port), group, int(pool.vless_port),
                                list(getattr(pool, "reality_names", None) or reality_server_names())))
         elif proto == "awg":
-            port = route.client_port if (route.client_port and not route.is_legacy) else pool.awg_port
-            out.append(Service(route.name, "udp", int(port), group, int(pool.awg_port)))
+            out.append(Service(route.name, "udp", own or int(pool.awg_port), group, int(pool.awg_port)))
         elif proto == "naive":
-            port = route.client_port or DEFAULT_NAIVE_CLIENT_PORT
-            sni = [route.client_host.lower()] if route.client_host else []
-            out.append(Service(route.name, "tcp", int(port), group, NAIVE_SERVER_PORT, sni))
+            sni = [rp.client_host.lower()] if rp.client_host else []
+            out.append(Service(route.name, "tcp", own or DEFAULT_NAIVE_CLIENT_PORT, group,
+                               NAIVE_SERVER_PORT, sni))
     return out
 
 

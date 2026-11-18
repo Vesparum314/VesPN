@@ -97,7 +97,7 @@ def _routes_for(db: Session, device: Device) -> list[Route]:
     from .pool import user_proto_routes
 
     proto = device.protocol
-    routes = [r for r in user_proto_routes(db, device.user, proto) if not r.is_blocked]
+    routes = [r for r in user_proto_routes(db, device.user, proto) if not r.proto_block_reason(proto)]
     own = device.route
     if own is not None and own.serves(proto) and own.pool is not None:
         routes = [own] + [r for r in routes if r.id != own.id]
@@ -121,9 +121,10 @@ def entries(db: Session, device: Device) -> list[dict]:
     out: list[dict] = []
     for r in _routes_for(db, device):
         port = r.port_for(proto)
+        name = r.proto(proto).client_host
         hosts: list[tuple[str, str]] = []
-        if r.client_host:
-            hosts.append(("авто", r.client_host))
+        if name:
+            hosts.append(("авто", name))
         for i, n in enumerate(r.entry_points, 1):
             if n.public_host and all(n.public_host != h for _, h in hosts):
                 hosts.append((str(i), n.public_host))
@@ -134,9 +135,9 @@ def entries(db: Session, device: Device) -> list[dict]:
                 item["uuid"] = cfg.uuid
                 item["link"] = vless_link(r.pool, cfg.uuid, host, port, label)
             else:
-                item.update(user=cfg.identifier, password=cfg.secret, sni=r.client_host,
+                item.update(user=cfg.identifier, password=cfg.secret, sni=name,
                             link=naive.link(cfg.identifier, cfg.secret, host, port, label)
-                            if host == r.client_host else None)
+                            if host == name else None)
             out.append(item)
     return out
 

@@ -8,6 +8,9 @@
   </div>
 </div>
 
+{% if paused %}
+  <div class="flash flash-info">Этот протокол на маршруте временно приостановлен — конфиг сохранён и заработает снова после включения, перевыпускать ничего не нужно.</div>
+{% endif %}
 {% if error %}
   <div class="flash flash-error">{{ error }}</div>
 {% elif cfg %}

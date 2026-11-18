@@ -1,8 +1,9 @@
 """Keep a route's client hostname pointed at its live entry points.
 
-A route may carry `client_host` (the name in client configs) and a DNS provider
-for the zone that name lives in. After every gate-journal cycle the panel puts
-the IPs of the route's LIVE entry points into the name's A records — the gates of
+Each protocol of a route may carry `client_host` (the name in client configs)
+and a DNS provider for the zone that name lives in. After every gate-journal
+cycle the panel puts the IPs of the route's LIVE entry points into the name's
+A records — the gates of
 its gate pool that the Hub still reaches, or (direct route) the pool's synced
 servers. A banned gate thus drops out of DNS on its own and a new one comes in,
 and clients (whose config only names the host) follow without a new config.
@@ -23,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from sqlalchemy.orm import Session
 
-from .models import DNS_CLOUDFLARE, DNS_DESEC, DNS_DYNV6, DnsProvider, Route, Setting
+from .models import DNS_CLOUDFLARE, DNS_DESEC, DNS_DYNV6, DnsProvider, Route, RouteProto, Setting
 
 log = logging.getLogger("vpnpanel.dns")
 
@@ -204,35 +205,36 @@ def wanted_ips(route: Route, live_gates: set[int]) -> list[str]:
     return sorted({n.public_host for n in pick if _is_ipv4(n.public_host)})
 
 
-def _state_key(route_id: int) -> str:
-    return f"dns_route_{route_id}"
+def _state_key(rp_id: int) -> str:
+    return f"dns_rp_{rp_id}"
 
 
-def get_state(db: Session, route_id: int) -> dict:
-    s = db.get(Setting, _state_key(route_id))
+def get_state(db: Session, rp_id: int) -> dict:
+    """Last push for one route protocol's hostname: {"ips", "at", "error"}."""
+    s = db.get(Setting, _state_key(rp_id))
     try:
         return json.loads(s.value) if s and s.value else {}
     except ValueError:
         return {}
 
 
-def _put_state(db: Session, route_id: int, state: dict) -> None:
-    s = db.get(Setting, _state_key(route_id))
+def _put_state(db: Session, rp_id: int, state: dict) -> None:
+    s = db.get(Setting, _state_key(rp_id))
     if s is None:
-        db.add(Setting(key=_state_key(route_id), value=json.dumps(state)))
+        db.add(Setting(key=_state_key(rp_id), value=json.dumps(state)))
     else:
         s.value = json.dumps(state)
     db.commit()
 
 
-def sync_route(db: Session, route: Route, live_gates: set[int], force: bool = False) -> dict:
-    """Push the route's wanted A records if they changed (or force). Returns the
-    stored state: {"ips", "at", "error"}."""
-    p = route.dns_provider
-    if p is None or not route.client_host:
+def sync_proto(db: Session, rp: RouteProto, live_gates: set[int], force: bool = False) -> dict:
+    """Push the wanted A records of one route protocol's hostname if they changed
+    (or force). Returns the stored state: {"ips", "at", "error"}."""
+    p = rp.dns_provider
+    if p is None or not rp.client_host:
         return {}
-    ips = wanted_ips(route, live_gates)
-    st = get_state(db, route.id)
+    ips = wanted_ips(rp.route, live_gates)
+    st = get_state(db, rp.id)
     now = datetime.now(timezone.utc)
     fresh = False
     try:
@@ -242,17 +244,23 @@ def sync_route(db: Session, route: Route, live_gates: set[int], force: bool = Fa
     if not force and st.get("ips") == ips and not st.get("error") and fresh:
         return st
     try:
-        set_a_records(p, route.client_host, ips)
+        set_a_records(p, rp.client_host, ips)
         st = {"ips": ips, "at": now.isoformat(timespec="seconds"), "error": ""}
-        log.info("dns: %s -> %s", route.client_host, ", ".join(ips))
+        log.info("dns: %s -> %s", rp.client_host, ", ".join(ips))
     except Exception as e:
         st = {"ips": st.get("ips", []), "at": st.get("at", ""), "error": str(e)[:300],
               "tried": now.isoformat(timespec="seconds")}
-        log.warning("dns: %s failed: %s", route.client_host, e)
-    _put_state(db, route.id, st)
+        log.warning("dns: %s failed: %s", rp.client_host, e)
+    _put_state(db, rp.id, st)
     return st
 
 
+def sync_route(db: Session, route: Route, live_gates: set[int], force: bool = False) -> dict:
+    """Sync every protocol hostname of the route; {protocol: state}."""
+    return {rp.protocol: sync_proto(db, rp, live_gates, force) for rp in route.protos_sorted
+            if rp.dns_provider_id and rp.client_host}
+
+
 def sync_routes(db: Session, live_gates: set[int]) -> None:
-    for r in db.query(Route).filter(Route.dns_provider_id.isnot(None)).all():
-        sync_route(db, r, live_gates)
+    for rp in db.query(RouteProto).filter(RouteProto.dns_provider_id.isnot(None)).all():
+        sync_proto(db, rp, live_gates)

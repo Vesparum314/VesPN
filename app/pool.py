@@ -176,7 +176,11 @@ def pool_proto_configs(db: Session, pool: ExitPool, proto: str) -> list[IssuedCo
     """Accounts of `proto` that must exist on `pool`'s servers: configs issued on
     the pool, plus those of devices whose owner may use some `proto` route on it
     (they reach it through their subscription). A user who loses access to all of
-    the pool's routes drops out — reconcile then removes the account."""
+    the pool's routes drops out — reconcile then removes the account. A protocol
+    paused on the pool's route has no accounts at all (they come back on resume)."""
+    carrying = [r for r in pool.routes if r.has(proto)]
+    if carrying and not any(r.serves(proto) for r in carrying):
+        return []  # paused: the servers drop its accounts, the configs stay in the DB
     routes = [r for r in pool.routes if r.enabled and r.serves(proto)]
     out = []
     for c in db.query(IssuedConfig).filter(IssuedConfig.protocol == proto).all():
@@ -475,14 +479,22 @@ def issue_for_device(db: Session, device: Device) -> IssuedConfig:
         raise NodeOpError("у маршрута нет пула выходов")
     if not route.is_direct and not route.gates:
         raise NodeOpError("в пуле гейтов маршрута нет гейтов")
-    if not route.serves(device.protocol):
+    if not route.has(device.protocol):
         raise NodeOpError(
             f"маршрут «{route.name}» — {route.protocol_label}, а устройство — "
             f"{device.protocol}: выберите маршрут этого протокола"
         )
-    host = route.host  # managed hostname, else the first gate / server
+    host = route.host_for(device.protocol)  # managed hostname, else the first gate / server
 
     existing = db.query(IssuedConfig).filter_by(device_id=device.id).one_or_none()
+    if not route.serves(device.protocol):
+        # Paused: an issued config is still shown (it works again after resume),
+        # a new one isn't made.
+        if (existing is not None and existing.payload and existing.protocol == device.protocol
+                and existing.route_id == route.id):
+            return existing
+        raise NodeOpError(f"{device.protocol} на маршруте «{route.name}» приостановлен — "
+                          f"конфиг будет выдан после включения")
 
     # Already issued for this very route/pool: hand it back as is. Opening the
     # device page must not re-run the SSH fan-out to every exit each time (new

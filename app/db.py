@@ -57,6 +57,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _add_columns()
     _migrate_route_gates()
+    _migrate_route_protocols()
     _reset_orphaned_jobs()
     _seed_default_group()
     _migrate_announcement()
@@ -228,6 +229,28 @@ def _migrate_route_gates() -> None:
             conn.exec_driver_sql(
                 "UPDATE routes SET gate_pool_id = :p WHERE id = :r", {"p": gate_pool_id, "r": route_id}
             )
+
+
+def _migrate_route_protocols() -> None:
+    """One-time per route: protocols moved from `routes.protocol` (one per route,
+    '' = legacy VLESS + AmneziaWG) with one address per route into
+    `route_protocols` (several per route, an address each). A legacy route gets
+    VLESS and AWG with no own port (its configs carry the pool ports). Migrated
+    routes are marked `protocol = '*'` (new routes are created with it)."""
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT id, protocol, client_host, client_port, dns_provider_id FROM routes "
+            "WHERE protocol != '*'"
+        ).fetchall()
+        for rid, proto, host, port, dns_id in rows:
+            protos = ["vless", "awg"] if not proto else [proto]
+            for p in protos:
+                conn.exec_driver_sql(
+                    "INSERT INTO route_protocols (route_id, protocol, enabled, client_host, "
+                    "client_port, dns_provider_id) VALUES (:r, :p, 1, :h, :port, :d)",
+                    {"r": rid, "p": p, "h": host or "", "port": port if proto else None, "d": dns_id},
+                )
+            conn.exec_driver_sql("UPDATE routes SET protocol = '*' WHERE id = :r", {"r": rid})
 
 
 def _reset_orphaned_jobs() -> None:

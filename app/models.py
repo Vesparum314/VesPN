@@ -453,9 +453,8 @@ class ExitPool(Base):
 
     @property
     def protocols(self) -> list[str]:
-        """Protocols this pool's servers must run — the union of its routes'
-        protocols. One server can carry several (e.g. VLESS and NaiveProxy): the
-        pool simply has a route per protocol."""
+        """Protocols this pool's servers must run — those of its route (paused ones
+        included: they stay installed). One server can carry several."""
         found: set[str] = set()
         for r in self.routes:
             found.update(r.protocols)
@@ -512,23 +511,30 @@ class DnsProvider(Base):
 
 
 class Route(Base):
-    """A path clients can pick: ONE protocol over a server POOL, entered either
-    through a GATE POOL (RU relays) or directly. A pool whose servers carry several
-    protocols has one route per protocol (they may share the gate pool, too).
+    """A path clients can pick: a server POOL (owned by this route) entered either
+    through a GATE POOL (RU relays, may front several routes) or directly, and the
+    PROTOCOLS the route runs on it (`protos`, each can be paused and resumed).
 
-    The client dials `host` — a hostname kept pointing at the route's live entry
-    points (or, when none is set, the first gate / server itself). Through a gate
-    pool, every gate's L4 relay fails over across the server pool's synced
-    members. The config's crypto comes from the server pool's shared identity, so
-    it stays valid whichever gate and whichever server currently carry it.
+    Each protocol has its own client address: a hostname kept pointing at the
+    route's live entry points (or, when none is set, the first gate / server
+    itself) and a port. Through a gate pool, every gate's relay fails over across
+    the server pool's synced members. The config's crypto comes from the server
+    pool's shared identity, so it stays valid whichever gate and whichever server
+    currently carry it.
     """
 
     __tablename__ = "routes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
-    # vless | naive | awg. Empty = a legacy route from before per-protocol routes:
-    # it serves BOTH VLESS and AmneziaWG (and its pool's servers run both).
-    protocol: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # Pre-«protocols per route» columns: read once by the migration into
+    # `route_protocols` (db._migrate_route_protocols), unused after that;
+    # `protocol = '*'` marks a route already in the new shape.
+    protocol: Mapped[str] = mapped_column(String(16), default="*", server_default="")
+    client_host: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dns_provider_id: Mapped[int | None] = mapped_column(
+        ForeignKey("dns_providers.id", ondelete="SET NULL"), nullable=True
+    )
     pool_id: Mapped[int | None] = mapped_column(
         ForeignKey("exit_pools.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -536,21 +542,14 @@ class Route(Base):
     gate_pool_id: Mapped[int | None] = mapped_column(
         ForeignKey("gate_pools.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    # What goes into client configs. Empty host = fall back to the first gate's
-    # (or, for a direct route, the first server's) public host; empty port = the
-    # protocol's default port of the server pool.
-    client_host: Mapped[str] = mapped_column(String(255), default="", server_default="")
-    client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Zone whose API keeps `client_host` A records = live entry points (optional).
-    dns_provider_id: Mapped[int | None] = mapped_column(
-        ForeignKey("dns_providers.id", ondelete="SET NULL"), nullable=True
-    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     pool: Mapped["ExitPool | None"] = relationship("ExitPool", back_populates="routes")
     gate_pool: Mapped["GatePool | None"] = relationship("GatePool", back_populates="routes")
-    dns_provider: Mapped["DnsProvider | None"] = relationship("DnsProvider")
+    protos: Mapped[list["RouteProto"]] = relationship(
+        "RouteProto", back_populates="route", cascade="all, delete-orphan"
+    )
     # Access groups allowed to use this route. Empty = no client may use it.
     groups: Mapped[list["Group"]] = relationship(secondary=route_groups, back_populates="routes")
 
@@ -583,33 +582,52 @@ class Route(Base):
             return self.gates
         return sorted(self.pool.members, key=lambda n: (n.priority, n.id)) if self.pool else []
 
+    # --- protocols -------------------------------------------------------
     @property
-    def host(self) -> str:
-        """Host clients dial: the managed hostname, else the first entry point."""
-        if self.client_host:
-            return self.client_host
-        entries = self.entry_points
-        return entries[0].public_host if entries else ""
+    def protos_sorted(self) -> list["RouteProto"]:
+        order = {p: i for i, p in enumerate(ALL_PROTOCOLS)}
+        return sorted(self.protos, key=lambda rp: order.get(rp.protocol, 99))
 
-    @property
-    def is_legacy(self) -> bool:
-        return not self.protocol
+    def proto(self, protocol: str) -> "RouteProto | None":
+        return next((rp for rp in self.protos if rp.protocol == protocol), None)
 
     @property
     def protocols(self) -> list[str]:
-        """What a device on this route may use (a legacy route: VLESS and AWG)."""
-        return [PROTO_VLESS, PROTO_AWG] if self.is_legacy else [self.protocol]
+        """Every protocol configured on the route, paused ones included — what its
+        pool's servers carry (a paused protocol stays installed for a quick resume)."""
+        return [rp.protocol for rp in self.protos_sorted]
+
+    @property
+    def active_protocols(self) -> list[str]:
+        """Protocols clients can use right now (not paused)."""
+        return [rp.protocol for rp in self.protos_sorted if rp.enabled]
+
+    def has(self, protocol: str) -> bool:
+        return self.proto(protocol) is not None
 
     def serves(self, protocol: str) -> bool:
-        return protocol in self.protocols
+        """The route runs `protocol` and it isn't paused."""
+        rp = self.proto(protocol)
+        return rp is not None and rp.enabled
+
+    def host_for(self, protocol: str) -> str:
+        """Host clients dial for `protocol`: its managed hostname, else the first
+        entry point."""
+        rp = self.proto(protocol)
+        if rp is not None and rp.client_host:
+            return rp.client_host
+        entries = self.entry_points
+        return entries[0].public_host if entries else ""
 
     def port_for(self, protocol: str) -> int:
-        """Port clients dial for `protocol` on this route: the route's own port if
-        set (not for legacy routes, whose configs carry the pool ports, and not for
+        """Port clients dial for `protocol`: the protocol's own port if set (not for
         direct routes — there's no gate to map a port, clients hit the server's own
-        port), else the pool's server port (VLESS/AWG) or 443 (NaiveProxy)."""
-        if self.client_port and not self.is_legacy and not self.is_direct:
-            return int(self.client_port)
+        port), else the pool's server port (VLESS/AWG) or 443 (NaiveProxy). Routes
+        migrated from before gate pools have no own port: their configs carry the
+        pool ports."""
+        rp = self.proto(protocol)
+        if rp is not None and rp.client_port and not self.is_direct:
+            return int(rp.client_port)
         if self.pool is not None:
             if protocol == PROTO_VLESS:
                 return int(self.pool.vless_port)
@@ -619,7 +637,9 @@ class Route(Base):
 
     @property
     def protocol_label(self) -> str:
-        return " + ".join(PROTOCOL_LABELS.get(p, p) for p in self.protocols)
+        """Usable protocols (for clients); configured ones if all are paused."""
+        ps = self.active_protocols or self.protocols
+        return " + ".join(PROTOCOL_LABELS.get(p, p) for p in ps) or "—"
 
     @property
     def hops(self) -> str:
@@ -640,13 +660,63 @@ class Route(Base):
         """Why the route can't serve clients right now ('' = it can)."""
         if self.pool is None:
             return "нет пула выходов"
-        if self.protocol == PROTO_NAIVE and not self.client_host:
-            return "у NaiveProxy-маршрута не задано имя хоста (на него выпускается сертификат)"
+        if not self.protos:
+            return "не выбран ни один протокол"
+        if not self.active_protocols:
+            return "все протоколы приостановлены"
         if not self.is_direct and not self.gates:
             return "в пуле гейтов нет гейтов"
         if not self.pool.synced_exits:
-            return "в пуле нет синхронизированных выходов"
+            return "в пуле нет развёрнутых выходов"
         return ""
+
+    def proto_block_reason(self, protocol: str) -> str:
+        """Why `protocol` on this route can't take new devices ('' = it can)."""
+        rp = self.proto(protocol)
+        if rp is None:
+            return "маршрут не работает с этим протоколом"
+        if not rp.enabled:
+            return "протокол приостановлен"
+        if protocol == PROTO_NAIVE and not rp.client_host:
+            return "у NaiveProxy не задано имя хоста (на него выпускается сертификат)"
+        return self.block_reason
+
+
+class RouteProto(Base):
+    """One protocol of a route: on/paused and the client address for it.
+
+    Pausing keeps every issued config: the gate stops forwarding the protocol, the
+    servers drop its accounts on the next sync and subscriptions leave it out;
+    resuming brings all of it back with the same configs."""
+
+    __tablename__ = "route_protocols"
+    __table_args__ = (UniqueConstraint("route_id", "protocol", name="uq_route_protocol"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    route_id: Mapped[int] = mapped_column(ForeignKey("routes.id", ondelete="CASCADE"), index=True)
+    protocol: Mapped[str] = mapped_column(String(16))  # vless | awg | naive
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # Name in client configs (empty = the first entry point's IP) and the zone whose
+    # API keeps its A records = the route's live entry points (optional).
+    client_host: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    client_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dns_provider_id: Mapped[int | None] = mapped_column(
+        ForeignKey("dns_providers.id", ondelete="SET NULL"), nullable=True
+    )
+
+    route: Mapped["Route"] = relationship("Route", back_populates="protos")
+    dns_provider: Mapped["DnsProvider | None"] = relationship("DnsProvider")
+
+    @property
+    def label(self) -> str:
+        return PROTOCOL_LABELS.get(self.protocol, self.protocol)
+
+    @property
+    def host(self) -> str:
+        return self.route.host_for(self.protocol)
+
+    @property
+    def port(self) -> int:
+        return self.route.port_for(self.protocol)
 
 
 class Group(Base):
