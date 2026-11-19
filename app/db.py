@@ -116,6 +116,8 @@ def _add_columns() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0"
             )
+        if "session_epoch" not in cols("users"):
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
         node_cols = cols("nodes")
         if "role" not in node_cols:
             conn.exec_driver_sql("ALTER TABLE nodes ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'exit'")

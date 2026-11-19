@@ -52,8 +52,13 @@ def password_problem(password: str, username: str | None = None) -> str | None:
     return None
 
 
+# Sessions are signed cookies (no server-side store), so a copied cookie stays
+# valid until it expires. To revoke them, each cookie carries the user's
+# `session_epoch`; bumping the epoch (on a password change) invalidates every
+# cookie issued before it.
 def login_session(request: Request, user: User) -> None:
     request.session["uid"] = user.id
+    request.session["ep"] = user.session_epoch or 0
 
 
 def logout_session(request: Request) -> None:
@@ -64,4 +69,7 @@ def current_user(request: Request, db) -> User | None:
     uid = request.session.get("uid")
     if not uid:
         return None
-    return db.get(User, uid)
+    user = db.get(User, uid)
+    if user is None or request.session.get("ep", 0) != (user.session_epoch or 0):
+        return None
+    return user

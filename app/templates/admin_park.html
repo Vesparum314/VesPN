@@ -8,6 +8,7 @@
 {% macro sdot(n) %}{{ 'ok' if n.sync_state == 'synced' else ('bad' if n.sync_state == 'unreachable' else 'warn') }}{% endmacro %}
 {% macro schip(n) %}<span class="srv" title="{{ n.public_host }} · {{ {'synced':'развёрнут','unreachable':'недоступен','drifted':'рассинхрон'}.get(n.sync_state, 'не развёрнут') }}"><span class="sdot {{ sdot(n) }}"></span>{{ n.name }}</span>{% endmacro %}
 {% macro ppill(rp) %}<span class="pill {{ rp.protocol if rp.enabled else 'paused' }}" title="{{ rp.label }}{{ ' — на паузе' if not rp.enabled }}">{{ rp.label }}</span>{% endmacro %}
+{% macro forgetkey(n) %}<form method="post" action="/admin/nodes/{{ n.id }}/hostkey/forget" onsubmit="return confirm('Сбросить запомненный ключ SSH сервера {{ n.name }}?\n\nНужно только после переустановки ОС: при следующем подключении панель запомнит новый ключ.')"><button>Сбросить ключ SSH</button></form>{% endmacro %}
 {% macro more(label='Ещё действия') %}<details class="more"><summary aria-label="{{ label }}" title="{{ label }}">⋯</summary><div class="menu">{{ caller() }}</div></details>{% endmacro %}
 {% set state_word = {'ok':'работает','warn':'требует внимания','bad':'не работает','off':'выключен'} %}
 {% set state_badge = {'ok':'b-ok','warn':'b-warn','bad':'b-bad','off':'b-exit'} %}
@@ -316,7 +317,8 @@
           {% else %}<span class="meta">сначала «+ Пул выходов»</span>{% endif %}
         {% endif %}
         {% call more() %}
-          <form method="post" action="/admin/nodes/{{ n.id }}/test"><button>Проверить SSH</button></form><hr>
+          <form method="post" action="/admin/nodes/{{ n.id }}/test"><button>Проверить SSH</button></form>
+          {{ forgetkey(n) }}<hr>
           <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить {{ n.name }}?')"><button class="danger">Удалить сервер</button></form>
         {% endcall %}
       </div>
@@ -353,6 +355,7 @@
               <input name="priority" type="number" value="{{ g.priority }}" class="prio" aria-label="Приоритет"><button class="btn btn-ghost btn-xs">OK</button></form>
             {% call more() %}
               <form method="post" action="/admin/nodes/{{ g.id }}/test"><button>Проверить SSH</button></form>
+              {{ forgetkey(g) }}
               <form method="post" action="/admin/nodes/{{ g.id }}/gate_pool" onsubmit="return confirm('Убрать {{ g.name }} из пула «{{ gp.name }}»?')"><input type="hidden" name="gate_pool_id" value=""><button>Убрать из пула</button></form><hr>
               <form method="post" action="/admin/nodes/{{ g.id }}/delete" onsubmit="return confirm('Удалить гейт {{ g.name }}?')"><button class="danger">Удалить сервер</button></form>
             {% endcall %}
@@ -389,6 +392,7 @@
             {% call more() %}
               <form method="post" action="/admin/nodes/{{ n.id }}/test"><button>Проверить через гейт</button></form>
               <form method="post" action="/admin/nodes/{{ n.id }}/test" onsubmit="return confirm('Подключиться к {{ n.name }} НАПРЯМУЮ, в обход гейта?\n\nВидимое соединение Хаб→выход. Только для диагностики.')"><input type="hidden" name="direct" value="1"><button>Проверить напрямую ⚠</button></form>
+              {{ forgetkey(n) }}
               <form method="post" action="/admin/nodes/{{ n.id }}/pool" onsubmit="return confirm('Убрать {{ n.name }} из пула «{{ p.name }}»?')"><input type="hidden" name="pool_id" value=""><button>Убрать из пула</button></form><hr>
               <form method="post" action="/admin/nodes/{{ n.id }}/delete" onsubmit="return confirm('Удалить сервер {{ n.name }}?')"><button class="danger">Удалить сервер</button></form>
             {% endcall %}
@@ -687,7 +691,7 @@ function addServer(role, poolId, title){
   function showTab(name){
     document.querySelectorAll('[data-tab]').forEach(function(b){ b.setAttribute('aria-selected', b.getAttribute('data-tab') === name ? 'true' : 'false'); });
     ['routes','servers','dns'].forEach(function(t){ document.getElementById('tab-' + t).hidden = t !== name; });
-    put(L, 'vespn.park.tab', name);
+    put(L, 'panel.park.tab', name);
     if (name === 'routes' && !document.getElementById('schemeview').hidden) draw();
   }
   document.querySelectorAll('[data-tab]').forEach(function(b){ b.addEventListener('click', function(){ showTab(b.getAttribute('data-tab')); }); });
@@ -725,7 +729,7 @@ function addServer(role, poolId, title){
     document.getElementById('viewhint').textContent = v === 'scheme'
       ? 'Наведите на маршрут — подсветится его путь; нажмите — откроется карточка.'
       : 'Нажмите на маршрут — откроется карточка.';
-    put(L, 'vespn.park.view', v);
+    put(L, 'panel.park.view', v);
     if (v === 'scheme') draw();
   }
   document.querySelectorAll('[data-view]').forEach(function(x){ x.addEventListener('click', function(){ setView(x.getAttribute('data-view')); }); });
@@ -736,19 +740,19 @@ function addServer(role, poolId, title){
   var drawer = document.getElementById('drawer'), scrim = document.getElementById('scrim'), lastFocus = null;
   function openRoute(id){
     var t = document.getElementById('rt-' + id);
-    if (!t) { put(S, 'vespn.park.route', null); return; }
+    if (!t) { put(S, 'panel.park.route', null); return; }
     lastFocus = document.activeElement;
     drawer.innerHTML = '';
     drawer.appendChild(t.content.cloneNode(true));
     drawer.classList.add('on'); scrim.classList.add('on');
     document.querySelectorAll('.rrow[data-route]').forEach(function(b){ b.setAttribute('aria-expanded', b.getAttribute('data-route') === String(id) ? 'true' : 'false'); });
-    put(S, 'vespn.park.route', String(id));
+    put(S, 'panel.park.route', String(id));
     var c = drawer.querySelector('[data-close]'); if (c) c.focus();
   }
   function closeRoute(){
     drawer.classList.remove('on'); scrim.classList.remove('on');
     document.querySelectorAll('.rrow[data-route]').forEach(function(b){ b.setAttribute('aria-expanded', 'false'); });
-    put(S, 'vespn.park.route', null);
+    put(S, 'panel.park.route', null);
     if (lastFocus && lastFocus.focus) lastFocus.focus();
   }
   scrim.addEventListener('click', closeRoute);
@@ -776,9 +780,9 @@ function addServer(role, poolId, title){
     if (confirm(s.getAttribute('data-confirm'))) s.form.submit(); else s.value = s.getAttribute('data-orig');
   });
 
-  showTab(get(L, 'vespn.park.tab', 'routes'));
-  setView(get(L, 'vespn.park.view', 'list'));
-  var keep = get(S, 'vespn.park.route', null);
+  showTab(get(L, 'panel.park.tab', 'routes'));
+  setView(get(L, 'panel.park.view', 'list'));
+  var keep = get(S, 'panel.park.route', null);
   if (keep) openRoute(keep);
 
   // Auto-refresh while a background rollout runs: reload once a running node

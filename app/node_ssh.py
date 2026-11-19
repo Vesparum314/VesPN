@@ -13,6 +13,7 @@ and works the same on any OS.
 
 from __future__ import annotations
 
+import os
 import select
 import socket
 import threading
@@ -20,6 +21,80 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import paramiko
+
+
+# --- host keys: trust on first use ----------------------------------------
+# The panel sends root passwords over SSH, so it must not talk to whoever answers
+# on the node's address. The first connection to a host:port records the key the
+# server showed (like `ssh` asking "are you sure?" — here the admin adding the
+# server is the yes); every later connection must show the same key, or it is
+# refused before any password leaves the panel. Keys live in an OpenSSH-format
+# known_hosts file next to the database (settings.known_hosts_file). A reinstalled
+# OS has a new key: the admin resets it from the server's menu (forget_host_key).
+_KH_LOCK = threading.Lock()
+
+
+class HostKeyChanged(paramiko.SSHException):
+    """The server's host key differs from the one recorded for it."""
+
+
+def known_hosts_file() -> str:
+    from .config import settings
+
+    return settings.known_hosts_file
+
+
+def _kh_name(host: str, port: int) -> str:
+    return host if int(port or 22) == 22 else f"[{host}]:{port}"
+
+
+def _load_known() -> paramiko.HostKeys:
+    hk = paramiko.HostKeys()
+    path = known_hosts_file()
+    if os.path.isfile(path):
+        hk.load(path)
+    return hk
+
+
+def _save_known(hk: paramiko.HostKeys) -> None:
+    path = known_hosts_file()
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    hk.save(tmp)
+    os.replace(tmp, path)
+
+
+def forget_host_key(host: str, port: int = 22) -> bool:
+    """Drop the recorded key of host:port (after an OS reinstall); True if one was."""
+    name = _kh_name(host, port)
+    with _KH_LOCK:
+        hk = _load_known()
+        if hk.lookup(name) is None:
+            return False
+        del hk[name]
+        _save_known(hk)
+    return True
+
+
+class _TrustOnFirstUse(paramiko.MissingHostKeyPolicy):
+    """Record an unknown host's key; refuse a host that has a key on record (paramiko
+    lands here also when the server offers a key of ANOTHER type than recorded)."""
+
+    def missing_host_key(self, client, hostname, key):  # noqa: ANN001
+        with _KH_LOCK:
+            hk = _load_known()
+            if hk.lookup(hostname) is not None:
+                raise HostKeyChanged(_changed_msg(hostname))
+            hk.add(hostname, key.get_name(), key)
+            _save_known(hk)
+
+
+def _changed_msg(hostname: str) -> str:
+    return (
+        f"ключ SSH сервера {hostname} не совпадает с запомненным. Если ОС на сервере "
+        f"переустанавливали — сбросьте ключ в меню сервера («Сбросить ключ SSH») и "
+        f"повторите; если нет — это может быть перехват соединения, пароль не отправлен"
+    )
 
 
 @dataclass
@@ -145,21 +220,35 @@ class SSHNode:
                 timeout=timeout,
             )
         c = paramiko.SSHClient()
-        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        c.connect(
-            self.creds.host,
-            port=self.creds.port,
-            username=self.creds.username,
-            password=self.creds.password,
-            pkey=self.creds.pkey,
-            key_filename=self.creds.key_filename,
-            timeout=timeout,
-            banner_timeout=timeout,
-            auth_timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
-            sock=sock,
-        )
+        with _KH_LOCK:
+            known = _load_known()
+        name = _kh_name(self.creds.host, self.creds.port)
+        for ktype, key in (known.lookup(name) or {}).items():
+            c.get_host_keys().add(name, ktype, key)
+        c.set_missing_host_key_policy(_TrustOnFirstUse())
+        try:
+            c.connect(
+                self.creds.host,
+                port=self.creds.port,
+                username=self.creds.username,
+                password=self.creds.password,
+                pkey=self.creds.pkey,
+                key_filename=self.creds.key_filename,
+                timeout=timeout,
+                banner_timeout=timeout,
+                auth_timeout=timeout,
+                look_for_keys=False,
+                allow_agent=False,
+                sock=sock,
+            )
+        except paramiko.BadHostKeyException:
+            c.close()
+            self.close()
+            raise HostKeyChanged(_changed_msg(name)) from None
+        except Exception:
+            c.close()
+            self.close()
+            raise
         self.client = c
         return self
 

@@ -59,8 +59,8 @@
   <script>
   (function(){
     var order=["","light","dark"], i=0;
-    try{var s=localStorage.getItem("vespn-theme"); if(s!==null){i=order.indexOf(s); if(i<0)i=0;}}catch(e){}
-    function apply(){var m=order[i]; var r=document.documentElement; if(m) r.setAttribute("data-theme",m); else r.removeAttribute("data-theme"); try{localStorage.setItem("vespn-theme",m);}catch(e){}}
+    try{var s=localStorage.getItem("panel-theme"); if(s!==null){i=order.indexOf(s); if(i<0)i=0;}}catch(e){}
+    function apply(){var m=order[i]; var r=document.documentElement; if(m) r.setAttribute("data-theme",m); else r.removeAttribute("data-theme"); try{localStorage.setItem("panel-theme",m);}catch(e){}}
     apply();
     var b=document.getElementById("theme");
     if(b) b.addEventListener("click",function(){i=(i+1)%order.length;apply();});
