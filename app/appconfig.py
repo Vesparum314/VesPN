@@ -84,3 +84,25 @@ def set_tg_config(db: Session, *, token: str | None = None, chats: str | None = 
     if api_base is not None:
         put(_K_API_BASE, _norm_base(api_base))
     db.commit()
+
+
+# --- temporary password for new / reset accounts ----------------------------
+# One for everybody, changeable by the admin from the users page (stored encrypted);
+# DEFAULT_USER_PASSWORD from the env until it is set there. Changing it does not touch
+# accounts that still carry the previous one — they keep it and stay flagged
+# must_change_password until their owner sets a password of their own.
+_K_TEMP_PW = "default_user_password"
+
+
+def temp_password(db: Session) -> str:
+    enc = _raw(db, _K_TEMP_PW)
+    return (decrypt(enc) or env.default_user_password) if enc else env.default_user_password
+
+
+def set_temp_password(db: Session, password: str) -> None:
+    s = db.get(Setting, _K_TEMP_PW)
+    if s is None:
+        db.add(Setting(key=_K_TEMP_PW, value=encrypt(password)))
+    else:
+        s.value = encrypt(password)
+    db.commit()

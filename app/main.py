@@ -353,7 +353,7 @@ def change_password_submit(
         flash(request, problem, "error")
     elif new_password != confirm:
         flash(request, "Пароли не совпадают", "error")
-    elif new_password == settings.default_user_password:
+    elif new_password == appconfig.temp_password(db):
         flash(request, "Выберите пароль, отличный от временного", "error")
     else:
         user.password_hash = hash_password(new_password)
@@ -1734,7 +1734,50 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     users = db.query(User).order_by(User.id).all()
     groups = db.query(Group).order_by(Group.name).all()
-    return render(request, "admin_users.html", user=admin, users=users, groups=groups)
+    return render(request, "admin_users.html", user=admin, users=users, groups=groups,
+                  temp_password=appconfig.temp_password(db), rules=PASSWORD_RULES)
+
+
+@app.post("/admin/users/temp-password")
+def admin_set_temp_password(request: Request, password: str = Form(""), db: Session = Depends(get_db)):
+    """Change the shared temporary password (admin only). Accounts still on the old
+    one keep it — and their «временный» flag — until they set their own."""
+    if not _require_admin(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    password = password.strip()
+    problem = password_problem(password)
+    if problem:
+        flash(request, f"Временный пароль не изменён: {problem[0].lower()}{problem[1:]}", "error")
+    elif password == appconfig.temp_password(db):
+        flash(request, "Это и есть текущий временный пароль", "info")
+    else:
+        appconfig.set_temp_password(db, password)
+        flash(request, "Временный пароль изменён — его получат новые и сброшенные учётки. Кто ещё "
+                       "не сменил старый временный, входит с ним, как раньше.", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/users/{user_id}/reset-password")
+def admin_reset_password(request: Request, user_id: int, db: Session = Depends(get_db)):
+    """Reset an account to the temporary password (admin only): its sessions end and
+    the owner must set a password of their own at the next sign-in."""
+    admin = _require_admin(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    target = db.get(User, user_id)
+    if not target:
+        flash(request, "Пользователь не найден", "error")
+    elif target.id == admin.id:
+        flash(request, "Свой пароль меняйте через «Сменить пароль»", "error")
+    else:
+        temp = appconfig.temp_password(db)
+        target.password_hash = hash_password(temp)
+        target.must_change_password = True
+        target.session_epoch = (target.session_epoch or 0) + 1  # sign out everywhere
+        db.commit()
+        flash(request, f"Пароль «{target.username}» сброшен на временный: {temp} — при входе "
+                       f"зададут свой. Открытые сессии завершены.", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
 # --- admin: notifications (admin -> clients) ----------------------------
@@ -1907,9 +1950,10 @@ def admin_add_user(
     elif db.query(User).filter_by(username=username).first():
         flash(request, "Пользователь уже существует", "error")
     else:
+        temp = appconfig.temp_password(db)
         db.add(User(
             username=username,
-            password_hash=hash_password(settings.default_user_password),
+            password_hash=hash_password(temp),
             role=role,
             created_by=staff.id,
             must_change_password=True,
@@ -1917,7 +1961,7 @@ def admin_add_user(
         db.commit()
         flash(request,
               f"Пользователь «{username}» (роль: {role}) создан. Временный пароль: "
-              f"{settings.default_user_password} — сменит при первом входе.", "success")
+              f"{temp} — сменит при первом входе.", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 

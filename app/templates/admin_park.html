@@ -8,9 +8,7 @@
 {% macro sdot(n) %}{{ 'ok' if n.sync_state == 'synced' else ('bad' if n.sync_state == 'unreachable' else 'warn') }}{% endmacro %}
 {% macro schip(n) %}<span class="srv" title="{{ n.public_host }} · {{ {'synced':'развёрнут','unreachable':'недоступен','drifted':'рассинхрон'}.get(n.sync_state, 'не развёрнут') }}"><span class="sdot {{ sdot(n) }}"></span>{{ n.name }}</span>{% endmacro %}
 {% macro ppill(rp) %}<span class="pill {{ rp.protocol if rp.enabled else 'paused' }}" title="{{ rp.label }}{{ ' — на паузе' if not rp.enabled }}">{{ rp.label }}</span>{% endmacro %}
-{% macro forgetkey(n) %}<form method="post" action="/admin/nodes/{{ n.id }}/hostkey/forget" onsubmit="return confirm('Сбросить запомненный ключ SSH сервера {{ n.name }}?
-
-Нужно только после переустановки ОС: при следующем подключении панель запомнит новый ключ.')"><button>Сбросить ключ SSH</button></form>{% endmacro %}
+{% macro forgetkey(n) %}<form method="post" action="/admin/nodes/{{ n.id }}/hostkey/forget" onsubmit="return confirm('Сбросить запомненный ключ SSH сервера {{ n.name }}?\n\nНужно только после переустановки ОС: при следующем подключении панель запомнит новый ключ.')"><button>Сбросить ключ SSH</button></form>{% endmacro %}
 {% macro more(label='Ещё действия') %}<details class="more"><summary aria-label="{{ label }}" title="{{ label }}">⋯</summary><div class="menu">{{ caller() }}</div></details>{% endmacro %}
 {% set state_word = {'ok':'работает','warn':'требует внимания','bad':'не работает','off':'выключен'} %}
 {% set state_badge = {'ok':'b-ok','warn':'b-warn','bad':'b-bad','off':'b-exit'} %}

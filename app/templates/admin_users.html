@@ -49,6 +49,7 @@
       <td data-label="Устройств">{{ u.devices | length }}</td>
       <td data-label="Пароль">{% if u.must_change_password %}<span class="badge b-warn">временный</span>{% else %}задан{% endif %}</td>
       <td data-label="Действия" class="full"><div class="row-actions">
+        {% if user.is_admin and u.id != user.id %}<form method="post" action="/admin/users/{{ u.id }}/reset-password" onsubmit="return confirm('Сбросить пароль {{ u.username }} на временный?\n\nОткрытые сессии завершатся, при входе нужно будет задать свой пароль.')"><button class="btn btn-ghost btn-sm">Сбросить пароль</button></form>{% endif %}
         <form method="post" action="/admin/users/{{ u.id }}/delete" onsubmit="return confirm('Удалить {{ u.username }}?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
       </div></td>
     </tr>
@@ -69,7 +70,14 @@
       </label>
       <button class="btn btn-primary" type="submit">Создать</button>
     </form>
-    <p class="hint">Пароль по умолчанию — <code>change-me-123</code>, пользователь сменит его при первом входе.{% if not user.is_admin %} Оператор может заводить только клиентов.{% endif %}</p>
+    <p class="hint">Временный пароль — <code>{{ temp_password }}</code>, пользователь сменит его при первом входе.{% if not user.is_admin %} Оператор может заводить только клиентов.{% endif %}</p>
+    {% if user.is_admin %}
+    <form method="post" action="/admin/users/temp-password" class="form-row" style="margin-top:12px">
+      <label style="flex:2">Новый временный пароль <input name="password" required autocomplete="off" placeholder="{{ rules }}"></label>
+      <button class="btn" type="submit">Сменить временный</button>
+    </form>
+    <p class="hint">Один на всех: его получают новые учётки и учётки после «Сбросить пароль». Тех, кто ещё не сменил прежний временный, смена не трогает — они входят с ним, метка «временный» остаётся.</p>
+    {% endif %}
   </div>
 </div>
 
