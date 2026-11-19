@@ -49,7 +49,9 @@ from .models import (
     ROLE_OPERATOR,
     ROLES,
     USER_ROLES,
+    APP_PLATFORMS,
     Announcement,
+    ClientApp,
     Device,
     DnsProvider,
     ExitPool,
@@ -360,6 +362,10 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         request, "dashboard.html",
         user=user, devices=user.devices, protocols=PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
         service_ready=bool(choices), choices=choices,
+        apps=[{"protocol": a.protocol, "platform": a.platform, "platform_label": a.platform_label,
+               "name": a.name, "version": a.version, "url": a.url, "note": a.note}
+              for a in db.query(ClientApp).filter_by(enabled=True)
+              .order_by(ClientApp.position, ClientApp.id).all()],
     )
 
 
@@ -1749,6 +1755,99 @@ def admin_delete_notification(request: Request, item_id: int, db: Session = Depe
         db.commit()
         flash(request, "Уведомление удалено из журнала", "success")
     return RedirectResponse("/admin/notifications", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: recommended client apps (shown in the «add device» form) ------
+def _app_fields(protocol: str, platform: str, name: str, version: str, url: str, note: str,
+                position: str) -> tuple[dict | None, str]:
+    """Validate a client-app form; (fields, '') or (None, error)."""
+    name, url = name.strip(), url.strip()
+    if protocol not in ALL_PROTOCOLS:
+        return None, "Выберите протокол"
+    if platform not in APP_PLATFORMS:
+        return None, "Выберите платформу"
+    if not name:
+        return None, "Укажите название приложения"
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return None, "Ссылка должна начинаться с https://"
+    pos = int(position) if position.strip().lstrip("-").isdigit() else 100
+    return {"protocol": protocol, "platform": platform, "name": name[:64],
+            "version": version.strip()[:32], "url": url[:512], "note": note.strip()[:255],
+            "position": pos}, ""
+
+
+@app.get("/admin/apps", response_class=HTMLResponse)
+def admin_apps(request: Request, db: Session = Depends(get_db)):
+    admin = _require_staff(request, db)
+    if not admin:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    apps = db.query(ClientApp).order_by(ClientApp.protocol, ClientApp.position, ClientApp.id).all()
+    return render(request, "admin_apps.html", user=admin, apps=apps, protocols=ALL_PROTOCOLS,
+                  protocol_labels=PROTOCOL_LABELS, platforms=APP_PLATFORMS)
+
+
+@app.post("/admin/apps")
+def admin_add_app(
+    request: Request, protocol: str = Form(""), platform: str = Form(""), name: str = Form(""),
+    version: str = Form(""), url: str = Form(""), note: str = Form(""), position: str = Form("100"),
+    db: Session = Depends(get_db),
+):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    f, err = _app_fields(protocol, platform, name, version, url, note, position)
+    if err:
+        flash(request, err, "error")
+    else:
+        db.add(ClientApp(**f))
+        db.commit()
+        flash(request, f"«{f['name']}» добавлено в рекомендованные для {PROTOCOL_LABELS[f['protocol']]}", "success")
+    return RedirectResponse("/admin/apps", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/apps/{app_id}")
+def admin_edit_app(
+    request: Request, app_id: int, protocol: str = Form(""), platform: str = Form(""),
+    name: str = Form(""), version: str = Form(""), url: str = Form(""), note: str = Form(""),
+    position: str = Form("100"), db: Session = Depends(get_db),
+):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    a = db.get(ClientApp, app_id)
+    f, err = _app_fields(protocol, platform, name, version, url, note, position)
+    if a is None:
+        return RedirectResponse("/admin/apps", status_code=HTTP_303_SEE_OTHER)
+    if err:
+        flash(request, err, "error")
+    else:
+        for k, v in f.items():
+            setattr(a, k, v)
+        db.commit()
+        flash(request, f"«{a.name}» сохранено", "success")
+    return RedirectResponse("/admin/apps", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/apps/{app_id}/toggle")
+def admin_toggle_app(request: Request, app_id: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    a = db.get(ClientApp, app_id)
+    if a:
+        a.enabled = not a.enabled
+        db.commit()
+        flash(request, f"«{a.name}» {'показывается клиентам' if a.enabled else 'скрыто от клиентов'}", "success")
+    return RedirectResponse("/admin/apps", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/apps/{app_id}/delete")
+def admin_delete_app(request: Request, app_id: int, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    a = db.get(ClientApp, app_id)
+    if a:
+        db.delete(a)
+        db.commit()
+        flash(request, f"«{a.name}» удалено из списка", "success")
+    return RedirectResponse("/admin/apps", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/users")

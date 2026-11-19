@@ -58,17 +58,56 @@
   </div>
 </div>
 {% endif %}
+
+{% set app_protos = protocols|select('in', apps|map(attribute='protocol')|list)|list %}
+{% if app_protos %}
+<div class="panel" id="apps">
+  <div class="panel-h"><h2>Рекомендованные приложения</h2>
+    <div class="seg" role="tablist" aria-label="Протокол">
+      {% for p in app_protos %}<button type="button" role="tab" data-app-proto="{{ p }}" aria-selected="{{ 'true' if loop.first else 'false' }}">{{ protocol_labels[p] }}</button>{% endfor %}
+    </div>
+  </div>
+  {% for p in app_protos %}
+  <ul class="apps" data-app-list="{{ p }}"{% if not loop.first %} hidden{% endif %}>
+    {% for a in apps if a.protocol == p %}
+    <li data-platform="{{ a.platform }}">
+      <span class="pl">{{ a.platform_label }}</span>
+      <span class="nm">{{ a.name }}</span>
+      <a href="{{ a.url }}" target="_blank" rel="noopener noreferrer">{{ 'версия ' ~ a.version if a.version else 'скачать' }} ↗</a>
+      {% if a.note %}<span class="nt">{{ a.note }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endfor %}
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
+<style>
+  #apps .seg{display:inline-flex;max-width:100%;overflow-x:auto;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:3px;gap:2px}
+  #apps .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-weight:600;font-size:13.5px;padding:5px 12px;border-radius:7px;cursor:pointer;white-space:nowrap}
+  #apps .seg button[aria-selected="true"]{background:var(--panel);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+  #apps .seg button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .apps{list-style:none;margin:0;padding:0}
+  .apps li{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:10px 18px;border-top:1px solid var(--border);font-size:14px}
+  .apps li:first-child{border-top:0}
+  .apps li.mine{background:var(--accent-weak)}
+  .apps li.mine .pl::after{content:" · это устройство";color:var(--accent)}
+  .apps .pl{color:var(--muted);font-size:12.5px;min-width:110px}
+  .apps .nm{font-weight:600}
+  .apps a{color:var(--accent);font-weight:600}
+  .apps .nt{color:var(--muted);font-size:12.5px;flex-basis:100%}
+</style>
 <script>
-// The protocol list follows the chosen route: only what that route offers now.
+// «Добавить устройство»: the protocol list follows the chosen route — only what
+// that route offers now.
 (function(){
   var route = document.getElementById('dev-route'), proto = document.getElementById('dev-proto'),
       hint = document.getElementById('dev-hint');
   if (!route || !proto) return;
   var LABEL = {{ protocol_labels|tojson }};
-  var APPS = {
+  var HINT = {
     vless: 'VLESS — v2rayNG (Android) или OneXray (iPhone, Mac, Windows).',
     naive: 'NaiveProxy — Karing (все платформы) или NekoBox (Android).',
     awg: 'AmneziaWG — приложение AmneziaVPN 5.0.1.5 или новее.'
@@ -86,10 +125,43 @@
     if (list.indexOf(keep) >= 0) proto.value = keep;
     showHint();
   }
-  function showHint(){ hint.textContent = APPS[proto.value] || ''; }
+  function showHint(){ hint.textContent = HINT[proto.value] || ''; }
   route.addEventListener('change', fill);
   proto.addEventListener('change', showHint);
   fill();
+})();
+
+// «Рекомендованные приложения»: its own protocol switch (remembered in this
+// browser); the visitor's platform (guessed from the browser) goes first.
+(function(){
+  var box = document.getElementById('apps');
+  if (!box) return;
+  var ua = navigator.userAgent || '';
+  var mine = /Android/i.test(ua) ? 'android' : /iPhone|iPad|iPod/i.test(ua) ? 'ios'
+           : /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1 ? 'ios'
+           : /Macintosh/i.test(ua) ? 'macos' : /Windows/i.test(ua) ? 'windows' : /Linux/i.test(ua) ? 'linux' : '';
+  function rank(li){ var p = li.getAttribute('data-platform'); return p === mine ? 0 : p === 'any' ? 1 : 2; }
+  box.querySelectorAll('[data-app-list]').forEach(function(ul){
+    var items = Array.prototype.slice.call(ul.children);
+    items.map(function(li, i){ return {li: li, i: i}; })
+      .sort(function(x, y){ return rank(x.li) - rank(y.li) || x.i - y.i; })
+      .forEach(function(it){ if (it.li.getAttribute('data-platform') === mine) it.li.classList.add('mine'); ul.appendChild(it.li); });
+  });
+  var KEY = 'vespn.apps.proto';
+  function show(p){
+    var tabs = box.querySelectorAll('[data-app-proto]'), found = false;
+    tabs.forEach(function(t){ if (t.getAttribute('data-app-proto') === p) found = true; });
+    if (!found) p = tabs[0].getAttribute('data-app-proto');
+    tabs.forEach(function(t){ t.setAttribute('aria-selected', t.getAttribute('data-app-proto') === p ? 'true' : 'false'); });
+    box.querySelectorAll('[data-app-list]').forEach(function(ul){ ul.hidden = ul.getAttribute('data-app-list') !== p; });
+    try { localStorage.setItem(KEY, p); } catch (e) {}
+  }
+  box.querySelectorAll('[data-app-proto]').forEach(function(t){
+    t.addEventListener('click', function(){ show(t.getAttribute('data-app-proto')); });
+  });
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  show(saved || '');
 })();
 </script>
 {% endblock %}
