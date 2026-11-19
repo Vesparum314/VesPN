@@ -10,12 +10,14 @@ from pathlib import Path
 
 import qrcode
 from fastapi import Depends, FastAPI, Form, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import ChoiceLoader, FileSystemLoader
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.status import HTTP_303_SEE_OTHER
 
@@ -30,6 +32,7 @@ from . import subscription as sub_ops
 from . import traffic as traffic_ops
 from .config import settings
 from .db import get_db, init_db
+from .node_ssh import forget_host_key
 from .models import (
     ALL_PROTOCOLS,
     DEFAULT_CLIENT_PORT,
@@ -81,7 +84,21 @@ log = logging.getLogger("vpnpanel")
 logging.basicConfig(level=logging.INFO)
 
 BASE_DIR = Path(__file__).parent
-app = FastAPI(title="VPN self-service panel")
+# No /docs, /redoc, /openapi.json: a public map of every admin endpoint (and a page
+# that names the product) only helps someone probing the panel.
+app = FastAPI(title="panel", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# Errors as bare status codes, not FastAPI's JSON ({"detail": ...} and, for a bad
+# form, the list of expected field names) — that JSON fingerprints the framework.
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request: Request, exc: StarletteHTTPException):
+    return Response(status_code=exc.status_code, headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    return Response(status_code=400)
 
 _PW_EXEMPT = {"/login", "/logout", "/change-password", "/healthz"}
 
@@ -108,7 +125,7 @@ async def _enforce_password_change(request: Request, call_next):
 
         db = SessionLocal()
         try:
-            u = db.get(User, uid)
+            u = current_user(request, db)
             if u and u.must_change_password:
                 return RedirectResponse("/change-password", status_code=HTTP_303_SEE_OTHER)
         finally:
@@ -194,7 +211,7 @@ def active_announcements(request: Request) -> list:
         return []
     db = SessionLocal()
     try:
-        user = db.get(User, uid)
+        user = current_user(request, db)
         if not user:
             return []
         rows = (
@@ -341,7 +358,9 @@ def change_password_submit(
     else:
         user.password_hash = hash_password(new_password)
         user.must_change_password = False
+        user.session_epoch = (user.session_epoch or 0) + 1  # sign out every other session
         db.commit()
+        login_session(request, user)  # …but keep this one
         flash(request, "Пароль изменён", "success")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     return RedirectResponse("/change-password", status_code=HTTP_303_SEE_OTHER)
@@ -773,14 +792,33 @@ def admin_park_status(request: Request, db: Session = Depends(get_db)):
     return JSONResponse({"running": running, "certs": sorted(_CERT_BUSY)})
 
 
+@app.post("/admin/nodes/{node_id}/hostkey/forget")
+def admin_forget_host_key(request: Request, node_id: int, db: Session = Depends(get_db)):
+    """Forget the server's recorded SSH host key (after an OS reinstall): the next
+    connection records the new one (app/node_ssh.py, trust on first use)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    node = db.get(Node, node_id)
+    if node:
+        if forget_host_key(node.ssh_host, node.ssh_port):
+            flash(request, f"Ключ SSH «{node.name}» сброшен — при следующем подключении запомнится новый", "success")
+        else:
+            flash(request, f"У «{node.name}» ключ SSH ещё не запомнен", "info")
+    return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
+
+
 @app.post("/admin/nodes/{node_id}/delete")
 def admin_delete_node(request: Request, node_id: int, db: Session = Depends(get_db)):
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     node = db.get(Node, node_id)
     if node:
+        host, port = node.ssh_host, node.ssh_port
         db.delete(node)
         db.commit()
+        # a server added again at this address later is a new machine — new key
+        if not db.query(Node.id).filter_by(ssh_host=host, ssh_port=port).first():
+            forget_host_key(host, port)
         flash(request, "Нода удалена", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 

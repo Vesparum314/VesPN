@@ -171,6 +171,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(16), default=ROLE_CLIENT, server_default=ROLE_CLIENT)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Bumped on a password change: signs out every session issued before (app/security.py).
+    session_epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # The staff account (admin/operator) that created this user; NULL for the
     # bootstrap admin or if the creator was later deleted.
     created_by: Mapped[int | None] = mapped_column(

@@ -147,7 +147,7 @@
       .sort(function(x, y){ return rank(x.li) - rank(y.li) || x.i - y.i; })
       .forEach(function(it){ if (it.li.getAttribute('data-platform') === mine) it.li.classList.add('mine'); ul.appendChild(it.li); });
   });
-  var KEY = 'vespn.apps.proto';
+  var KEY = 'panel.apps.proto';
   function show(p){
     var tabs = box.querySelectorAll('[data-app-proto]'), found = false;
     tabs.forEach(function(t){ if (t.getAttribute('data-app-proto') === p) found = true; });

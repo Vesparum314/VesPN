@@ -19,6 +19,15 @@ class Settings:
             self.secret_key_ephemeral = False
 
         self.database_url: str = os.environ.get("DATABASE_URL", "sqlite:///./data/panel.db")
+        # SSH host keys of the nodes (OpenSSH known_hosts format, trust on first use —
+        # app/node_ssh.py). Default: next to the SQLite file, i.e. in the same volume.
+        _db_dir = (
+            os.path.dirname(os.path.abspath(self.database_url.split("sqlite:///", 1)[-1]))
+            if self.database_url.startswith("sqlite:///") else os.path.abspath("data")
+        )
+        self.known_hosts_file: str = os.environ.get(
+            "KNOWN_HOSTS_FILE", os.path.join(_db_dir, "ssh_known_hosts")
+        )
 
         # First-run admin bootstrap.
         self.admin_username: str = os.environ.get("ADMIN_USERNAME", "admin")
