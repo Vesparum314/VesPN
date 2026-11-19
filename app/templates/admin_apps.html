@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Приложения — {{ brand }}{% endblock %}
+{% block content %}
+{% macro fields(a=None) %}
+  <label>Протокол
+    <select name="protocol" required>{% for p in protocols %}<option value="{{ p }}" {{ 'selected' if a and a.protocol == p }}>{{ protocol_labels[p] }}</option>{% endfor %}</select>
+  </label>
+  <label>Платформа
+    <select name="platform" required>{% for k, v in platforms.items() %}<option value="{{ k }}" {{ 'selected' if a and a.platform == k }}>{{ v }}</option>{% endfor %}</select>
+  </label>
+  <label>Приложение <input name="name" required maxlength="64" value="{{ a.name if a }}" placeholder="v2rayNG"></label>
+  <label>Версия <input name="version" maxlength="32" value="{{ a.version if a }}" placeholder="1.10.4"></label>
+  <label class="wide">Ссылка на эту версию <input name="url" type="url" required maxlength="512" value="{{ a.url if a }}" placeholder="https://github.com/…/releases/tag/1.10.4"></label>
+  <label class="wide">Заметка для клиента <input name="note" maxlength="255" value="{{ a.note if a }}" placeholder="Напр.: APK для arm64; импорт — «+» → «Из буфера»"></label>
+  <label>Порядок <input name="position" type="number" value="{{ a.position if a else 100 }}" style="width:90px" title="меньше — выше в списке"></label>
+{% endmacro %}
+<style>
+  .appform{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end}
+  .appform .wide{grid-column:span 2}
+  @media (max-width:620px){.appform .wide{grid-column:auto}}
+  tr.edit td{background:var(--panel-2)}
+  .url-cell{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+</style>
+
+<div class="head">
+  <div>
+    <h1>Приложения</h1>
+    <div class="sub">Рекомендованные клиенты. Клиент видит их в форме «Добавить устройство» для выбранного протокола; свою платформу — первой. Удобно давать ссылку на конкретную проверенную версию.</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Добавить приложение</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/admin/apps" class="appform">
+      {{ fields() }}
+      <div><button class="btn btn-primary" type="submit">Добавить</button></div>
+    </form>
+  </div>
+</div>
+
+{% for p in protocols %}
+{% set rows = apps|selectattr('protocol', 'equalto', p)|list %}
+<div class="panel">
+  <div class="panel-h"><h2>{{ protocol_labels[p] }}</h2><span class="muted" style="font-size:13px">{{ rows|selectattr('enabled')|list|length }} показывается клиентам</span></div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Платформа</th><th>Приложение</th><th>Версия</th><th>Ссылка</th><th>Заметка</th><th>Статус</th><th></th></tr></thead>
+    <tbody>
+    {% for a in rows %}
+      <tr>
+        <td data-label="Платформа">{{ a.platform_label }}</td>
+        <td data-label="Приложение"><b>{{ a.name }}</b></td>
+        <td data-label="Версия"><span class="mono">{{ a.version or '—' }}</span></td>
+        <td data-label="Ссылка" class="url-cell"><a href="{{ a.url }}" target="_blank" rel="noopener noreferrer" title="{{ a.url }}">{{ a.url }}</a></td>
+        <td data-label="Заметка">{{ a.note or '—' }}</td>
+        <td data-label="Статус">{% if a.enabled %}<span class="badge b-ok b-dot">показано</span>{% else %}<span class="badge b-exit">скрыто</span>{% endif %}</td>
+        <td data-label="Действия" class="full"><div class="row-actions">
+          <button class="btn btn-ghost btn-sm" type="button" onclick="var e=document.getElementById('edit-{{ a.id }}'); e.hidden=!e.hidden">Изменить</button>
+          <form method="post" action="/admin/apps/{{ a.id }}/toggle"><button class="btn btn-ghost btn-sm">{{ 'Скрыть' if a.enabled else 'Показать' }}</button></form>
+          <form method="post" action="/admin/apps/{{ a.id }}/delete" onsubmit="return confirm('Удалить «{{ a.name }}» из списка?')"><button class="btn btn-ghost btn-sm btn-danger">Удалить</button></form>
+        </div></td>
+      </tr>
+      <tr class="edit" id="edit-{{ a.id }}" hidden><td colspan="7" class="full">
+        <form method="post" action="/admin/apps/{{ a.id }}" class="appform">
+          {{ fields(a) }}
+          <div><button class="btn btn-sm" type="submit">Сохранить</button></div>
+        </form>
+      </td></tr>
+    {% else %}
+      <tr><td class="full muted" colspan="7">Пока ничего — клиенты видят только короткую подсказку, какое приложение нужно.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% endfor %}
+{% endblock %}

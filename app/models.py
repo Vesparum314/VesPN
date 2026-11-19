@@ -743,6 +743,38 @@ class Setting(Base):
 
 ANNOUNCEMENT_KEY = "announcement"  # legacy single-banner setting (migrated to Announcement)
 
+# Platforms of recommended client apps, in display order.
+APP_PLATFORMS = {
+    "android": "Android", "ios": "iPhone / iPad", "macos": "Mac",
+    "windows": "Windows", "linux": "Linux", "any": "все платформы",
+}
+
+
+class ClientApp(Base):
+    """A recommended client app the admin lists for one protocol and platform —
+    usually a link to a specific, known-good version. Clients see the enabled ones
+    for the protocol they pick when adding a device."""
+
+    __tablename__ = "client_apps"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    protocol: Mapped[str] = mapped_column(String(16), index=True)   # vless | awg | naive
+    platform: Mapped[str] = mapped_column(String(16))               # one of APP_PLATFORMS
+    name: Mapped[str] = mapped_column(String(64))
+    version: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    url: Mapped[str] = mapped_column(String(512))
+    note: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    position: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def platform_label(self) -> str:
+        return APP_PLATFORMS.get(self.platform, self.platform)
+
+    @property
+    def protocol_label(self) -> str:
+        return PROTOCOL_LABELS.get(self.protocol, self.protocol)
+
 
 class Announcement(Base):
     """An admin→clients message. Active ones show as a banner to every logged-in
