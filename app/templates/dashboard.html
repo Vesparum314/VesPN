@@ -4,7 +4,7 @@
 <div class="head">
   <div>
     <h1>Мои устройства</h1>
-    <div class="sub">Добавьте устройство, откройте его и получите конфиг — приложение, QR и инструкция внутри.</div>
+    <div class="sub">У каждого устройства — свой конфиг. Откройте устройство: там приложение, QR и инструкция.</div>
   </div>
 </div>
 
@@ -12,20 +12,18 @@
   <div class="flash flash-info">Вам пока не доступен ни один маршрут — попросите администратора выдать доступ (добавить вас в группу с маршрутом).</div>
 {% endif %}
 
-{% if devices %}
-<div class="grid">
-  {% for d in devices %}
-  <div class="card">
-    <div class="dev-top">
-      <span class="badge b-{{ d.protocol }} b-dot">{{ protocol_labels.get(d.protocol, d.protocol) }}</span>
-      <b>{{ d.name }}</b>
-    </div>
-    <small class="muted">Маршрут: {{ d.route.name if d.route else '— не выбран' }}</small>
+{% if cards %}
+<div class="grid devs">
+  {% for c in cards %}{% set d = c.d %}
+  <div class="card dev{% if d.retire_at %} retiring{% endif %}">
+    <div class="dev-top"><span class="badge b-{{ d.protocol }} b-dot">{{ protocol_labels.get(d.protocol, d.protocol) }}</span><b>{{ d.name }}</b></div>
+    {% if d.retire_at %}<div class="dev-flag bad">Будет удалено {{ d.retire_at.strftime('%d.%m') }} — создайте новое устройство</div>{% endif %}
+    {% if not c.access %}<div class="dev-flag bad">Нет доступа к маршруту</div>
+    {% elif d.pinned %}<div class="dev-mode"><span class="ico">→</span>{{ 'Маршрут' if d.protocol == 'awg' else 'Один маршрут' }}: {{ d.route.name }}</div>
+    {% else %}{% set n = c.routes|length %}<div class="dev-mode"><span class="ico">⟳</span>Подписка · {{ n }} {{ 'маршрут' if n % 10 == 1 and n % 100 != 11 else ('маршрута' if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else 'маршрутов') }}</div>{% endif %}
     <div class="dev-actions">
       <a class="btn btn-primary btn-sm" href="/devices/{{ d.id }}">Получить конфиг</a>
-      <form method="post" action="/devices/{{ d.id }}/delete" onsubmit="return confirm('Удалить устройство «{{ d.name }}»?')">
-        <button class="btn btn-ghost btn-sm btn-danger" type="submit">Удалить</button>
-      </form>
+      <form method="post" action="/devices/{{ d.id }}/delete" onsubmit="return confirm('Удалить устройство «{{ d.name }}»?')"><button class="del" type="submit">удалить</button></form>
     </div>
   </div>
   {% endfor %}
@@ -35,27 +33,24 @@
 {% endif %}
 
 {% if service_ready %}
-<div class="panel">
-  <div class="panel-h"><h2>Добавить устройство</h2></div>
-  <div class="panel-b">
-    <form method="post" action="/devices" class="form-row" id="add-device">
-      <label>Имя<input name="name" placeholder="например, Телефон" required></label>
-      <label>Маршрут
-        <select name="route_id" id="dev-route" required>
-          {% for r, ps in choices %}
-            <option value="{{ r.id }}" data-protos="{{ ps|join(',') }}">{{ r.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label>Протокол
-        <select name="protocol" id="dev-proto" required>
-          {% for p in protocols %}<option value="{{ p }}">{{ protocol_labels[p] }}</option>{% endfor %}
-        </select>
-      </label>
-      <button class="btn btn-primary" type="submit">Добавить</button>
-    </form>
-    <p class="hint" id="dev-hint"></p>
-  </div>
+<div class="panel nd" id="new">
+  <form method="post" action="/devices" class="nd-b" id="add-device">
+    <div class="nd-title">Новое устройство</div>
+    <div class="nd-row">
+      <input name="name" id="dn" placeholder="Название, например «Телефон»" autocomplete="off" aria-label="Название" required maxlength="64">
+      <div class="nd-seg" role="radiogroup" aria-label="Протокол">
+        {% for p in protocols if p in by_proto %}<label><input type="radio" name="protocol" value="{{ p }}"{% if loop.first %} checked{% endif %}><span>{{ protocol_labels[p] }}</span></label>{% endfor %}
+      </div>
+      <button class="btn btn-primary" id="go" type="submit">Добавить</button>
+    </div>
+    <div class="nd-desc" id="desc"></div>
+    <div class="nd-conn">
+      <span class="nd-k">Подключение</span>
+      <span id="c-sub"><span class="ico">⟳</span> подписка на все ваши маршруты: <span id="c-list"></span></span>
+      <span id="c-one" hidden><span class="ico">→</span> маршрут <select name="route_id" id="route" aria-label="Маршрут"></select></span>
+      <label class="nd-chk" id="c-chk"><input type="checkbox" name="route_mode" value="one" id="one"> только один маршрут</label>
+    </div>
+  </form>
 </div>
 {% endif %}
 
@@ -85,6 +80,53 @@
 
 {% block scripts %}
 <style>
+  .devs{margin-bottom:18px}
+  .dev{display:flex;flex-direction:column}
+  /* badge on top, the name under it at full width: a long name wraps tightly */
+  .dev .dev-top{flex-direction:column;align-items:flex-start;gap:8px;margin-bottom:8px}
+  .dev .dev-top b{line-height:1.15;overflow-wrap:anywhere}
+  .dev .dev-mode{font-size:13px;color:var(--fg-soft);display:flex;gap:7px;align-items:center}
+  .ico{color:var(--accent)}
+  .dev .dev-flag{font-size:13px;font-weight:600;margin-top:2px}
+  .dev .dev-flag.bad{color:var(--bad)}
+  .dev.retiring{border-color:color-mix(in srgb,var(--bad) 55%,var(--border))}
+  .dev .dev-actions{margin-top:auto;padding-top:14px}
+  .dev .dev-actions form{margin-left:auto}
+  .del{background:none;border:0;color:var(--muted);font:inherit;font-size:12.5px;cursor:pointer;text-decoration:underline;text-underline-offset:3px;padding:0}
+  .del:hover{color:var(--bad)}
+
+  .nd-b{padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+  .nd-title{font-weight:600;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .nd-row{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap}
+  .nd-row input[name=name]{flex:1 1 220px;min-width:0;max-width:340px}
+  .nd-seg{display:inline-flex;background:var(--panel-2);border:1px solid var(--border);padding:3px;gap:2px;border-radius:var(--radius)}
+  .nd-seg label{display:block;cursor:pointer;margin:0}
+  .nd-seg input{position:absolute;opacity:0;pointer-events:none}
+  .nd-seg span{display:block;padding:6px 12px;font-weight:600;font-size:13.5px;color:var(--muted);white-space:nowrap;border-radius:var(--radius)}
+  .nd-seg label:hover span{color:var(--fg)}
+  .nd-seg input:checked+span{background:var(--accent);color:var(--accent-fg)}
+  .nd-seg input:focus-visible+span{outline:2px solid var(--accent);outline-offset:1px}
+  .nd-row .btn{margin-left:auto}
+  .nd-desc{font-size:13px;color:var(--fg-soft)}
+  .nd-desc .apps-hint{color:var(--muted)}
+  .nd-conn{display:flex;gap:6px 14px;align-items:center;flex-wrap:wrap;font-size:13.5px;color:var(--fg-soft);border-top:1px solid var(--border);padding-top:10px}
+  .nd-k{color:var(--muted);font-size:12.5px}
+  .nd-conn b{color:var(--fg);font-weight:600}
+  .nd-conn select{width:auto;padding:4px 8px;font-size:13.5px;display:inline-block}
+  .nd-chk{display:inline-flex;flex-direction:row;align-items:center;gap:6px;margin-left:auto;font-size:13px;color:var(--muted);cursor:pointer}
+  .nd-chk input{width:auto;margin:0;accent-color:var(--accent)}
+  @media (max-width:720px){
+    .nd-row{display:contents}
+    .nd-row input[name=name]{order:1;max-width:none;flex-basis:auto}
+    .nd-seg{order:2}
+    .nd-seg label{flex:1;text-align:center}
+    .nd-seg span{padding:6px 4px}
+    .nd-desc{order:3}
+    .nd-conn{order:4}
+    .nd-chk{margin-left:0}
+    .nd-row .btn{order:5;width:100%;margin:0}
+  }
+
   #apps .seg{display:inline-flex;max-width:100%;overflow-x:auto;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:3px;gap:2px}
   #apps .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-weight:600;font-size:13.5px;padding:5px 12px;border-radius:7px;cursor:pointer;white-space:nowrap}
   #apps .seg button[aria-selected="true"]{background:var(--panel);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.12)}
@@ -100,35 +142,31 @@
   .apps .nt{color:var(--muted);font-size:12.5px;flex-basis:100%}
 </style>
 <script>
-// «Добавить устройство»: the protocol list follows the chosen route — only what
-// that route offers now.
+// «Новое устройство»: VLESS/NaiveProxy — subscription over every route by default
+// (a checkbox narrows it to one route); AmneziaWG — always one route.
 (function(){
-  var route = document.getElementById('dev-route'), proto = document.getElementById('dev-proto'),
-      hint = document.getElementById('dev-hint');
-  if (!route || !proto) return;
-  var LABEL = {{ protocol_labels|tojson }};
-  var HINT = {
-    vless: 'VLESS — v2rayNG (Android) или OneXray (iPhone, Mac, Windows).',
-    naive: 'NaiveProxy — Karing (все платформы) или NekoBox (Android).',
-    awg: 'AmneziaWG — приложение AmneziaVPN 5.0.1.5 или новее.'
-  };
-  function fill(){
-    var opt = route.options[route.selectedIndex];
-    var list = (opt ? opt.getAttribute('data-protos') : '').split(',').filter(Boolean);
-    var keep = proto.value;
-    proto.innerHTML = '';
-    list.forEach(function(p){
-      var o = document.createElement('option');
-      o.value = p; o.textContent = LABEL[p] || p;
-      proto.appendChild(o);
-    });
-    if (list.indexOf(keep) >= 0) proto.value = keep;
-    showHint();
+  var f = document.getElementById('add-device');
+  if (!f) return;
+  var ROUTES = {{ by_proto|tojson }}, IDS = {{ route_ids|tojson }}, DESC = {{ desc|tojson }};
+  var APPS = {};
+  {{ apps|tojson }}.forEach(function(a){ var l = APPS[a.protocol] = APPS[a.protocol] || []; if (l.indexOf(a.name) < 0) l.push(a.name); });
+  var one = document.getElementById('one'), sel = document.getElementById('route'), desc = document.getElementById('desc');
+  function esc(t){ var d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+  function render(){
+    var p = f.querySelector('input[name=protocol]:checked').value, list = ROUTES[p] || [], awg = p === 'awg';
+    var keep = sel.value;
+    desc.innerHTML = esc(DESC[p] || '') + (APPS[p] ? ' <span class="apps-hint">· ' + esc(APPS[p].join(', ')) + '</span>' : '');
+    document.getElementById('c-list').innerHTML = list.map(function(n){ return '<b>' + esc(n) + '</b>'; }).join(', ');
+    sel.innerHTML = list.map(function(n){ return '<option value="' + IDS[n] + '">' + esc(n) + '</option>'; }).join('');
+    if (keep && sel.querySelector('option[value="' + keep + '"]')) sel.value = keep;
+    var pick = awg || one.checked;
+    document.getElementById('c-sub').hidden = pick;
+    document.getElementById('c-one').hidden = !pick;
+    document.getElementById('c-chk').hidden = awg;
+    sel.disabled = !pick;  // not sent in subscription mode: the server picks the home route
   }
-  function showHint(){ hint.textContent = HINT[proto.value] || ''; }
-  route.addEventListener('change', fill);
-  proto.addEventListener('change', showHint);
-  fill();
+  f.addEventListener('change', render);
+  render();
 })();
 
 // «Рекомендованные приложения»: its own protocol switch (remembered in this

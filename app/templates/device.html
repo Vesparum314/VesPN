@@ -8,6 +8,9 @@
   </div>
 </div>
 
+{% if device.retire_at %}
+  <div class="flash flash-error"><b>Это устройство будет удалено {{ device.retire_at.strftime('%d.%m.%Y') }}.</b> Создайте новое на странице «Мои устройства» и добавьте в приложение его <b>подписку</b>, затем удалите это.</div>
+{% endif %}
 {% if paused %}
   <div class="flash flash-info">Этот протокол на маршруте временно приостановлен — конфиг сохранён и заработает снова после включения, перевыпускать ничего не нужно.</div>
 {% endif %}
@@ -16,7 +19,16 @@
 {% elif cfg %}
   {% if sub %}
   <div class="panel"><div class="panel-b">
-    <h2 style="margin:0 0 .5rem">Подписка — рекомендуется</h2>
+    <div class="mode-row">
+      <h2 style="margin:0">Подписка</h2>
+      <form method="post" action="/devices/{{ device.id }}/mode" class="mode-form" id="mode-form">
+        <label class="nd-chk"><input type="radio" name="route_mode" value="{{ ROUTE_ALL }}"{% if not device.pinned %} checked{% endif %}> все мои маршруты ({{ mode_routes|length }})</label>
+        <label class="nd-chk"><input type="radio" name="route_mode" value="{{ ROUTE_ONE }}"{% if device.pinned %} checked{% endif %}> один:
+          <select name="route_id" aria-label="Маршрут">{% for r in mode_routes %}<option value="{{ r.id }}"{% if route and r.id == route.id %} selected{% endif %}>{{ r.name }}</option>{% endfor %}</select></label>
+        <button class="btn btn-ghost btn-sm" type="submit">Применить</button>
+      </form>
+    </div>
+    <p class="muted" style="margin:.3rem 0 .8rem;font-size:13px">{% if device.sub_fetched_at %}Приложение обновляло подписку {{ device.sub_fetched_at.strftime('%d.%m %H:%M') }} UTC.{% else %}Приложение ещё ни разу не загружало эту подписку — добавьте её по ссылке или QR ниже.{% endif %}</p>
     <div class="cfg">
       <div class="qr"><img src="{{ sub_qr }}" alt="QR подписки" width="200" height="200"></div>
       <div style="min-width:0">
@@ -40,7 +52,7 @@
       </div>
     </div>
   </div></div>
-  <h2 style="margin:18px 0 .5rem">Или одной ссылкой</h2>
+  <details class="alt"><summary>Другой способ: одна ссылка без подписки</summary>
   {% endif %}
   <div class="panel"><div class="panel-b">
     <div class="cfg">
@@ -64,6 +76,7 @@
       </div>
     </div>
   </div></div>
+  {% if sub %}</details>{% endif %}
 
   {% if is_awg and ios_conf %}
   <div class="panel"><div class="panel-b">
@@ -88,6 +101,15 @@
 {% endblock %}
 
 {% block scripts %}
+<style>
+  .mode-row{display:flex;justify-content:space-between;align-items:center;gap:8px 16px;flex-wrap:wrap}
+  .mode-form{display:flex;gap:6px 14px;align-items:center;flex-wrap:wrap;margin:0}
+  .nd-chk{display:inline-flex;flex-direction:row;align-items:center;gap:6px;font-size:13px;color:var(--fg-soft);cursor:pointer}
+  .nd-chk input{width:auto;margin:0;accent-color:var(--accent)}
+  .nd-chk select{width:auto;padding:3px 6px;font-size:13px}
+  details.alt{margin-top:14px}
+  details.alt>summary{cursor:pointer;color:var(--muted);font-size:14px;margin-bottom:10px}
+</style>
 <script>
 function copyText(id, btn){
   var el=document.getElementById(id); if(!el) return;

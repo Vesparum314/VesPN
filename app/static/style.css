@@ -2,6 +2,7 @@
    Layout: sticky top bar; content spans the full width with a safe-area gutter;
    tables stack to cards on phones. */
 :root{
+  --proto-naive:#2f6db3;
   --font-display:"Sora","Segoe UI",system-ui,sans-serif;
   --font-body:"IBM Plex Sans","Segoe UI",system-ui,sans-serif;
   --font-mono:"IBM Plex Mono",ui-monospace,"Cascadia Code",monospace;
@@ -14,6 +15,7 @@
   --radius:16px; --radius-sm:10px;
 }
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --proto-naive:#6fa3e0;
   --bg:#0d121c; --panel:#141b28; --panel-2:#19212f; --panel-3:#1f2838;
   --border:#283244; --border-strong:#36435a;
   --fg:#e8edf6; --fg-soft:#c0cadb; --muted:#8694aa;
@@ -23,6 +25,7 @@
   color-scheme:dark;
 }}
 :root[data-theme="dark"]{
+  --proto-naive:#6fa3e0;
   --bg:#0d121c; --panel:#141b28; --panel-2:#19212f; --panel-3:#1f2838;
   --border:#283244; --border-strong:#36435a;
   --fg:#e8edf6; --fg-soft:#c0cadb; --muted:#8694aa;
@@ -99,7 +102,8 @@ main{padding:22px max(16px,env(safe-area-inset-right,0px)) 48px max(16px,env(saf
   padding:3px 9px;border-radius:999px;white-space:nowrap}
 .b-vless{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
 .b-awg{background:var(--ok-bg);color:var(--ok)}
-.b-naive{background:var(--warn-bg);color:var(--warn)}
+/* NaiveProxy: its own cool hue — amber sat too close to the VLESS accent */
+.b-naive{background:color-mix(in srgb,var(--proto-naive) 16%,transparent);color:var(--proto-naive)}
 .b-gate{background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent)}
 .b-exit{background:var(--panel-3);color:var(--fg-soft)}
 .b-ok{background:var(--ok-bg);color:var(--ok)}

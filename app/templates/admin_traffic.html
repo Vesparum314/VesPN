@@ -1,41 +1,153 @@
 {% extends "base.html" %}
 {% block title %}Трафик — {{ brand }}{% endblock %}
 {% block content %}
+{% macro bars(vals, w=112, h=26) %}{% set top = (vals|max) if vals else 0 %}{% set bw = w / (vals|length or 1) %}<svg class="spark" viewBox="0 0 {{ w }} {{ h }}" width="{{ w }}" height="{{ h }}" aria-hidden="true">{% for v in vals %}{% set bh = [1.5, (v / top * (h - 2)) if top else 0]|max %}<rect x="{{ '%.1f'|format(loop.index0 * bw + (1 if bw > 4 else 0.3)) }}" y="{{ '%.1f'|format(h - bh) }}" width="{{ '%.1f'|format([bw - (2 if bw > 4 else 0.6), 0.6]|max) }}" height="{{ '%.1f'|format(bh) }}"{% if not v %} class="z"{% endif %}/>{% endfor %}</svg>{% endmacro %}
+{% macro protobar(parts) %}{% set tot = parts.values()|sum %}<span class="pbar">{% for p in ('vless', 'naive', 'awg') %}{% if parts.get(p) %}<span class="pb-{{ p }}" style="width:{{ '%.1f'|format(parts[p] * 100 / tot) }}%" title="{{ protocol_labels.get(p, p) }}: {{ parts[p]|rbytes }}"></span>{% endif %}{% endfor %}</span>{% endmacro %}
+{% macro when(iso) %}{% if iso %}{{ iso[11:16] }} UTC{% if iso[:10] != (updated.strftime('%Y-%m-%d') if updated else '') %} {{ iso[8:10] }}.{{ iso[5:7] }}{% endif %}{% else %}—{% endif %}{% endmacro %}
+{% set q = '?period=' ~ period %}
+
 <div class="head">
   <div>
     <h1>Трафик</h1>
-    <div class="sub">Сколько конфигов у каждого пользователя и трафик по каждому (за день / всего). Сбор — периодически <b>через гейт</b> (не напрямую Хаб→выход).
-      {% if updated %} По состоянию на <span class="mono">{{ updated.strftime('%Y-%m-%d %H:%M') }}</span> UTC.{% else %} Сбор ещё не выполнялся.{% endif %}</div>
+    <div class="sub">Через каждый сервер и у кого. {% if updated %}Собрано в <span class="mono">{{ updated.strftime('%H:%M') }}</span> UTC{% else %}Сбора ещё не было{% endif %}, сбор раз в час.</div>
   </div>
-  <form method="post" action="/admin/traffic/collect" onsubmit="return confirm('Собрать трафик со всех выходов сейчас? Может занять до минуты.')"><button class="btn btn-primary">Собрать сейчас</button></form>
+  <div class="row-actions per-bar">
+    <div class="seg per" aria-label="Период">
+      {% for p, l in (('today', 'Сегодня'), ('7', '7 дней'), ('30', '30 дней')) %}<a href="?period={{ p }}&tab={{ tab }}" aria-current="{{ 'true' if period == p else 'false' }}">{{ l }}</a>{% endfor %}
+    </div>
+    <form method="get" class="status-form"><input type="hidden" name="tab" value="{{ tab }}">
+      <select name="period" onchange="this.form.submit()" aria-label="Календарный месяц" class="{{ 'on' if period.startswith('m:') }}">
+        <option value="" disabled {{ 'selected' if not period.startswith('m:') }}>месяц…</option>
+        {% for m in months %}<option value="m:{{ m }}" {{ 'selected' if period == 'm:' ~ m }}>{{ month_names[m[5:]|int - 1] }} {{ m[:4] }}</option>{% endfor %}
+      </select><noscript><button class="btn btn-ghost btn-sm">OK</button></noscript></form>
+    <form method="post" action="/admin/traffic/collect" onsubmit="return confirm('Собрать трафик со всех серверов сейчас? Может занять до минуты.')"><button class="btn btn-primary">Собрать сейчас</button></form>
+  </div>
 </div>
 
-{% for u in users %}
-  <div class="panel">
-    <div class="panel-h"><h2>{{ u.username }}
-      <span class="badge {{ 'b-gate' if u.role=='admin' else ('b-warn' if u.role=='operator' else 'b-exit') }}">{{ u.role_label }}</span>
-      <span class="muted">· конфигов: {{ u.devices|length }}</span>
-    </h2></div>
-    {% if u.devices %}
-    <div class="tbl-wrap"><table>
-      <thead><tr><th>Конфиг</th><th>Маршрут</th><th>За день (↑ / ↓)</th><th>Всего (↑ / ↓)</th></tr></thead>
-      <tbody>
-      {% for d in u.devices %}
-        {% set s = stats.get(d.id) %}
-        <tr>
-          <td data-label="Конфиг"><span class="badge b-{{ d.protocol }} b-dot">{{ {'vless':'VLESS','awg':'AWG','naive':'Naive'}.get(d.protocol, d.protocol) }}</span> {{ d.name }}</td>
-          <td data-label="Маршрут">{{ d.route.name if d.route else '—' }}</td>
-          <td data-label="За день">{% if s %}{{ s.up_today|hbytes }} / {{ s.down_today|hbytes }}{% else %}<span class="muted">—</span>{% endif %}</td>
-          <td data-label="Всего">{% if s %}{{ s.up_total|hbytes }} / {{ s.down_total|hbytes }}{% else %}<span class="muted">—</span>{% endif %}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table></div>
-    {% else %}
-    <div class="panel-b"><span class="muted">Нет конфигов.</span></div>
-    {% endif %}
-  </div>
-{% else %}
-  <div class="panel"><div class="panel-b"><span class="muted">Пользователей нет.</span></div></div>
+{% for s in ov.stale %}
+  <div class="flash flash-info"><b>{{ s.node.name }}</b> не ответил при последнем сборе{% if s.ok_at %} — его цифры на {{ when(s.ok_at) }}{% endif %}. <span class="muted">{{ s.err }}</span></div>
 {% endfor %}
+
+<div class="tiles">
+  <div class="tile"><span class="k">Через выходы · {{ ov.label }}</span><b>{{ ov.exits_total|rbytes }}</b><span class="muted small">{% if ov.down_share is not none %}↓ к людям {{ ov.down_share }}% · ↑ {{ 100 - ov.down_share }}%{% else %}данных за период нет{% endif %}</span></div>
+  <div class="tile"><span class="k">Самый загруженный</span>{% if ov.busiest %}<b>{{ ov.busiest.node.name if ov.busiest.node else ov.busiest.name }}</b><span class="muted small">{{ ov.busiest.total|rbytes }} · {{ (ov.busiest.total * 100 / ov.exits_total)|round|int }}% всего</span>{% else %}<b>—</b>{% endif %}</div>
+  <div class="tile"><span class="k">Активных устройств</span><b>{{ ov.active }}</b><span class="muted small">из {{ ov.devices_total }}</span></div>
+  <div class="tile"><span class="k">Проверочный трафик</span><b>{{ ov.probe|rbytes }}</b><span class="muted small">замеры «Скорость»</span></div>
+</div>
+
+<div class="ttabs">
+  <a href="{{ q }}&tab=srv" aria-current="{{ 'true' if tab == 'srv' else 'false' }}">Серверы</a>
+  <a href="{{ q }}&tab=ppl" aria-current="{{ 'true' if tab == 'ppl' else 'false' }}">Люди</a>
+</div>
+
+{% if tab == 'srv' %}
+<div class="panel">
+  <div class="tbl-wrap"><table class="srv">
+    <thead><tr><th>Сервер</th><th class="num">{{ ov.label|capitalize }}</th><th>По дням</th><th>По протоколам <span class="legend"><i class="pb-vless"></i>VLESS <i class="pb-naive"></i>Naive <i class="pb-awg"></i>AWG</span></th></tr></thead>
+    {% for g in ov.groups %}
+    <tbody>
+      <tr class="rt-h"><td colspan="4"><b>{{ g.name }}</b>{% if g.route and not g.route.enabled %} <span class="muted small">· выключен</span>{% endif %}<span class="rt-tot">{{ g.total|rbytes }}</span></td></tr>
+      {% for e in g.gates %}
+      <tr class="gate">
+        <td><div class="nm"><span class="role">гейт</span><b>{{ e.node.name }}</b>{% if e.shared %} <span class="muted small">· общий с {{ e.shared|join(', ') }}</span>{% endif %}</div><div class="mono muted small">{{ e.node.public_host }}</div></td>
+        <td class="num"><b>{{ e.total|rbytes }}</b><div class="muted small">весь трафик через гейт</div><span class="load"><span style="width:{{ '%.1f'|format(e.total * 100 / ov.top_load) }}%"></span></span></td>
+        <td>{{ bars(e.series) }}</td>
+        <td><span class="muted small">по счётчикам интерфейса</span></td>
+      </tr>
+      {% endfor %}
+      {% for e in g.exits %}
+      <tr>
+        <td><div class="nm"><span class="role exit">выход</span><b>{{ e.node.name if e.node else e.name }}</b>{% if not e.node %} <span class="muted small">· сервер удалён</span>{% endif %}{% if e.stale %} <span class="badge b-warn" title="{{ e.stale.err }}">нет ответа</span>{% endif %}</div>{% if e.node %}<div class="mono muted small">{{ e.node.public_host }}</div>{% endif %}</td>
+        <td class="num"><b>{{ e.total|rbytes }}</b><div class="muted small">↓ {{ e.down|rbytes }} · ↑ {{ e.up|rbytes }}</div><span class="load"><span style="width:{{ '%.1f'|format(e.total * 100 / ov.top_load) }}%"></span></span></td>
+        <td>{{ bars(e.series) }}</td>
+        <td>{% if e.total %}{{ protobar(e.proto) }}{% else %}<span class="muted small">—</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    {% endfor %}
+  </table></div>
+  <p class="hint" style="padding:0 18px 14px">Выход — сумма трафика устройств на нём, по протоколам. Гейт — счётчики его сетевого интерфейса (журнал гейтов): там весь трафик маршрута, включая служебный. NaiveProxy учитывается, когда соединение закрывается, — длинная сессия попадает в час её окончания. Сутки — по Москве, история хранится 3 месяца.</p>
+</div>
+{% else %}
+<div class="panel">
+  <div class="ppl-h"><span>Человек</span><span class="num">{{ ov.label|capitalize }}</span><span>По дням</span></div>
+  {% for p in ov.people %}
+  <details class="person">
+    <summary><span class="who"><b>{{ p.user.username if p.user else p.username }}</b> <span class="muted small">{% if p.user %}{{ p.user.role_label }}{% else %}удалён{% endif %} · устройств: {{ p.devices|rejectattr('gone')|list|length }}</span></span>
+      <span class="num"><b>{{ p.total|rbytes }}</b><span class="load"><span style="width:{{ '%.1f'|format(p.total * 100 / ov.top_person) }}%"></span></span></span>
+      <span>{{ bars(p.series) }}</span></summary>
+    {% if p.devices %}
+    <table class="devs">
+      {% for d in p.devices %}{% set dev = d.device %}
+      <tr class="{{ 'gone' if d.gone }}">
+        <td><span class="badge b-{{ d.protocol }} b-dot">{{ protocol_labels.get(d.protocol, d.protocol) }}</span> {{ d.name }}</td>
+        <td class="muted small">{% if d.gone %}удалено{% elif dev.protocol == 'awg' %}Маршрут: {{ dev.route.name if dev.route else '—' }}{% elif dev.pinned %}Один маршрут: {{ dev.route.name if dev.route else '—' }}{% else %}Подписка{% endif %}{% if dev and dev.retire_at %} · будет удалено {{ dev.retire_at.strftime('%d.%m') }}{% endif %}</td>
+        <td class="num">{{ d.total|rbytes }}</td>
+        <td>{{ bars(d.series, 84, 20) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </details>
+  {% endfor %}
+  <p class="hint" style="padding:0 18px 14px">Удалённые устройства и люди остаются в истории серыми — итоги не обнуляются.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<style>
+  :root{--p-vless:var(--accent);--p-naive:var(--proto-naive);--p-awg:var(--ok)}
+  .small{font-size:12.5px}
+  .num{text-align:right;white-space:nowrap}
+  .per-bar{align-items:center}
+  .seg.per{display:inline-flex;background:var(--panel-2);border:1px solid var(--border);padding:3px;gap:2px;border-radius:var(--radius)}
+  .seg.per a{color:var(--muted);font-weight:600;font-size:13px;padding:5px 11px;text-decoration:none;border-radius:var(--radius)}
+  .seg.per a[aria-current=true]{background:var(--accent);color:var(--accent-fg)}
+  .per-bar select{width:auto;padding:5px 8px;font-size:13px}
+  .per-bar select.on{border-color:var(--accent);color:var(--accent)}
+  .tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+  .tile{border:1px solid var(--border);background:var(--panel);padding:12px 14px;display:flex;flex-direction:column;gap:3px;border-radius:var(--radius);min-width:0}
+  .tile .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .tile b{font-size:20px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ttabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid var(--border)}
+  .ttabs a{color:var(--muted);font-weight:600;padding:8px 14px;text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px}
+  .ttabs a[aria-current=true]{color:var(--accent);border-bottom-color:var(--accent)}
+  table.srv{width:100%}
+  table.srv td{vertical-align:middle}
+  .rt-h td{background:var(--panel-2);padding-top:10px;padding-bottom:8px}
+  .rt-tot{float:right;font-weight:600}
+  .nm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .role{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;padding:1px 6px;border:1px solid var(--border-strong);color:var(--muted)}
+  .role.exit{color:var(--accent);border-color:var(--accent-line)}
+  tr.gate td{opacity:.85}
+  .load{display:block;height:3px;background:var(--panel-3);margin-top:5px;min-width:90px}
+  .load span{display:block;height:100%;background:var(--accent)}
+  .spark rect{fill:var(--accent);opacity:.75}
+  .spark rect.z{opacity:.2}
+  .pbar{display:flex;height:8px;width:160px;background:var(--panel-3);overflow:hidden}
+  .pbar span{display:block;height:100%}
+  .pb-vless{background:var(--p-vless)}
+  .pb-naive{background:var(--p-naive)}
+  .pb-awg{background:var(--p-awg)}
+  .legend{font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px;color:var(--muted)}
+  .legend i{display:inline-block;width:8px;height:8px;margin:0 4px 0 8px}
+  .ppl-h,.person summary{display:grid;grid-template-columns:minmax(0,1fr) 170px 130px;gap:14px;align-items:center;padding:10px 18px}
+  .ppl-h{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);border-bottom:1px solid var(--border)}
+  .person{border-bottom:1px solid var(--border)}
+  .person summary{cursor:pointer;list-style:none}
+  .person summary::-webkit-details-marker{display:none}
+  .person summary .who::before{content:"▸ ";color:var(--muted)}
+  .person[open] summary .who::before{content:"▾ "}
+  .person[open]{background:var(--panel-2)}
+  table.devs{width:100%;margin:0 0 8px}
+  table.devs td{padding:6px 18px 6px 36px;border:0}
+  tr.gone td{opacity:.45}
+  @media (max-width:720px){
+    .tiles{grid-template-columns:1fr 1fr}
+    .ppl-h,.person summary{grid-template-columns:minmax(0,1fr) 110px}
+    .ppl-h span:last-child,.person summary>span:last-child{display:none}
+    .pbar{width:100px}
+  }
+</style>
 {% endblock %}

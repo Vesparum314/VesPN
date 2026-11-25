@@ -25,7 +25,20 @@
 <div class="head">
   <div>
     <h1>Приложения</h1>
-    <div class="sub">Рекомендованные клиенты. Клиент видит их в форме «Добавить устройство» для выбранного протокола; свою платформу — первой. Удобно давать ссылку на конкретную проверенную версию.</div>
+    <div class="sub">Рекомендованные клиенты и описания протоколов. Клиент видит их на странице «Мои устройства»: описание — под переключателем протокола в форме нового устройства, приложения — в блоке «Рекомендованные приложения», свою платформу первой. Удобно давать ссылку на конкретную проверенную версию.</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Описания протоколов</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/admin/apps/descriptions" class="appform" style="grid-template-columns:1fr">
+      {% for p in ('vless', 'naive', 'awg') %}
+      <label>{{ protocol_labels[p] }} <input name="{{ p }}" maxlength="300" value="{{ desc[p] }}" placeholder="{{ desc_default[p] }}"></label>
+      {% endfor %}
+      <div><button class="btn btn-primary" type="submit">Сохранить описания</button></div>
+    </form>
+    <p class="hint">Одна строка на протокол — что он даёт человеку. Пустое поле — текст по умолчанию.</p>
   </div>
 </div>
 

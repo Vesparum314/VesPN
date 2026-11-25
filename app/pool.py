@@ -145,11 +145,16 @@ def _pool_configs(db: Session, pool: ExitPool, protocol: str) -> list[IssuedConf
 
 
 # VLESS and NaiveProxy clients are accounts (uuid / login+password) that can live
-# on several pools at once, so a device's subscription can list every route of its
-# protocol its owner may use. (AmneziaWG peers are per pool: address + key.)
+# on several pools at once, so a device in ROUTE_ALL mode is served by every route of
+# its protocol its owner may use (one subscription lists them all). A ROUTE_ONE device
+# and every AmneziaWG device (peers are per pool) use their own route only.
+#
+# Access is checked live everywhere below: a route the owner lost access to (group
+# removed, route switched off) drops out of the subscription, and the next sync of
+# its pool removes the account / peer from the servers. If access comes back, the
+# same config works again after the next sync.
 def user_proto_routes(db: Session, user, proto: str) -> list[Route]:
-    """Enabled routes of `proto` the user may use — what their devices'
-    subscriptions list (the device's own route first is up to the caller)."""
+    """Enabled routes of `proto` the user may use."""
     return [r for r in accessible_routes(db, user) if r.serves(proto) and r.pool is not None]
 
 
@@ -157,13 +162,51 @@ def user_vless_routes(db: Session, user) -> list[Route]:
     return user_proto_routes(db, user, PROTO_VLESS)
 
 
+def own_route_usable(device: Device) -> bool:
+    r = device.route
+    return r is not None and r.pool is not None and r.allows(device.user) and r.has(device.protocol)
+
+
+def device_routes(db: Session, device: Device, _acc: dict | None = None) -> list[Route]:
+    """Routes the device is served by right now, its own route first. `_acc` caches
+    user_proto_routes per (user, protocol) for callers that loop over many devices."""
+    own = device.route if own_route_usable(device) else None
+    if device.pinned:
+        return [own] if own is not None else []
+    key = (device.user_id, device.protocol)
+    if _acc is not None and key in _acc:
+        routes = _acc[key]
+    else:
+        routes = user_proto_routes(db, device.user, device.protocol)
+        if _acc is not None:
+            _acc[key] = routes
+    if own is not None:
+        routes = [own] + [r for r in routes if r.id != own.id]
+    return routes
+
+
+def device_has_access(db: Session, device: Device) -> bool:
+    return bool(device_routes(db, device))
+
+
+def ensure_home_route(db: Session, device: Device) -> None:
+    """A ROUTE_ALL device whose own route became unusable (access lost, route off)
+    gets the first usable route of its protocol as the new home — its single link
+    points there. The account itself stays the same (same uuid / login)."""
+    if device.pinned or own_route_usable(device):
+        return
+    for r in user_proto_routes(db, device.user, device.protocol):
+        if not r.proto_block_reason(device.protocol):
+            device.route_id = r.id
+            db.commit()
+            db.refresh(device)
+            return
+
+
 def device_proto_pools(db: Session, device: Device, proto: str) -> list[ExitPool]:
-    """Server pools a device's account must exist on: its own route's pool plus
-    the pool of every `proto` route its owner may use."""
+    """Server pools the device's account must exist on."""
     pools: dict[int, ExitPool] = {}
-    if device.route is not None and device.route.pool is not None:
-        pools[device.route.pool.id] = device.route.pool
-    for r in user_proto_routes(db, device.user, proto):
+    for r in device_routes(db, device):
         pools.setdefault(r.pool.id, r.pool)
     return list(pools.values())
 
@@ -173,26 +216,57 @@ def device_vless_pools(db: Session, device: Device) -> list[ExitPool]:
 
 
 def pool_proto_configs(db: Session, pool: ExitPool, proto: str) -> list[IssuedConfig]:
-    """Accounts of `proto` that must exist on `pool`'s servers: configs issued on
-    the pool, plus those of devices whose owner may use some `proto` route on it
-    (they reach it through their subscription). A user who loses access to all of
-    the pool's routes drops out — reconcile then removes the account. A protocol
-    paused on the pool's route has no accounts at all (they come back on resume)."""
+    """Accounts of `proto` that must exist on `pool`'s servers: of devices served by
+    a route on this pool (device_routes — mode and access included). A protocol paused
+    on the pool's route has no accounts at all (they come back on resume)."""
     carrying = [r for r in pool.routes if r.has(proto)]
     if carrying and not any(r.serves(proto) for r in carrying):
         return []  # paused: the servers drop its accounts, the configs stay in the DB
-    routes = [r for r in pool.routes if r.enabled and r.serves(proto)]
+    acc: dict = {}
     out = []
     for c in db.query(IssuedConfig).filter(IssuedConfig.protocol == proto).all():
         if proto == PROTO_VLESS and not c.uuid:
             continue
-        if c.pool_id == pool.id:
-            out.append(c)
-            continue
         dev = c.device
-        if dev is not None and any(r.allows(dev.user) for r in routes):
+        if dev is None:
+            continue
+        if any(r.pool_id == pool.id for r in device_routes(db, dev, acc)):
             out.append(c)
     return out
+
+
+def pool_awg_peers(db: Session, pool: ExitPool) -> list[IssuedConfig]:
+    """AmneziaWG peers that must exist on `pool`: issued on it, owner still allowed
+    on the device's route (peers of a revoked route are taken off the servers)."""
+    out = []
+    for c in _pool_configs(db, pool, PROTO_AWG):
+        dev = c.device
+        if dev is not None and own_route_usable(dev) and dev.route.pool_id == pool.id:
+            out.append(c)
+    return out
+
+
+def reconcile_pools_async(pool_ids: list[int] | None = None) -> None:
+    """Sync pools in the background (all when None): after access, mode or route
+    changes, so accounts appear on / leave the servers without an «Применить»."""
+    import threading
+
+    def run() -> None:
+        from .db import SessionLocal
+
+        db = SessionLocal()
+        try:
+            ids = pool_ids if pool_ids is not None else [p.id for p in db.query(ExitPool).all()]
+            for pid in ids:
+                pool = db.get(ExitPool, pid)
+                if pool is not None and pool.members:
+                    reconcile_pool(db, pool, soft=True)
+        except Exception as e:
+            log.warning("background pool sync failed: %s", e)
+        finally:
+            db.close()
+
+    threading.Thread(target=run, name="pool-sync", daemon=True).start()
 
 
 def pool_vless_configs(db: Session, pool: ExitPool) -> list[IssuedConfig]:
@@ -312,9 +386,11 @@ def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> 
 
 
 # --- reconcile ----------------------------------------------------------
-def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
+def reconcile_exit(db: Session, pool: ExitPool, node: Node, soft: bool = False) -> dict:
     """Converge one exit to the pool's desired client/peer set (idempotent).
-    Adds missing clients/peers and removes extras, then records sync state."""
+    Adds missing clients/peers and removes extras, then records sync state.
+    `soft` (background syncs after access changes): a failure is only logged — the
+    node keeps its state, so one SSH hiccup doesn't take the route out of service."""
     added_v = removed_v = added_a = removed_a = 0
     protos = pool.protocols
     try:
@@ -324,7 +400,12 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
                 with n.tunnel(node.xui_port) as lport:
                     xui = XUIClient(f"http://127.0.0.1:{lport}/{node.xui_path}", node.xui_token)
                     inbound = xui.find_vless_inbound()
-                    desired = pool_vless_configs(db, pool)
+                    desired = list(pool_vless_configs(db, pool))
+                    from . import speed  # the speed probes' service client, while they are on
+
+                    probe = speed.vless_probe_config(db, pool)
+                    if probe is not None:
+                        desired.append(probe)
                     desired_emails = {c.identifier for c in desired}
                     # Robust check: don't trust list_client_emails() for "present"
                     # (orphaned clients from an inbound recreate still appear there
@@ -356,7 +437,7 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
             if PROTO_AWG in protos:
                 mgr = AWGManager(n)
                 mgr.discover_container()
-                desired_a = _pool_configs(db, pool, PROTO_AWG)
+                desired_a = pool_awg_peers(db, pool)
                 desired_pubs = {c.identifier for c in desired_a}
                 current_pubs = {pub for pub, _ in mgr.list_peers()}
                 for c in desired_a:
@@ -372,9 +453,11 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
 
                 naive.sync(n, db, pool)
     except Exception as e:
-        node.sync_state = SYNC_UNREACHABLE
-        node.last_reconcile_at = _now()
-        db.commit()
+        db.rollback()
+        if not soft:
+            node.sync_state = SYNC_UNREACHABLE
+            node.last_reconcile_at = _now()
+            db.commit()
         log.warning("reconcile of %s failed: %s", node.name, e)
         return {"node": node.name, "ok": False, "error": str(e)}
 
@@ -388,9 +471,9 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
     }
 
 
-def reconcile_pool(db: Session, pool: ExitPool) -> list[dict]:
+def reconcile_pool(db: Session, pool: ExitPool, soft: bool = False) -> list[dict]:
     """Reconcile every member of the pool; never raises."""
-    return [reconcile_exit(db, pool, m) for m in pool.members]
+    return [reconcile_exit(db, pool, m, soft=soft) for m in pool.members]
 
 
 # --- issuance -----------------------------------------------------------
@@ -749,6 +832,7 @@ def provision_gate_relay(db: Session, gate: Node) -> dict:
     with connect(gate) as g:
         provisioning.install_fleet_key(g, fleetkey.public_line(db))  # key-manage from here on
         info = relay.install(g, plan)
+        provisioning.ensure_mtr(g)  # for the speed monitor's path traces (optional)
     if not gate.key_installed:
         gate.key_installed = True
         db.commit()

@@ -46,7 +46,7 @@
           {% elif not groups %}<span class="muted">групп нет — создайте ниже</span>{% endif %}
         </div>
       </td>
-      <td data-label="Устройств">{{ u.devices | length }}</td>
+      <td data-label="Устройств">{{ u.devices | length }}{% set ret = u.devices | selectattr('retire_at') | list | length %}{% if no_access[u.id] %} <span class="badge b-bad" title="устройства на маршрутах, к которым у человека больше нет доступа">без доступа: {{ no_access[u.id] }}</span>{% endif %}{% if ret %} <span class="badge b-warn">на удаление: {{ ret }}</span>{% endif %}</td>
       <td data-label="Пароль">{% if u.must_change_password %}<span class="badge b-warn">временный</span>{% else %}задан{% endif %}</td>
       <td data-label="Действия" class="full"><div class="row-actions">
         {% if user.is_admin and u.id != user.id %}<form method="post" action="/admin/users/{{ u.id }}/reset-password" onsubmit="return confirm('Сбросить пароль {{ u.username }} на временный?\n\nОткрытые сессии завершатся, при входе нужно будет задать свой пароль.')"><button class="btn btn-ghost btn-sm">Сбросить пароль</button></form>{% endif %}
@@ -56,6 +56,29 @@
   {% endfor %}
   </tbody>
 </table></div></div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Устройства на удаление{% if retiring %} · {{ retiring|length }}{% endif %}</h2></div>
+  <div class="panel-b">
+    {% if retiring %}
+    <details><summary class="muted">Список</summary>
+      <ul style="margin:6px 0 10px 18px">{% for d in retiring %}<li><b>{{ d.user.username }}</b> — {{ d.name }} <span class="muted">({{ protocol_labels.get(d.protocol, d.protocol) }}, {{ d.route.name if d.route else 'без маршрута' }}, до {{ d.retire_at.strftime('%d.%m') }})</span>
+        <form method="post" action="/admin/devices/{{ d.id }}/retire" style="display:inline"><button class="del" type="submit" style="background:none;border:0;color:var(--muted);text-decoration:underline;cursor:pointer;font-size:12.5px">снять</button></form></li>{% endfor %}</ul>
+    </details>
+    <div class="row-actions" style="margin-bottom:12px">
+      <form method="post" action="/admin/devices/retire/delete" onsubmit="return confirm('Удалить все помеченные устройства ({{ retiring|length }})? Их конфиги перестанут работать сразу.')"><button class="btn btn-danger btn-sm">Удалить помеченные ({{ retiring|length }})</button></form>
+      <form method="post" action="/admin/devices/retire/clear" onsubmit="return confirm('Снять все пометки?')"><button class="btn btn-ghost btn-sm">Снять все пометки</button></form>
+    </div>
+    {% endif %}
+    <form method="post" action="/admin/devices/retire/mark" class="form-row">
+      <label>Пометить все устройства маршрута
+        <select name="route_id" required>{% for r in routes %}<option value="{{ r.id }}">{{ r.name }}{% if not r.enabled %} (выключен){% endif %}</option>{% endfor %}</select></label>
+      <label>Удалить после <input type="date" name="day" required></label>
+      <button class="btn" type="submit">Пометить</button>
+    </form>
+    <p class="hint">Владельцы видят на устройстве «Будет удалено <дата> — создайте новое». Удаление — кнопкой выше, когда люди перевыпустят конфиги: учётки уходят с серверов при синхронизации.</p>
+  </div>
+</div>
 
 <div class="panel">
   <div class="panel-h"><h2>Создать пользователя</h2></div>

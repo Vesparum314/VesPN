@@ -106,3 +106,31 @@ def set_temp_password(db: Session, password: str) -> None:
     else:
         s.value = encrypt(password)
     db.commit()
+
+
+# --- protocol descriptions on the «Мои устройства» form ---------------------
+# One line per protocol under the protocol switch, edited by the admin on the
+# «Приложения» page; these are the defaults until then.
+PROTO_DESC_DEFAULT = {
+    "vless": "С подпиской: приложение само переключится, если вход заблокируют.",
+    "naive": "Выглядит как обычный HTTPS-сайт, тоже с подпиской.",
+    "awg": "Быстрый, без подписки: конфиг на один маршрут, при бане гейта имя само укажет "
+           "на живой гейт этого маршрута.",
+}
+_K_DESC = "proto_desc_{}"
+
+
+def proto_desc(db: Session) -> dict[str, str]:
+    return {p: (_raw(db, _K_DESC.format(p)) or d) for p, d in PROTO_DESC_DEFAULT.items()}
+
+
+def set_proto_desc(db: Session, protocol: str, text: str) -> None:
+    """Empty text restores the default."""
+    key = _K_DESC.format(protocol)
+    s = db.get(Setting, key)
+    text = " ".join(text.split())[:300]
+    if s is None:
+        db.add(Setting(key=key, value=text))
+    else:
+        s.value = text
+    db.commit()

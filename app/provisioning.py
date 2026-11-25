@@ -59,16 +59,27 @@ def ensure_base(node: SSHNode) -> None:
     Notably `curl`: the 3x-ui installer, the Docker install script and the Xray
     pin all shell out to curl, and fresh ufo.hosting Debian 13 ships without it."""
     _rc, out, _ = node.run("command -v curl >/dev/null 2>&1 && echo yes || echo no", timeout=20)
-    if out.strip().endswith("yes"):
-        return
-    node.run(
-        "apt-get update >/dev/null 2>&1; "
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates >/dev/null 2>&1; true",
-        timeout=300,
-    )
-    _rc, chk, _ = node.run("command -v curl || echo NONE", timeout=15)
-    if "NONE" in chk:
-        raise ProvisionError("could not install curl on the node (needed for provisioning)")
+    if not out.strip().endswith("yes"):
+        node.run(
+            "apt-get update >/dev/null 2>&1; "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates >/dev/null 2>&1; true",
+            timeout=300,
+        )
+        _rc, chk, _ = node.run("command -v curl || echo NONE", timeout=15)
+        if "NONE" in chk:
+            raise ProvisionError("could not install curl on the node (needed for provisioning)")
+    ensure_mtr(node)
+
+
+def ensure_mtr(node: SSHNode) -> None:
+    """mtr: the speed monitor's snapshot traces the path when a route slows down
+    (app/speed.py). Optional — nothing fails without it."""
+    try:
+        node.run("command -v mtr >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+                 "mtr-tiny >/dev/null 2>&1 || { apt-get update >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive "
+                 "apt-get install -y -qq mtr-tiny >/dev/null 2>&1; }; true; }", timeout=300)
+    except Exception:
+        pass
 
 
 def install_3xui(node: SSHNode) -> dict:
