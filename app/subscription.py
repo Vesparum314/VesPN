@@ -94,14 +94,12 @@ def allow(ip: str) -> bool:
 
 # --- entries ------------------------------------------------------------
 def _routes_for(db: Session, device: Device) -> list[Route]:
-    from .pool import user_proto_routes
+    """Routes the subscription lists: the device's own route first, then (ROUTE_ALL)
+    every other route of its protocol the owner may use — those that take clients now."""
+    from .pool import device_routes
 
     proto = device.protocol
-    routes = [r for r in user_proto_routes(db, device.user, proto) if not r.proto_block_reason(proto)]
-    own = device.route
-    if own is not None and own.serves(proto) and own.pool is not None:
-        routes = [own] + [r for r in routes if r.id != own.id]
-    return routes
+    return [r for r in device_routes(db, device) if not r.proto_block_reason(proto)]
 
 
 def entries(db: Session, device: Device) -> list[dict]:

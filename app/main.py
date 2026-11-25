@@ -51,6 +51,8 @@ from .models import (
     ROLE_GATE,
     ROLE_OPERATOR,
     ROLES,
+    ROUTE_ALL,
+    ROUTE_ONE,
     USER_ROLES,
     APP_PLATFORMS,
     Announcement,
@@ -379,15 +381,19 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     user = current_user(request, db)
     if not user:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
-    routes = pool_ops.accessible_routes(db, user)  # routes this client may use
-    # Per route: the protocols a new device can get there right now (on, not
-    # blocked) — the form offers only these after the route is picked.
-    choices = [(r, [p for p in r.active_protocols if not r.proto_block_reason(p)]) for r in routes]
-    choices = [(r, ps) for r, ps in choices if ps]
+    # Per protocol: the routes a new device can get right now (on, not blocked).
+    by_proto = _new_device_routes(db, user)
+    acc: dict = {}
+    cards = []
+    for d in user.devices:
+        rs = pool_ops.device_routes(db, d, acc)
+        cards.append({"d": d, "routes": rs, "access": bool(rs)})
     return render(
         request, "dashboard.html",
-        user=user, devices=user.devices, protocols=PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
-        service_ready=bool(choices), choices=choices,
+        user=user, cards=cards, protocols=PROTOCOLS, protocol_labels=PROTOCOL_LABELS,
+        service_ready=bool(by_proto), by_proto={p: [r.name for r in rs] for p, rs in by_proto.items()},
+        route_ids={r.name: r.id for rs in by_proto.values() for r in rs},
+        desc=appconfig.proto_desc(db),
         apps=[{"protocol": a.protocol, "platform": a.platform, "platform_label": a.platform_label,
                "name": a.name, "version": a.version, "url": a.url, "note": a.note}
               for a in db.query(ClientApp).filter_by(enabled=True)
@@ -395,14 +401,29 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     )
 
 
+def _new_device_routes(db: Session, user: User) -> dict[str, list[Route]]:
+    """{protocol: routes a new device of it can use now}, protocols without any left out."""
+    routes = pool_ops.accessible_routes(db, user)
+    out: dict[str, list[Route]] = {}
+    for p in PROTOCOLS:
+        rs = [r for r in routes if r.pool is not None and r.serves(p) and not r.proto_block_reason(p)]
+        if rs:
+            out[p] = rs
+    return out
+
+
 @app.post("/devices")
 def create_device(
     request: Request,
     name: str = Form(...),
     protocol: str = Form(...),
+    route_mode: str = Form(""),
     route_id: str = Form(""),
     db: Session = Depends(get_db),
 ):
+    """VLESS/NaiveProxy: by default the device gets a subscription over every route of
+    its protocol the owner may use (route_mode=all; route_id, if given, is the «home»
+    route of its single link). route_mode=one / AmneziaWG: the chosen route only."""
     user = current_user(request, db)
     if not user:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
@@ -410,26 +431,58 @@ def create_device(
     if not name or protocol not in PROTOCOLS:
         flash(request, "Укажите имя и протокол", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    # The client picks a route among those their groups grant access to.
+    mode = ROUTE_ONE if (protocol == PROTO_AWG or route_mode == ROUTE_ONE) else ROUTE_ALL
+    usable = _new_device_routes(db, user).get(protocol, [])
+    if not usable:
+        flash(request, f"Для {PROTOCOL_LABELS.get(protocol, protocol)} сейчас нет доступного вам маршрута", "error")
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     route = db.get(Route, int(route_id)) if route_id.strip().isdigit() else None
-    if not route or not route.allows(user):
-        flash(request, "Выберите доступный вам маршрут", "error")
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    if not route.has(protocol):
-        flash(request, f"Маршрут «{route.name}» — для {route.protocol_label}, выберите другой", "error")
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    reason = route.proto_block_reason(protocol)
-    if reason:
-        flash(request, f"Маршрут «{route.name}» сейчас недоступен для этого протокола: {reason}", "error")
-        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    if mode == ROUTE_ONE:
+        if route is None or route not in usable:
+            flash(request, "Выберите доступный вам маршрут этого протокола", "error")
+            return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    elif route is None or route not in usable:
+        route = usable[0]
     exists = db.query(Device).filter_by(user_id=user.id, name=name, protocol=protocol).first()
     if exists:
         flash(request, "Устройство с таким именем и протоколом уже есть", "error")
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    db.add(Device(user_id=user.id, name=name, protocol=protocol, route_id=route.id))
+    dev = Device(user_id=user.id, name=name, protocol=protocol, route_id=route.id, route_mode=mode)
+    db.add(dev)
     db.commit()
     flash(request, f"Устройство «{name}» добавлено", "success")
-    return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse(f"/devices/{dev.id}", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/devices/{device_id}/mode")
+def device_set_mode(
+    request: Request, device_id: int, route_mode: str = Form(""), route_id: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Switch a VLESS/NaiveProxy device between «every route» and «one route» — the
+    same account and subscription URL; what the subscription lists and which pools
+    carry the account follow (a background sync brings the servers in line)."""
+    owned = _owned_device(request, db, device_id)
+    if not owned:
+        return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
+    user, device = owned
+    if device.protocol == PROTO_AWG or route_mode not in (ROUTE_ALL, ROUTE_ONE):
+        return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
+    usable = _new_device_routes(db, user).get(device.protocol, [])
+    route = db.get(Route, int(route_id)) if route_id.strip().isdigit() else None
+    if route_mode == ROUTE_ONE and (route is None or route not in usable):
+        flash(request, "Выберите доступный вам маршрут", "error")
+        return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
+    device.route_mode = route_mode
+    if route is not None and route in usable:
+        device.route_id = route.id
+    db.commit()
+    pool_ops.reconcile_pools_async(None)
+    if route_mode == ROUTE_ONE:
+        flash(request, f"Теперь только маршрут «{route.name}». Обновите подписку в приложении.", "success")
+    else:
+        flash(request, "Теперь подписка на все ваши маршруты. Обновите подписку в приложении.", "success")
+    return RedirectResponse(f"/devices/{device_id}", status_code=HTTP_303_SEE_OTHER)
 
 
 def _owned_device(request: Request, db: Session, device_id: int) -> tuple[User, Device] | None:
@@ -461,11 +514,19 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
     if not owned:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
     user, device = owned
+    pool_ops.ensure_home_route(db, device)
     route = device.route
+    routes_now = pool_ops.device_routes(db, device)
     cfg = None
     error = None
     try:
+        if not routes_now:
+            raise RuntimeError("нет доступа к маршруту устройства — удалите его и создайте новое "
+                               "на доступном маршруте" if device.pinned else
+                               "сейчас нет ни одного доступного вам маршрута этого протокола")
         cfg = node_ops.get_or_issue_config(db, device)
+    except RuntimeError as e:
+        error = str(e)[0].upper() + str(e)[1:]
     except Exception as e:
         db.rollback()  # a failed flush leaves the session unusable for rendering
         error = f"Не удалось создать конфиг: {e}"
@@ -497,6 +558,8 @@ def device_config(request: Request, device_id: int, db: Session = Depends(get_db
         paused=bool(route and route.has(device.protocol) and not route.serves(device.protocol)),
         ios_conf=ios_conf, ios_qr=ios_qr,
         sub=sub, sub_qr=sub_qr, sub_items=sub_items,
+        routes_now=routes_now, mode_routes=_new_device_routes(db, user).get(device.protocol, []),
+        ROUTE_ALL=ROUTE_ALL, ROUTE_ONE=ROUTE_ONE,
     )
 
 
@@ -529,6 +592,17 @@ def subscription(request: Request, token: str, format: str = "", db: Session = D
     device = sub_ops.device_by_token(db, token)
     if device is None:
         return not_found
+    # Remember that an app uses the subscription (shown on the device page). One write
+    # per 10 minutes at most: apps refresh every few hours, retries come in bursts.
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    last = device.sub_fetched_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if last is None or now - last > timedelta(minutes=10):
+        device.sub_fetched_at = now
+        db.commit()
     items = sub_ops.entries(db, device)
     title = settings.sub_title or settings.brand_name
     hdrs = sub_ops.headers(device, db, title, settings.sub_update_hours)
@@ -546,6 +620,7 @@ def device_download(request: Request, device_id: int, fmt: str = "", db: Session
     if not owned:
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
     _, device = owned
+    pool_ops.ensure_home_route(db, device)
     try:
         cfg = node_ops.get_or_issue_config(db, device)
     except Exception:
@@ -1057,6 +1132,7 @@ def admin_toggle_route(request: Request, route_id: int, db: Session = Depends(ge
     if route:
         route.enabled = not route.enabled
         db.commit()
+        pool_ops.reconcile_pools_async(None)  # access changed: accounts on/off the servers
         flash(request, f"Маршрут «{route.name}» {'включён' if route.enabled else 'выключен'}", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
@@ -1074,6 +1150,7 @@ def admin_set_route_groups(
     if route:
         route.groups = db.query(Group).filter(Group.id.in_(group_ids)).all() if group_ids else []
         db.commit()
+        pool_ops.reconcile_pools_async(None)  # access changed: accounts on/off the servers
         flash(request, f"Доступ к «{route.name}»: групп — {len(route.groups)}", "success")
     return RedirectResponse("/admin/park", status_code=HTTP_303_SEE_OTHER)
 
@@ -1796,8 +1873,81 @@ def admin_users(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     users = db.query(User).order_by(User.id).all()
     groups = db.query(Group).order_by(Group.name).all()
+    acc: dict = {}
+    no_access = {u.id: sum(1 for d in u.devices if not pool_ops.device_routes(db, d, acc)) for u in users}
+    retiring = (db.query(Device).filter(Device.retire_at.isnot(None))
+                .order_by(Device.user_id, Device.name).all())
     return render(request, "admin_users.html", user=admin, users=users, groups=groups,
-                  temp_password=appconfig.temp_password(db), rules=PASSWORD_RULES)
+                  temp_password=appconfig.temp_password(db), rules=PASSWORD_RULES,
+                  no_access=no_access, retiring=retiring,
+                  routes=db.query(Route).order_by(Route.name).all(), protocol_labels=PROTOCOL_LABELS)
+
+
+def _parse_day(s: str):
+    from datetime import datetime, timezone
+
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%d").replace(hour=12, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+@app.post("/admin/devices/retire/mark")
+def admin_retire_mark(
+    request: Request, route_id: int = Form(...), day: str = Form(""), db: Session = Depends(get_db),
+):
+    """Mark every device of a route «будет удалено <day>» (owners see it on their page)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    when = _parse_day(day)
+    route = db.get(Route, route_id)
+    if route is None or when is None:
+        flash(request, "Выберите маршрут и дату", "error")
+    else:
+        n = 0
+        for d in db.query(Device).filter_by(route_id=route.id).all():
+            d.retire_at = when
+            n += 1
+        db.commit()
+        flash(request, f"Помечено устройств маршрута «{route.name}»: {n}", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/devices/{device_id}/retire")
+def admin_retire_one(request: Request, device_id: int, day: str = Form(""), db: Session = Depends(get_db)):
+    """Mark (a date) or unmark (empty) one device."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    d = db.get(Device, device_id)
+    if d is not None:
+        d.retire_at = _parse_day(day) if day.strip() else None
+        db.commit()
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/devices/retire/clear")
+def admin_retire_clear(request: Request, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    n = db.query(Device).filter(Device.retire_at.isnot(None)).update({Device.retire_at: None})
+    db.commit()
+    flash(request, f"Пометки сняты: {n}", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/devices/retire/delete")
+def admin_retire_delete(request: Request, db: Session = Depends(get_db)):
+    """Delete every marked device; the sync that follows takes their accounts and peers
+    off the servers (one pass per pool instead of SSH per device)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    gone = db.query(Device).filter(Device.retire_at.isnot(None)).all()
+    for d in gone:
+        db.delete(d)
+    db.commit()
+    pool_ops.reconcile_pools_async(None)
+    flash(request, f"Удалено устройств: {len(gone)}. Учётки уходят с серверов в фоне.", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/users/temp-password")
@@ -1926,7 +2076,22 @@ def admin_apps(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     apps = db.query(ClientApp).order_by(ClientApp.protocol, ClientApp.position, ClientApp.id).all()
     return render(request, "admin_apps.html", user=admin, apps=apps, protocols=ALL_PROTOCOLS,
-                  protocol_labels=PROTOCOL_LABELS, platforms=APP_PLATFORMS)
+                  protocol_labels=PROTOCOL_LABELS, platforms=APP_PLATFORMS,
+                  desc=appconfig.proto_desc(db), desc_default=appconfig.PROTO_DESC_DEFAULT)
+
+
+@app.post("/admin/apps/descriptions")
+def admin_proto_descriptions(
+    request: Request, vless: str = Form(""), naive: str = Form(""), awg: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """One-line protocol descriptions on the «Мои устройства» form (empty = default)."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    for p, text in (("vless", vless), ("naive", naive), ("awg", awg)):
+        appconfig.set_proto_desc(db, p, text)
+    flash(request, "Описания протоколов сохранены", "success")
+    return RedirectResponse("/admin/apps", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/admin/apps")
@@ -2043,6 +2208,7 @@ def admin_set_user_role(
     else:
         target.role = role
         db.commit()
+        pool_ops.reconcile_pools_async(None)  # access changed: accounts on/off the servers
         flash(request, f"Роль «{target.username}»: {role}", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
@@ -2063,10 +2229,12 @@ def admin_toggle_user_group(
         if action == "remove" and group in target.groups:
             target.groups.remove(group)
             db.commit()
+            pool_ops.reconcile_pools_async(None)  # access changed: accounts on/off the servers
             flash(request, f"«{target.username}» убран из «{group.name}»", "success")
         elif action == "add" and group not in target.groups:
             target.groups.append(group)
             db.commit()
+            pool_ops.reconcile_pools_async(None)  # access changed: accounts on/off the servers
             flash(request, f"«{target.username}» добавлен в «{group.name}»", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
@@ -2092,5 +2260,6 @@ def admin_delete_user(request: Request, user_id: int, db: Session = Depends(get_
     else:
         db.delete(target)
         db.commit()
+        pool_ops.reconcile_pools_async(None)  # access changed: accounts on/off the servers
         flash(request, "Пользователь удалён", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)

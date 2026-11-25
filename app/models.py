@@ -805,6 +805,13 @@ class Announcement(Base):
         return bool({g.id for g in tg} & set(user.group_ids))
 
 
+# How a VLESS/NaiveProxy device reaches the fleet: through every route of its
+# protocol its owner may use (one subscription, apps switch by themselves), or
+# through its own route only. AmneziaWG has no subscriptions: always one route.
+ROUTE_ALL = "all"
+ROUTE_ONE = "one"
+
+
 class Device(Base):
     __tablename__ = "devices"
     __table_args__ = (UniqueConstraint("user_id", "name", "protocol", name="uq_device"),)
@@ -819,6 +826,13 @@ class Device(Base):
     # Secret part of the device's subscription URL (random, unguessable). NULL until
     # first requested; re-issuing it revokes the old URL.
     sub_token: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    # ROUTE_ALL: the subscription lists every route of the protocol the owner may use
+    # (route_id is then just the «home» route of the single link); ROUTE_ONE: only route_id.
+    route_mode: Mapped[str] = mapped_column(String(8), default=ROUTE_ALL, server_default=ROUTE_ALL)
+    # When an app last fetched this device's subscription (None = never).
+    sub_fetched_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Marked by the admin «будет удалено»: shown to the owner, deleted in bulk later.
+    retire_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped[User] = relationship(back_populates="devices")
@@ -826,6 +840,11 @@ class Device(Base):
     configs: Mapped[list["IssuedConfig"]] = relationship(
         back_populates="device", cascade="all, delete-orphan"
     )
+
+    @property
+    def pinned(self) -> bool:
+        """Works through its own route only (AmneziaWG always; VLESS/Naive by choice)."""
+        return self.protocol == PROTO_AWG or self.route_mode == ROUTE_ONE
 
     def node_identifier(self) -> str:
         """Stable, human-readable id used as the node-side client email / peer
