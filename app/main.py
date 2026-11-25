@@ -191,6 +191,21 @@ def _hbytes(n) -> str:
 templates.env.filters["hbytes"] = _hbytes
 
 
+def _rbytes(n) -> str:
+    """Byte size in Russian units (2.5 GB -> '2,5 ГБ')."""
+    v = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if v < 1024 or unit == "ТБ":
+            if unit == "Б":
+                return f"{v:.0f} Б"
+            return (f"{v:.1f}" if v < 100 else f"{v:.0f}").replace(".", ",") + " " + unit
+        v /= 1024
+    return f"{v:.0f} ТБ"
+
+
+templates.env.filters["rbytes"] = _rbytes
+
+
 # --- flash helpers ------------------------------------------------------
 def flash(request: Request, message: str, category: str = "info") -> None:
     request.session.setdefault("_flash", []).append({"m": message, "c": category})
@@ -1843,14 +1858,17 @@ def admin_monitor_settings(
 
 # --- admin: traffic -----------------------------------------------------
 @app.get("/admin/traffic", response_class=HTMLResponse)
-def admin_traffic(request: Request, db: Session = Depends(get_db)):
+def admin_traffic(request: Request, period: str = "7", tab: str = "srv", db: Session = Depends(get_db)):
     admin = _require_staff(request, db)
     if not admin:
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    users = db.query(User).order_by(User.username).all()
-    stats = {s.device_id: s for s in db.query(TrafficStat).all()}
-    return render(request, "admin_traffic.html", user=admin, users=users, stats=stats,
-                  updated=traffic_ops.last_updated(db))
+    if period not in ("today", "7", "30") and not period.startswith("m:"):
+        period = "7"
+    ov = traffic_ops.overview(db, period)
+    return render(request, "admin_traffic.html", user=admin, ov=ov, period=period,
+                  tab="ppl" if tab == "ppl" else "srv", months=traffic_ops.months_back(3),
+                  month_names=traffic_ops._MONTHS, updated=traffic_ops.last_updated(db),
+                  protocol_labels=PROTOCOL_LABELS)
 
 
 @app.post("/admin/traffic/collect")
@@ -1859,7 +1877,8 @@ def admin_traffic_collect(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     try:
         info = traffic_ops.collect_traffic(db)
-        flash(request, f"Трафик собран (ноды: ok {info['members_ok']}, ошибок {info['members_fail']})", "success")
+        flash(request, f"Трафик собран: серверов ответило {info['members_ok']}, не ответило {info['members_fail']}",
+              "success" if not info["members_fail"] else "info")
     except Exception as e:
         log.exception("traffic collect failed")
         flash(request, f"Сбор трафика не удался: {e}", "error")

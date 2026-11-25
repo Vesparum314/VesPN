@@ -37,6 +37,11 @@ log = logging.getLogger("vpnpanel.naive")
 
 CONTAINER = "vespn-naive"
 BASE = "/opt/vespn-naive"
+# Traffic per user (app/traffic.py): Caddy logs every proxy tunnel when it closes —
+# login (user_id), bytes to the client (size) and from it (bytes_read). Inside the
+# container (no extra volume, so running servers pick it up with a reload), rolled at
+# a small size; the filter strips everything that would say WHERE people go.
+ACCESS_LOG = "/var/log/caddy/access.log"
 SERVER_PORT = 443
 RENEW_BEFORE = timedelta(days=30)
 
@@ -170,6 +175,20 @@ def render_caddyfile(domains: list[str], users: list[tuple[str, str]]) -> str:
         f":{SERVER_PORT} {{",
         "\ttls {",
         "\t\tload /data/certs",
+        "\t}",
+        "\tlog {",
+        f"\t\toutput file {ACCESS_LOG} {{",
+        "\t\t\troll_size 10MiB",
+        "\t\t\troll_keep 1",
+        "\t\t}",
+        "\t\tformat filter {",
+        "\t\t\twrap json",
+        "\t\t\tfields {",
+        *[f"\t\t\t\t{f} delete" for f in (
+            "request>headers", "request>uri", "request>host", "request>remote_ip",
+            "request>remote_port", "request>client_ip", "request>tls", "resp_headers")],
+        "\t\t\t}",
+        "\t\t}",
         "\t}",
         "\tforward_proxy {",
         auth,
@@ -307,3 +326,46 @@ def renew_all(db: Session) -> list[str]:
             msgs.append(f"{r.client_host}: не удалось обновить сертификат: {e}")
             log.warning("naive: renew %s failed: %s", r.client_host, e)
     return msgs
+
+
+# --- traffic per user (read by app/traffic.py) -----------------------------
+# Inside the container (busybox): the log's inode and size, then the bytes past the
+# caller's offset folded into «user down up» lines — only totals cross the wire.
+_READ_LOG = r"""
+F=__LOG__
+[ -f "$F" ] || { echo "NOLOG"; exit 0; }
+set -- $(stat -c '%i %s' "$F")
+echo "FILE $1 $2"
+OFF=__OFF__
+[ "$1" = "__INODE__" ] && [ "$2" -ge "$OFF" ] || OFF=0
+tail -c +$((OFF + 1)) "$F" | head -c $(($2 - OFF)) | awk '
+{ u = ""; s = 0; r = 0
+  if (match($0, /"user_id":"[^"]*"/)) u = substr($0, RSTART + 11, RLENGTH - 12)
+  if (match($0, /"size":[0-9]+/)) s = substr($0, RSTART + 7, RLENGTH - 7)
+  if (match($0, /"bytes_read":[0-9]+/)) r = substr($0, RSTART + 13, RLENGTH - 13)
+  if (u != "") { D[u] += s; U[u] += r } }
+END { for (k in D) printf "USER %s %.0f %.0f\n", k, D[k], U[k] }'
+echo "OFF $OFF"
+"""
+
+
+def read_traffic(node: SSHNode, inode: str, offset: int) -> tuple[dict[str, tuple[int, int]], str, int]:
+    """Per-login (down, up) bytes logged since (inode, offset); returns them and the
+    new (inode, offset). A rolled or new log starts over from its beginning."""
+    import base64
+
+    script = (_READ_LOG.replace("__LOG__", ACCESS_LOG).replace("__OFF__", str(int(offset)))
+              .replace("__INODE__", inode or "-"))
+    b64 = base64.b64encode(script.encode()).decode()
+    _rc, out, _ = node.run(f"echo {b64} | base64 -d | docker exec -i {CONTAINER} sh", timeout=120)
+    users: dict[str, tuple[int, int]] = {}
+    new_inode, size = inode, offset
+    for line in out.splitlines():
+        f = line.split()
+        if f[:1] == ["FILE"] and len(f) == 3:
+            new_inode, size = f[1], int(f[2])
+        elif f[:1] == ["USER"] and len(f) == 4:
+            users[f[1]] = (int(f[2]), int(f[3]))
+        elif f[:1] == ["NOLOG"]:
+            return {}, "", 0
+    return users, new_inode, size

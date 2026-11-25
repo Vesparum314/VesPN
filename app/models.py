@@ -910,6 +910,35 @@ class IssuedConfig(Base):
         self.secret_enc = encrypt(value)
 
 
+class TrafficDay(Base):
+    """Traffic of one device on one server during one day (Moscow time) — what the
+    «Трафик» page sums over any period. Names are copied in, so a deleted device, user
+    or server keeps its history (the ids go NULL). Kept TRAFFIC_KEEP_DAYS."""
+
+    __tablename__ = "traffic_days"
+    __table_args__ = (UniqueConstraint("day", "device_id", "node_id", name="uq_traffic_day"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD, Moscow
+    device_id: Mapped[int | None] = mapped_column(
+        ForeignKey("devices.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    node_id: Mapped[int | None] = mapped_column(
+        ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    protocol: Mapped[str] = mapped_column(String(16), default="")
+    username: Mapped[str] = mapped_column(String(64), default="")
+    device_name: Mapped[str] = mapped_column(String(64), default="")
+    node_name: Mapped[str] = mapped_column(String(64), default="")
+    up: Mapped[int] = mapped_column(Integer, default=0)    # client → server
+    down: Mapped[int] = mapped_column(Integer, default=0)  # server → client
+
+
+TRAFFIC_KEEP_DAYS = 92
+
+
 class TrafficStat(Base):
     """Per-device traffic accounting, collected periodically THROUGH THE GATE (never
     a direct Hub→exit). Node counters (3x-ui usedTraffic / `awg show transfer`) are
@@ -1103,3 +1132,26 @@ class NodeStatusHistory(Base):
     at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     node: Mapped["Node"] = relationship("Node")
+
+
+# --- keep traffic history apart from deleted rows ----------------------------
+# SQLite reuses the highest freed id and this DB doesn't enforce ON DELETE (no
+# foreign_keys pragma), so a new device could inherit a deleted one's history and
+# counter baselines. Unlink them explicitly when a device, user or server goes.
+from sqlalchemy import event as _event  # noqa: E402
+
+
+@_event.listens_for(Device, "before_delete")
+def _device_gone(mapper, conn, target):  # noqa: ANN001
+    conn.execute(TrafficDay.__table__.update().where(TrafficDay.device_id == target.id).values(device_id=None))
+    conn.execute(TrafficStat.__table__.delete().where(TrafficStat.device_id == target.id))
+
+
+@_event.listens_for(User, "before_delete")
+def _user_gone(mapper, conn, target):  # noqa: ANN001
+    conn.execute(TrafficDay.__table__.update().where(TrafficDay.user_id == target.id).values(user_id=None))
+
+
+@_event.listens_for(Node, "before_delete")
+def _node_gone(mapper, conn, target):  # noqa: ANN001
+    conn.execute(TrafficDay.__table__.update().where(TrafficDay.node_id == target.id).values(node_id=None))
