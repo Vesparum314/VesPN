@@ -81,7 +81,7 @@
       {% for d in p.devices %}{% set dev = d.device %}
       <tr class="{{ 'gone' if d.gone }}">
         <td><span class="badge b-{{ d.protocol }} b-dot">{{ protocol_labels.get(d.protocol, d.protocol) }}</span> {{ d.name }}</td>
-        <td class="muted small">{% if d.gone %}удалено{% elif dev.protocol == 'awg' %}Маршрут: {{ dev.route.name if dev.route else '—' }}{% elif dev.pinned %}Один маршрут: {{ dev.route.name if dev.route else '—' }}{% else %}Подписка{% endif %}{% if dev and dev.retire_at %} · будет удалено {{ dev.retire_at.strftime('%d.%m') }}{% endif %}</td>
+        <td class="muted small">{% if d.gone %}удалено{% elif dev.protocol == 'awg' %}Маршрут: {{ dev.route.name if dev.route else '—' }}{% elif dev.pinned %}Один маршрут: {{ dev.route.name if dev.route else '—' }}{% else %}Подписка · маршрутов: {{ d.routes_n }}{% endif %}{% if dev and dev.retire_at %} · будет удалено {{ dev.retire_at.strftime('%d.%m') }}{% endif %}</td>
         <td class="num">{{ d.total|rbytes }}</td>
         <td>{{ bars(d.series, 84, 20) }}</td>
       </tr>

@@ -546,6 +546,9 @@ class Route(Base):
         ForeignKey("gate_pools.id", ondelete="SET NULL"), nullable=True, index=True
     )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # Going away (its devices are marked «будет удалено»): still serves, but no longer
+    # offered for new devices nor taken as a subscription device's home route.
+    retiring: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     pool: Mapped["ExitPool | None"] = relationship("ExitPool", back_populates="routes")
@@ -810,6 +813,8 @@ class Announcement(Base):
 # through its own route only. AmneziaWG has no subscriptions: always one route.
 ROUTE_ALL = "all"
 ROUTE_ONE = "one"
+RETIRE_ROUTE = "route"
+RETIRE_NOSUB = "nosub"
 
 
 class Device(Base):
@@ -833,6 +838,10 @@ class Device(Base):
     sub_fetched_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
     # Marked by the admin «будет удалено»: shown to the owner, deleted in bulk later.
     retire_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Why: RETIRE_ROUTE (its route goes away — stays until deleted or unmarked by hand) or
+    # RETIRE_NOSUB (its app never fetched the subscription — cleared by itself on the
+    # first fetch, so only devices that really live on a single link stay marked).
+    retire_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped[User] = relationship(back_populates="devices")
