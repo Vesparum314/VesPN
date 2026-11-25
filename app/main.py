@@ -53,6 +53,8 @@ from .models import (
     ROLES,
     ROUTE_ALL,
     ROUTE_ONE,
+    RETIRE_NOSUB,
+    RETIRE_ROUTE,
     USER_ROLES,
     APP_PLATFORMS,
     Announcement,
@@ -421,7 +423,8 @@ def _new_device_routes(db: Session, user: User) -> dict[str, list[Route]]:
     routes = pool_ops.accessible_routes(db, user)
     out: dict[str, list[Route]] = {}
     for p in PROTOCOLS:
-        rs = [r for r in routes if r.pool is not None and r.serves(p) and not r.proto_block_reason(p)]
+        rs = [r for r in routes if r.pool is not None and not r.retiring
+              and r.serves(p) and not r.proto_block_reason(p)]
         if rs:
             out[p] = rs
     return out
@@ -617,6 +620,11 @@ def subscription(request: Request, token: str, format: str = "", db: Session = D
         last = last.replace(tzinfo=timezone.utc)
     if last is None or now - last > timedelta(minutes=10):
         device.sub_fetched_at = now
+        db.commit()
+    if device.retire_at is not None and device.retire_reason == RETIRE_NOSUB:
+        # marked only because no app used the subscription — one does now
+        device.retire_at = None
+        device.retire_reason = None
         db.commit()
     items = sub_ops.entries(db, device)
     title = settings.sub_title or settings.brand_name
@@ -1916,7 +1924,10 @@ def _parse_day(s: str):
 def admin_retire_mark(
     request: Request, route_id: int = Form(...), day: str = Form(""), db: Session = Depends(get_db),
 ):
-    """Mark every device of a route «будет удалено <day>» (owners see it on their page)."""
+    """The route is going away: it's hidden from new devices; devices that depend on it
+    (AmneziaWG, «one route») are marked «будет удалено <day>»; subscription devices
+    don't need it — they just get another home route (their subscription keeps the
+    other routes; one living on the old single link is caught by «без подписки»)."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     when = _parse_day(day)
@@ -1924,12 +1935,46 @@ def admin_retire_mark(
     if route is None or when is None:
         flash(request, "Выберите маршрут и дату", "error")
     else:
-        n = 0
+        route.retiring = True
+        db.commit()
+        n = moved = 0
         for d in db.query(Device).filter_by(route_id=route.id).all():
+            if not d.pinned:
+                pool_ops.ensure_home_route(db, d)
+                if d.route_id != route.id:
+                    moved += 1
+                    continue
+            # tied to the route — or a subscription device with no other route to go to
             d.retire_at = when
+            d.retire_reason = RETIRE_ROUTE
             n += 1
         db.commit()
-        flash(request, f"Помечено устройств маршрута «{route.name}»: {n}", "success")
+        flash(request, f"Маршрут «{route.name}» уходит: скрыт из формы. Помечено устройств, привязанных к нему "
+                       f"(AmneziaWG, «один маршрут», подписки без другого маршрута): {n}. Устройствам с подпиской "
+                       f"сменён домашний маршрут: {moved}.", "success")
+    return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/devices/retire/nosub")
+def admin_retire_nosub(request: Request, day: str = Form(""), db: Session = Depends(get_db)):
+    """Mark every VLESS/NaiveProxy device whose subscription no app has fetched yet.
+    The mark clears itself on the first fetch (see /s/<token>), so by the date only
+    devices that live on a single link are left. Already marked devices are skipped."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    when = _parse_day(day)
+    if when is None:
+        flash(request, "Укажите дату", "error")
+        return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
+    n = 0
+    for d in (db.query(Device).filter(Device.protocol.in_((PROTO_VLESS, PROTO_NAIVE)),
+                                      Device.sub_fetched_at.is_(None), Device.retire_at.is_(None)).all()):
+        d.retire_at = when
+        d.retire_reason = RETIRE_NOSUB
+        n += 1
+    db.commit()
+    flash(request, f"Помечено устройств без подписки: {n}. Метка снимется сама, когда приложение "
+                   f"загрузит подписку.", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -1941,6 +1986,7 @@ def admin_retire_one(request: Request, device_id: int, day: str = Form(""), db: 
     d = db.get(Device, device_id)
     if d is not None:
         d.retire_at = _parse_day(day) if day.strip() else None
+        d.retire_reason = RETIRE_ROUTE if d.retire_at else None
         db.commit()
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
@@ -1949,7 +1995,9 @@ def admin_retire_one(request: Request, device_id: int, day: str = Form(""), db: 
 def admin_retire_clear(request: Request, db: Session = Depends(get_db)):
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
-    n = db.query(Device).filter(Device.retire_at.isnot(None)).update({Device.retire_at: None})
+    n = (db.query(Device).filter(Device.retire_at.isnot(None))
+         .update({Device.retire_at: None, Device.retire_reason: None}))
+    db.query(Route).filter(Route.retiring.is_(True)).update({Route.retiring: False})
     db.commit()
     flash(request, f"Пометки сняты: {n}", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)

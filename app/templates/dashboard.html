@@ -17,7 +17,7 @@
   {% for c in cards %}{% set d = c.d %}
   <div class="card dev{% if d.retire_at %} retiring{% endif %}">
     <div class="dev-top"><span class="badge b-{{ d.protocol }} b-dot">{{ protocol_labels.get(d.protocol, d.protocol) }}</span><b>{{ d.name }}</b></div>
-    {% if d.retire_at %}<div class="dev-flag bad">Будет удалено {{ d.retire_at.strftime('%d.%m') }} — создайте новое устройство</div>{% endif %}
+    {% if d.retire_at %}<div class="dev-flag bad">{% if d.retire_reason == 'nosub' %}Будет удалено {{ d.retire_at.strftime('%d.%m') }}, если не добавить в приложение подписку — откройте устройство{% else %}Будет удалено {{ d.retire_at.strftime('%d.%m') }} — создайте новое устройство{% endif %}</div>{% endif %}
     {% if not c.access %}<div class="dev-flag bad">Нет доступа к маршруту</div>
     {% elif d.pinned %}<div class="dev-mode"><span class="ico">→</span>{{ 'Маршрут' if d.protocol == 'awg' else 'Один маршрут' }}: {{ d.route.name }}</div>
     {% else %}{% set n = c.routes|length %}<div class="dev-mode"><span class="ico">⟳</span>Подписка · {{ n }} {{ 'маршрут' if n % 10 == 1 and n % 100 != 11 else ('маршрута' if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else 'маршрутов') }}</div>{% endif %}

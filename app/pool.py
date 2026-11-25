@@ -190,13 +190,13 @@ def device_has_access(db: Session, device: Device) -> bool:
 
 
 def ensure_home_route(db: Session, device: Device) -> None:
-    """A ROUTE_ALL device whose own route became unusable (access lost, route off)
-    gets the first usable route of its protocol as the new home — its single link
+    """A ROUTE_ALL device whose own route became unusable (access lost, route off) or
+    is going away (retiring) gets the first usable route of its protocol as the new home — its single link
     points there. The account itself stays the same (same uuid / login)."""
-    if device.pinned or own_route_usable(device):
+    if device.pinned or (own_route_usable(device) and not device.route.retiring):
         return
     for r in user_proto_routes(db, device.user, device.protocol):
-        if not r.proto_block_reason(device.protocol):
+        if not r.retiring and not r.proto_block_reason(device.protocol):
             device.route_id = r.id
             db.commit()
             db.refresh(device)

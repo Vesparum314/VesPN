@@ -359,7 +359,13 @@ def overview(db: Session, period: str) -> dict:
     for k, p in people.items():
         if isinstance(k, str):
             plist.append({"user": None, **p})
+    from .pool import device_routes
+
+    acc: dict = {}
     for p in plist:
+        for k in p["devices"]:
+            if isinstance(k, int) and k in devs:
+                p["devices"][k]["routes_n"] = len(device_routes(db, devs[k], acc))
         p["devices"] = sorted(
             [{**v, "device": devs.get(k) if isinstance(k, int) else None} for k, v in p["devices"].items()],
             key=lambda x: (x["gone"], -x["total"], x["name"]))

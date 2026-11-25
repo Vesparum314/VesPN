@@ -123,6 +123,10 @@ def _add_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN sub_fetched_at DATETIME")
         if "retire_at" not in dcols:
             conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN retire_at DATETIME")
+        if "retiring" not in cols("routes"):
+            conn.exec_driver_sql("ALTER TABLE routes ADD COLUMN retiring BOOLEAN NOT NULL DEFAULT 0")
+        if "retire_reason" not in dcols:
+            conn.exec_driver_sql("ALTER TABLE devices ADD COLUMN retire_reason VARCHAR(16)")
         if "session_epoch" not in cols("users"):
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0")
         node_cols = cols("nodes")
