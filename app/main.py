@@ -1924,10 +1924,15 @@ def _parse_day(s: str):
 def admin_retire_mark(
     request: Request, route_id: int = Form(...), day: str = Form(""), db: Session = Depends(get_db),
 ):
-    """The route is going away: it's hidden from new devices; devices that depend on it
-    (AmneziaWG, «one route») are marked «будет удалено <day>»; subscription devices
-    don't need it — they just get another home route (their subscription keeps the
-    other routes; one living on the old single link is caught by «без подписки»)."""
+    """The route is going away: it's hidden from new devices and never taken as a home.
+    Marked «будет удалено <day>»:
+      * devices tied to it — AmneziaWG, «one route», and subscription devices whose owner
+        has no other route of the protocol (reason «route»);
+      * subscription devices whose ISSUED config still points at it (a single link from
+        before subscriptions — the mode says «subscription», the app holds the old link)
+        and whose subscription no app has fetched (reason «nosub»: adding the
+        subscription clears it, and the device keeps working on the other routes).
+    Other subscription devices just get another home route. Safe to run again."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     when = _parse_day(day)
@@ -1937,21 +1942,31 @@ def admin_retire_mark(
     else:
         route.retiring = True
         db.commit()
-        n = moved = 0
-        for d in db.query(Device).filter_by(route_id=route.id).all():
-            if not d.pinned:
+        on_link = {c.device_id for c in db.query(IssuedConfig).filter_by(route_id=route.id).all()}
+        cand = {d.id: d for d in db.query(Device).filter(
+            (Device.route_id == route.id) | (Device.id.in_(on_link))).all()}
+        n_route = n_link = moved = 0
+        for d in cand.values():
+            if d.pinned:
+                if d.route_id == route.id:
+                    d.retire_at, d.retire_reason = when, RETIRE_ROUTE
+                    n_route += 1
+                continue
+            if d.route_id == route.id:
                 pool_ops.ensure_home_route(db, d)
-                if d.route_id != route.id:
-                    moved += 1
+                if d.route_id == route.id:  # nowhere to go
+                    d.retire_at, d.retire_reason = when, RETIRE_ROUTE
+                    n_route += 1
                     continue
-            # tied to the route — or a subscription device with no other route to go to
-            d.retire_at = when
-            d.retire_reason = RETIRE_ROUTE
-            n += 1
+                moved += 1
+            if d.id in on_link and d.sub_fetched_at is None and d.retire_reason != RETIRE_ROUTE:
+                d.retire_at, d.retire_reason = when, RETIRE_NOSUB
+                n_link += 1
         db.commit()
-        flash(request, f"Маршрут «{route.name}» уходит: скрыт из формы. Помечено устройств, привязанных к нему "
-                       f"(AmneziaWG, «один маршрут», подписки без другого маршрута): {n}. Устройствам с подпиской "
-                       f"сменён домашний маршрут: {moved}.", "success")
+        flash(request, f"Маршрут «{route.name}» уходит: скрыт из формы. Помечено привязанных к нему (AmneziaWG, "
+                       f"«один маршрут», подписки без другого маршрута): {n_route}; со старой ссылкой на него, "
+                       f"подписку не загружали (снимется само, если добавят подписку): {n_link}. "
+                       f"Сменён домашний маршрут: {moved}.", "success")
     return RedirectResponse("/admin/users", status_code=HTTP_303_SEE_OTHER)
 
 
