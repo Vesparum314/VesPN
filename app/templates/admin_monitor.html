@@ -34,8 +34,8 @@
           <td data-label="Выходы пула">
             {% for e in r.exits %}
               <div style="margin-bottom:4px">
-                {% if e.vless_ok %}<span class="badge b-ok b-dot">{{ e.name }}</span>{% elif e.vless_ok is none %}<span class="badge b-warn" title="гейт недоступен">{{ e.name }}</span>{% else %}<span class="badge b-bad b-dot" title="гейт не достаёт по VLESS-порту">{{ e.name }}</span>{% endif %}
-                <small class="muted">VLESS :{{ e.vless_port }} {{ '✓' if e.vless_ok else ('—' if e.vless_ok is none else '✗') }} · AWG :{{ e.awg_port }} {{ {'OPEN':'✓','DOWN':'✗','NA':'n/a'}.get(e.awg, '—') }}</small>
+                {% if e.vless_ok %}<span class="badge b-ok b-dot">{{ e.name }}</span>{% elif e.vless_ok is none %}<span class="badge b-warn" title="гейт недоступен">{{ e.name }}</span>{% else %}<span class="badge b-bad b-dot" title="гейт не достаёт по порту трафика">{{ e.name }}</span>{% endif %}
+                <small class="muted">{% if e.tcp %}{% for k, ok in e.tcp.items() %}{{ k }} {{ '✓' if ok else '✗' }} · {% endfor %}{% else %}TCP :{{ e.vless_port }} {{ '✓' if e.vless_ok else ('—' if e.vless_ok is none else '✗') }} · {% endif %}AWG :{{ e.awg_port }} {{ {'OPEN':'✓','DOWN':'✗','NA':'n/a'}.get(e.awg, '—') }}</small>
               </div>
             {% else %}<span class="muted">в пуле нет выходов</span>{% endfor %}
           </td>

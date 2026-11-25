@@ -97,6 +97,7 @@ TIMEOUT = 15
 
 _K_ON = "speed_enabled"
 _K_HEAVY = "speed_heavy_minutes"
+_K_ALERTS = "speed_alerts"    # "1" = incidents also go to the Telegram bot
 _K_ACCT = "speed_probe_{}"    # per pool: encrypted {"uuid", "user", "password", "ready"}
 
 _cycle_lock = threading.Lock()
@@ -133,20 +134,23 @@ def config(db: Session) -> dict:
         heavy = int(_get(db, _K_HEAVY) or 60)
     except ValueError:
         heavy = 60
-    return {"enabled": _get(db, _K_ON) == "1", "heavy_minutes": heavy if heavy in HEAVY_CHOICES else 60}
+    return {"enabled": _get(db, _K_ON) == "1", "heavy_minutes": heavy if heavy in HEAVY_CHOICES else 60,
+            "alerts": _get(db, _K_ALERTS) == "1"}
 
 
 def enabled(db: Session) -> bool:
     return _get(db, _K_ON) == "1"
 
 
-def set_config(db: Session, on: bool, heavy_minutes: int) -> None:
+def set_config(db: Session, on: bool, heavy_minutes: int, alerts: bool | None = None) -> None:
     """Persist the switch. Turning it on or off brings the service accounts onto /
     off the servers in the background (a reconcile of the pools that carry VLESS or
     NaiveProxy); probes through a pool wait until its account is there."""
     was = enabled(db)
     _put(db, _K_ON, "1" if on else "0")
     _put(db, _K_HEAVY, str(heavy_minutes if heavy_minutes in HEAVY_CHOICES else 60))
+    if alerts is not None:
+        _put(db, _K_ALERTS, "1" if alerts else "0")
     if was != on:
         for pool in _probe_pools(db):
             acct = probe_account(db, pool, create=on)
@@ -888,12 +892,23 @@ def _incident(db: Session, route: Route, proto: str, entry: Node, reason: str,
         snap = snapshot(db, route, entry)
     except Exception as e:
         snap = f"(снимок не снят: {e})"
+    hs = hints(db, route, proto, entry, vitals, control, others_ok)
     db.add(ProbeIncident(route_id=route.id, protocol=proto, entry_id=entry.id, reason=reason[:255],
-                         hints_json=json.dumps(hints(db, route, proto, entry, vitals, control, others_ok),
-                                               ensure_ascii=False),
-                         snapshot=snap))
+                         hints_json=json.dumps(hs, ensure_ascii=False), snapshot=snap))
     db.commit()
     log.warning("speed incident: %s / %s / %s — %s", route.name, proto, entry.name, reason)
+    if config(db)["alerts"]:
+        try:
+            from . import tgbot
+            from .models import PROTOCOL_LABELS
+
+            text = (f"🐢 Скорость: {route.name} · {PROTOCOL_LABELS.get(proto, proto)} · {entry.name}\n{reason}"
+                    + ("\n\n" + "\n".join("• " + h for h in hs[:5]) if hs else "")
+                    + "\n\nПодробно — вкладка «Скорость», раздел «Провалы».")
+            if tgbot.enabled():
+                tgbot.broadcast(text)
+        except Exception as e:
+            log.warning("speed alert not sent: %s", e)
 
 
 # --- the cycle --------------------------------------------------------------

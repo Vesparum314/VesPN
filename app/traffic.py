@@ -200,6 +200,14 @@ def collect_traffic(db: Session) -> dict:
     return {"members_ok": ok, "members_fail": fail, "at": datetime.now(timezone.utc)}
 
 
+def _traffic_for_day(db: Session, day: str) -> tuple[int, list[tuple[str, int]]]:
+    """(total, [(server, bytes)] busiest first) through the exits on one Moscow day."""
+    per: dict[str, int] = {}
+    for r in db.query(TrafficDay).filter_by(day=day).all():
+        per[r.node_name] = per.get(r.node_name, 0) + r.up + r.down
+    return sum(per.values()), sorted(per.items(), key=lambda x: -x[1])
+
+
 def device_stat(db: Session, device_id: int) -> TrafficStat | None:
     return db.get(TrafficStat, device_id)
 

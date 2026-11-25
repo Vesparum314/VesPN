@@ -1739,17 +1739,18 @@ def admin_speed(request: Request, days: int = 1, db: Session = Depends(get_db)):
 
 @app.post("/admin/speed/settings")
 def admin_speed_settings(
-    request: Request, enabled: str = Form(""), heavy_minutes: int = Form(60),
+    request: Request, enabled: str = Form(""), heavy_minutes: int = Form(60), alerts: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    """Switch the probes (= the test traffic through the fleet) on/off; heavy round period."""
+    """Switch the probes (= the test traffic through the fleet) on/off; heavy round period;
+    whether incidents also go to the Telegram bot."""
     if not _require_staff(request, db):
         return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
     from . import speed
 
     on = enabled == "1"
     was = speed.enabled(db)
-    speed.set_config(db, on, heavy_minutes)
+    speed.set_config(db, on, heavy_minutes, alerts=alerts == "1")
     if on and not was:
         flash(request, "Замеры включены. Служебная учётка заводится на выходах — первые результаты "
                        f"через {speed.CYCLE_SEC // 60}–{speed.CYCLE_SEC // 60 * 2} мин.", "success")

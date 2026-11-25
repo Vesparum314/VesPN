@@ -47,6 +47,7 @@
           {% for m in heavy_choices %}<option value="{{ m }}" {{ 'selected' if m == cfg.heavy_minutes }}>{% if m %}раз в {{ m // 60 }} ч{% else %}только при плохом коротком{% endif %}</option>{% endfor %}
         </select>
       </label>
+      <label class="status-form" title="тот же бот, что шлёт тревоги мониторинга"><input type="checkbox" name="alerts" value="1" style="width:auto"{% if cfg.alerts %} checked{% endif %}> сообщать о провалах в Telegram</label>
       {% if cfg.enabled %}
         <button class="btn btn-ghost" name="enabled" value="1">Сохранить</button>
         <button class="btn btn-danger" name="enabled" value="0" onclick="return confirm('Выключить замеры? Проверочный трафик прекратится, служебная учётка уйдёт с выходов. Собранные данные останутся.')">Выключить замеры</button>

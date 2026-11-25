@@ -199,34 +199,37 @@ def run_checks(db: Session) -> dict:
         # while the others keep the route alive.
         for r in routes:
             pool = r.pool
-            if not pool or not r.gates:
-                continue
+            if not pool or not r.gates or not r.enabled:
+                continue  # a route switched off on purpose is no alarm
             working = 0
             for gate in r.gates:
                 g = gate_g(gate)
                 view = _daemon_view(g, pool.name)
                 names = {m.public_host: m.name for m in pool.members}
                 exits = []
+                # TCP traffic ports of the pool: VLESS and/or NaiveProxy (443) — each
+                # checked; AWG-only pools: SSH (whether the host is up at all).
+                tports = ([("VLESS", pool.vless_port)] if "vless" in pool.protocols else []) + \
+                         ([("Naive", 443)] if "naive" in pool.protocols else [])
                 for m in pool.members:
+                    ports = tports or [("SSH", m.ssh_port or 22)]
                     if g is not None:
-                        # TCP traffic port of the pool: VLESS, else NaiveProxy (443), else
-                        # (AWG-only) SSH — whether the host is up at all.
-                        tport = (pool.vless_port if "vless" in pool.protocols
-                                 else 443 if "naive" in pool.protocols else (m.ssh_port or 22))
-                        vless_ok: bool | None = _probe_tcp(g, m.public_host, tport)
-                        awg = _probe_udp(g, m.public_host, pool.awg_port)
+                        tcp = {f"{lbl} :{port}": _probe_tcp(g, m.public_host, port) for lbl, port in ports}
+                        vless_ok: bool | None = all(tcp.values())
+                        awg = _probe_udp(g, m.public_host, pool.awg_port) if "awg" in pool.protocols else "NA"
                         client_state[m.id] = client_state.get(m.id, False) or bool(vless_ok)
                     else:
-                        vless_ok, awg = None, None
+                        tcp, vless_ok, awg = {}, None, None
                     exits.append({
-                        "name": m.name,
-                        "vless_port": tport if g is not None else pool.vless_port, "vless_ok": vless_ok,
+                        "name": m.name, "tcp": tcp,
+                        "vless_port": ports[0][1], "vless_ok": vless_ok,
                         "awg_port": pool.awg_port, "awg": awg,
                     })
                 active = [names.get(ip, ip) for ip in view.get("active", [])]
                 # (б): "down" = the gate can't reach the exit's traffic port right
                 # now (fresh probe), independent of the daemon's hysteretic list.
-                down = [e["name"] for e in exits if e["vless_ok"] is False]
+                down = [e["name"] + "".join(f" ({k} ✗)" for k, ok in e["tcp"].items() if not ok)
+                        for e in exits if e["vless_ok"] is False]
                 gate_up = (g is not None) and view.get("daemon") == "active"
                 if gate_up and view.get("active"):
                     working += 1
@@ -313,7 +316,9 @@ def summarize(snap: dict | None) -> str:
     (б) client path (gate→exits) and (а) management reachability (Hub→nodes)."""
     if not snap:
         return "Мониторинг ещё не запускался."
-    lines = [f"🩺 VesPN · {snap.get('at','?')} UTC"]
+    from .config import settings
+
+    lines = [f"🩺 {settings.brand_name} · {snap.get('at','?')} UTC"]
 
     # --- (б) client path: gate → exits ---
     lines.append("\n📡 Клиентский путь (гейт → выходы):")
