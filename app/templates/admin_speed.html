@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}Скорость — {{ brand }}{% endblock %}
+{% block content %}
+{% macro when(t) %}{% if t %}<span class="mono">{{ t.strftime('%d.%m %H:%M') }}</span>{% else %}—{% endif %}{% endmacro %}
+{% macro num(v, unit='', nd=1) %}{% if v is none %}<span class="muted">—</span>{% else %}{{ ('%.' ~ nd ~ 'f') | format(v) }}{{ unit }}{% endif %}{% endmacro %}
+{% macro sparkline(sp, cls='') %}<svg class="spark {{ cls }}" viewBox="0 0 {{ sp.w }} {{ sp.h }}" width="{{ sp.w }}" height="{{ sp.h }}" preserveAspectRatio="none" role="img" aria-label="график">
+  <line x1="0" y1="{{ sp.h - 1 }}" x2="{{ sp.w }}" y2="{{ sp.h - 1 }}" class="axis"/>
+  {% if sp.line %}<polyline points="{{ sp.line }}" class="ln"/>{% endif %}
+  {% for x in sp.fails %}<circle cx="{{ x }}" cy="{{ sp.h - 3 }}" r="2.2" class="fail"/>{% endfor %}
+</svg>{% endmacro %}
+<style>
+  .spark{display:block;max-width:100%;height:40px}
+  .spark .axis{stroke:var(--border);stroke-width:1}
+  .spark .ln{fill:none;stroke:var(--accent);stroke-width:1.6;vector-effect:non-scaling-stroke}
+  .spark.alt .ln{stroke:var(--warn)}
+  .spark .fail{fill:var(--bad)}
+  .spd-cfg{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .spd-cfg select{width:auto}
+  .kv{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:13px;color:var(--fg-soft)}
+  .kv b{color:var(--fg);font-weight:600}
+  .snap{white-space:pre-wrap;font-size:12px;max-height:420px;overflow:auto;background:var(--panel-2);padding:10px;border-radius:8px;margin:8px 0 0}
+  .hint-list{margin:6px 0 0 18px;padding:0}
+  .hint-list li{margin:2px 0}
+  td .stack small{color:var(--muted)}
+</style>
+
+<div class="head">
+  <div>
+    <h1>Скорость маршрутов</h1>
+    <div class="sub">Замеры через маршруты так, как ходит клиент: Хаб → гейт → выход → интернет, по каждому входу и протоколу (VLESS, NaiveProxy; AmneziaWG — только показатели серверов). Каждые {{ cycle_min }} мин. — короткий замер ({{ light_kb }} КБ) и показатели серверов; тяжёлый ({{ heavy_sec|int }} с загрузки после {{ heavy_ramp|int }} с разгона, не больше {{ heavy_mb }} МБ) — по расписанию и сразу, если короткий выглядит плохо. Провал — тяжёлый замер вдвое ниже обычного: в этот момент снимаются показатели и трассировка на гейте и выходах.</div>
+  </div>
+  <div class="row-actions">
+    <form method="get" action="/admin/speed" class="status-form">
+      <select name="days" onchange="this.form.submit()" aria-label="Период">{% for d in (1, 7, 30) %}<option value="{{ d }}" {{ 'selected' if d == days }}>за {{ d }} дн.</option>{% endfor %}</select>
+    </form>
+    {% if cfg.enabled %}<form method="post" action="/admin/speed/run"><button class="btn btn-primary"{% if running %} disabled title="замер уже идёт"{% endif %}>{{ 'Идёт замер…' if running else 'Замерить сейчас' }}</button></form>{% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Проверочный трафик</h2></div>
+  <div class="panel-b">
+    <form method="post" action="/admin/speed/settings" class="spd-cfg">
+      <span>Замеры {% if cfg.enabled %}<span class="badge b-ok b-dot">включены</span>{% else %}<span class="badge b-warn">выключены</span>{% endif %}</span>
+      <label class="status-form">Тяжёлый замер
+        <select name="heavy_minutes">
+          {% for m in heavy_choices %}<option value="{{ m }}" {{ 'selected' if m == cfg.heavy_minutes }}>{% if m %}раз в {{ m // 60 }} ч{% else %}только при плохом коротком{% endif %}</option>{% endfor %}
+        </select>
+      </label>
+      {% if cfg.enabled %}
+        <button class="btn btn-ghost" name="enabled" value="1">Сохранить</button>
+        <button class="btn btn-danger" name="enabled" value="0" onclick="return confirm('Выключить замеры? Проверочный трафик прекратится, служебная учётка уйдёт с выходов. Собранные данные останутся.')">Выключить замеры</button>
+      {% else %}
+        <button class="btn btn-primary" name="enabled" value="1">Включить замеры</button>
+      {% endif %}
+    </form>
+    <div class="kv" style="margin-top:10px">
+      <span>Проверочный трафик за сутки: <b>{{ '%.2f' | format(ov.spent_day / 1e9) }} ГБ</b></span>
+      <span>Хаб напрямую (контроль): <b>{% if ov.control_last %}{% if ov.control_last.ok %}{{ num(ov.control_last.mbps, ' Мбит/с') }}{% else %}ошибка{% endif %}{% else %}—{% endif %}</b>{% if ov.control_median %} <span class="muted">(обычно {{ num(ov.control_median, '') }})</span>{% endif %}</span>
+      {% if not ov.xray %}<span class="badge b-bad">на Хабе нет xray — VLESS не замеряется, пересоберите образ панели</span>{% endif %}
+      {% if ov.pending %}<span class="badge b-warn">служебная учётка заводится: {{ ov.pending | join(', ') }}</span>{% endif %}
+    </div>
+    <p class="hint">Тяжёлый замер — до {{ heavy_mb }} МБ на каждый вход и протокол, плюс по столько же на Хабе и каждом выходе напрямую. Раз в час на 8 сочетаний — около 5 ГБ в сутки в худшем случае, раз в 2 ч — вдвое меньше; короткие — около 0,6 ГБ. Выключение останавливает весь проверочный трафик сразу.</p>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Маршруты</h2></div>
+  <div class="panel-b">
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>Маршрут · вход</th><th>Сейчас</th><th>Тяжёлые, Мбит/с</th><th>Короткие</th></tr></thead>
+      <tbody>
+      {% for r in ov.rows %}
+        <tr>
+          <td data-label="Маршрут"><div class="stack"><b>{{ r.route.name }}</b><small>{{ protocol_labels.get(r.proto, r.proto) }} · {{ r.entry.name }} <span class="mono">{{ r.entry.public_host }}</span></small></div></td>
+          <td data-label="Сейчас"><div class="stack">
+            {% set h = r.last_heavy %}{% set l = r.last_light %}
+            {% if h %}{% if h.ok %}<b>{{ num(h.mbps, ' Мбит/с') }}</b>{% else %}<span class="badge b-bad" title="{{ h.error }}">ошибка</span>{% endif %}<small>тяжёлый {{ when(h.at) }}</small>{% endif %}
+            {% if l %}<small>{% if l.ok %}короткий: {{ l.ttfb_ms }} мс до первого байта{% else %}<span style="color:var(--bad)">короткий: {{ l.error }}</span>{% endif %}</small>{% endif %}
+            {% if not h and not l %}<span class="muted">замеров нет</span>{% endif %}
+          </div></td>
+          <td data-label="Тяжёлые">{{ sparkline(r.spark) }}<div class="kv"><span>медиана <b>{{ num(r.median, '') }}</b></span><span>мин <b>{{ num(r.min, '') }}</b></span><span>макс шкалы {{ '%.0f' | format(r.spark.top) }}</span></div></td>
+          <td data-label="Короткие">{{ sparkline(r.spark_ttfb, 'alt') }}<div class="kv"><span>успешных <b>{% if r.light_ok is none %}—{% else %}{{ r.light_ok }}%{% endif %}</b></span><span>до 1-го байта <b>{{ num(r.ttfb, ' мс', 0) }}</b></span></div></td>
+        </tr>
+      {% else %}
+        <tr><td class="full muted">Нет маршрутов с VLESS или NaiveProxy, которые сейчас обслуживают клиентов.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    <p class="hint">Красные точки на графиках — неудачные замеры. Короткий график — время до первого байта (выше — хуже).</p>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Провалы</h2></div>
+  <div class="panel-b">
+    {% for i in ov.incidents %}
+      <details style="margin-bottom:8px">
+        <summary>{{ when(i.at) }} — <b>{{ i.route.name if i.route else 'маршрут удалён' }}</b> · {{ protocol_labels.get(i.protocol, i.protocol) }} · {{ i.entry.name if i.entry else '—' }}: {{ i.reason }}</summary>
+        {% if i.hints %}<ul class="hint-list">{% for h in i.hints %}<li>{{ h }}</li>{% endfor %}</ul>{% else %}<p class="muted" style="margin:6px 0 0">Явной причины в показателях серверов нет — смотрите снимок.</p>{% endif %}
+        <pre class="snap mono">{{ i.snapshot }}</pre>
+      </details>
+    {% else %}
+      <span class="muted">За период провалов нет.</span>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-h"><h2>Серверы</h2></div>
+  <div class="panel-b">
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>Сервер</th><th>Сейчас</th><th>Steal, %</th><th>Входящий трафик, Мбит/с</th><th>Соединения</th></tr></thead>
+      <tbody>
+      {% for n in ov.nodes %}{% set v = n.last %}
+        <tr>
+          <td data-label="Сервер"><div class="stack"><b>{{ n.node.name }}</b><small>{{ 'гейт' if n.node.role == 'gate' else 'выход' }} · <span class="mono">{{ n.node.public_host }}</span></small></div></td>
+          <td data-label="Сейчас"><div class="stack">
+            {% if not v %}<span class="muted">нет данных</span>
+            {% elif not v.ok %}<span class="badge b-bad" title="{{ v.error }}">не снято</span><small>{{ when(v.at) }}</small>
+            {% else %}
+              <span>ЦП {{ num(v.cpu, '%', 0) }} · steal {{ num(v.steal, '%') }} · нагрузка {{ num(v.load1, '', 2) }}{% if v.ncpu %}/{{ v.ncpu }}{% endif %}</span>
+              <small>↓{{ num(v.rx_mbps, '') }} ↑{{ num(v.tx_mbps, '') }} Мбит/с{% if v.drops %} · отброшено {{ v.drops }}{% endif %}{% if v.errors %} · ошибок {{ v.errors }}{% endif %}{% if v.conntrack_pct is not none %} · conntrack {{ num(v.conntrack_pct, '%', 0) }}{% endif %}</small>
+              {% set ex = v.extra %}{% if ex.direct is defined %}<small>напрямую качает {{ ex.direct }} Мбит/с</small>{% endif %}
+              <small>{{ when(v.at) }}</small>
+            {% endif %}
+          </div></td>
+          <td data-label="Steal">{{ sparkline(n.spark_steal, 'alt') }}<div class="kv"><span>медиана <b>{{ num(n.steal_med, '') }}</b></span><span>макс <b>{{ num(n.steal_max, '') }}</b></span></div></td>
+          <td data-label="Трафик">{{ sparkline(n.spark_rx) }}</td>
+          <td data-label="Соединения">{% if v and v.ok %}{% set pe = v.peers %}<div class="stack">
+            {% for k, g in pe.items() %}<small>{% if k == 'cli' %}клиенты{% elif k == 'net' %}в интернет{% else %}{{ ov.names.get(k|int, '#' ~ k) }}{% endif %}: {{ g.n }} · RTT {{ num(g.rtt, ' мс', 0) }} · повторы {{ num(g.retr, '%') }}</small>{% endfor %}
+            {% if v.extra.tcp %}{% for k, ms in v.extra.tcp.items() %}<small>TCP → {{ ov.names.get(k|int, '#' ~ k) }}: {% if ms is none %}<span style="color:var(--bad)">не открывается</span>{% else %}{{ ms }} мс{% endif %}</small>{% endfor %}{% endif %}
+          </div>{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td class="full muted">Серверов в маршрутах нет.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    <p class="hint">Steal — доля процессорного времени, которую забирают соседи по физическому серверу у хостера: выше 10% — заметно, выше 30% — тормозит. «Повторы» — доля повторно отправленных TCP-сегментов у живых соединений: по клиентам — участок клиент → гейт, по соседнему серверу — канал между серверами, «в интернет» — канал выхода.</p>
+  </div>
+</div>
+{% endblock %}

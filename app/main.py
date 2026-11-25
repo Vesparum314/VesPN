@@ -278,6 +278,13 @@ def _startup() -> None:
     except Exception as e:  # never let the bot break panel startup
         log.warning("Telegram bot did not start: %s", e)
 
+    # Speed monitoring (app/speed.py): idle until switched on at «Скорость».
+    try:
+        from . import speed
+        speed.start()
+    except Exception as e:
+        log.warning("speed monitoring did not start: %s", e)
+
 
 @app.get("/healthz")
 def healthz() -> dict:
@@ -1620,6 +1627,61 @@ def admin_journal_run(request: Request, db: Session = Depends(get_db)):
     threading.Thread(target=tgbot._journal_cycle, name="journal-now", daemon=True).start()
     flash(request, "Замер запущен — обновите страницу через минуту", "success")
     return RedirectResponse("/admin/journal", status_code=HTTP_303_SEE_OTHER)
+
+
+# --- admin: speed monitoring (app/speed.py) ------------------------------
+@app.get("/admin/speed", response_class=HTMLResponse)
+def admin_speed(request: Request, days: int = 1, db: Session = Depends(get_db)):
+    user = _require_staff(request, db)
+    if not user:
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    from . import speed
+
+    days = days if days in (1, 7, 30) else 1
+    return render(request, "admin_speed.html", user=user, days=days, cfg=speed.config(db),
+                  ov=speed.overview(db, days), running=speed.running(),
+                  heavy_choices=speed.HEAVY_CHOICES, cycle_min=speed.CYCLE_SEC // 60,
+                  light_kb=speed.LIGHT_BYTES // 1024, heavy_mb=speed.HEAVY_CAP // 1_000_000,
+                  heavy_sec=speed.HEAVY_SEC, heavy_ramp=speed.HEAVY_RAMP, protocol_labels=PROTOCOL_LABELS)
+
+
+@app.post("/admin/speed/settings")
+def admin_speed_settings(
+    request: Request, enabled: str = Form(""), heavy_minutes: int = Form(60),
+    db: Session = Depends(get_db),
+):
+    """Switch the probes (= the test traffic through the fleet) on/off; heavy round period."""
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    from . import speed
+
+    on = enabled == "1"
+    was = speed.enabled(db)
+    speed.set_config(db, on, heavy_minutes)
+    if on and not was:
+        flash(request, "Замеры включены. Служебная учётка заводится на выходах — первые результаты "
+                       f"через {speed.CYCLE_SEC // 60}–{speed.CYCLE_SEC // 60 * 2} мин.", "success")
+    elif was and not on:
+        flash(request, "Замеры выключены: проверочного трафика больше нет, служебная учётка "
+                       "убирается с выходов. Собранные данные остаются.", "success")
+    else:
+        flash(request, "Настройки замеров сохранены", "success")
+    return RedirectResponse("/admin/speed", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/speed/run")
+def admin_speed_run(request: Request, db: Session = Depends(get_db)):
+    if not _require_staff(request, db):
+        return RedirectResponse("/", status_code=HTTP_303_SEE_OTHER)
+    from . import speed
+
+    if not speed.enabled(db):
+        flash(request, "Сначала включите замеры", "error")
+    elif speed.run_now():
+        flash(request, "Полный замер запущен (с тяжёлыми замерами) — обновите страницу через пару минут", "success")
+    else:
+        flash(request, "Замер уже идёт — обновите страницу чуть позже", "info")
+    return RedirectResponse("/admin/speed", status_code=HTTP_303_SEE_OTHER)
 
 
 # --- admin: DNS providers + route client address ------------------------

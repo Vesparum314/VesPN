@@ -129,6 +129,8 @@ def pool_users(db: Session, pool: ExitPool, exclude: set[int] | None = None) -> 
     """(login, password) of every NaiveProxy client that must exist on the pool."""
     from .pool import pool_proto_configs
 
+    from . import speed
+
     out = []
     for c in pool_proto_configs(db, pool, PROTO_NAIVE):
         if exclude and c.id in exclude:
@@ -136,6 +138,9 @@ def pool_users(db: Session, pool: ExitPool, exclude: set[int] | None = None) -> 
         pw = c.secret
         if c.identifier and pw:
             out.append((c.identifier, pw))
+    probe = speed.naive_probe_user(db, pool)  # the speed probes' service user, while they are on
+    if probe is not None:
+        out.append(probe)
     return out
 
 

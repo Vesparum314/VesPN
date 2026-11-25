@@ -16,6 +16,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -964,6 +965,108 @@ class GateSample(Base):
     clients: Mapped[int | None] = mapped_column(Integer, nullable=True)  # distinct client IPs right now
 
     node: Mapped["Node"] = relationship("Node")
+
+
+# --- speed monitoring (app/speed.py) -------------------------------------------
+PROBE_LIGHT = "light"      # a short download through the route: freezes, latency, gross drops
+PROBE_HEAVY = "heavy"      # a timed download through the route: the real throughput
+PROBE_CONTROL = "control"  # the same heavy download from the Hub directly (is the Hub itself slow?)
+
+
+class ProbeSample(Base):
+    """One speed probe. Light/heavy go through a route (route × protocol × entry point,
+    the way a client goes: Hub → gate → exit → internet); control goes from the Hub
+    straight out, to tell «the route is slow» from «the Hub's own link is slow»."""
+
+    __tablename__ = "probe_samples"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    route_id: Mapped[int | None] = mapped_column(
+        ForeignKey("routes.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    protocol: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    entry_id: Mapped[int | None] = mapped_column(
+        ForeignKey("nodes.id", ondelete="CASCADE"), nullable=True, index=True
+    )  # the gate (or, on a direct route, the server) the probe connected to
+    ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+    connect_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)  # tunnel up
+    ttfb_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)     # first byte of the file
+    mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error: Mapped[str] = mapped_column(String(255), default="", server_default="")
+
+
+class NodeSample(Base):
+    """A server's vitals every cycle — what explains a slow probe: CPU taken by the
+    hoster's other tenants (steal), load, link usage, interface drops/errors, the
+    connection table, and the quality of live TCP connections (`ss -ti`: RTT and
+    retransmissions — for clients and for each neighbouring server of the fleet).
+    `peers` (JSON): {"cli": {"n", "rtt", "retr"}, "<node id>": {...}};
+    `extra` (JSON): gate → {"tcp": {"<exit id>": connect ms | null}}, exit → {"direct": mbps}."""
+
+    __tablename__ = "node_samples"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    steal: Mapped[float | None] = mapped_column(Float, nullable=True)   # % of CPU time since the last sample
+    cpu: Mapped[float | None] = mapped_column(Float, nullable=True)     # % busy
+    load1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ncpu: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rx_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tx_mbps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    drops: Mapped[int | None] = mapped_column(Integer, nullable=True)   # rx+tx drops since the last sample
+    errors: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    conntrack_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    conns: Mapped[int | None] = mapped_column(Integer, nullable=True)  # established TCP
+    peers_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    extra_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")  # counters for the next delta
+    error: Mapped[str] = mapped_column(String(255), default="", server_default="")
+
+    @property
+    def peers(self) -> dict:
+        try:
+            return json.loads(self.peers_json or "{}")
+        except ValueError:
+            return {}
+
+    @property
+    def extra(self) -> dict:
+        try:
+            return json.loads(self.extra_json or "{}")
+        except ValueError:
+            return {}
+
+
+class ProbeIncident(Base):
+    """A slowdown caught by the probes, with what was captured on the servers at that
+    very moment (a later look would find the problem already gone)."""
+
+    __tablename__ = "probe_incidents"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    route_id: Mapped[int | None] = mapped_column(
+        ForeignKey("routes.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    protocol: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    entry_id: Mapped[int | None] = mapped_column(
+        ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True
+    )
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    hints_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    snapshot: Mapped[str] = mapped_column(Text, default="", server_default="")
+
+    route: Mapped["Route | None"] = relationship("Route")
+    entry: Mapped["Node | None"] = relationship("Node")
+
+    @property
+    def hints(self) -> list[str]:
+        try:
+            return json.loads(self.hints_json or "[]")
+        except ValueError:
+            return []
 
 
 class NodeStatusHistory(Base):

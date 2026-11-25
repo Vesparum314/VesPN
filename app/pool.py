@@ -324,7 +324,12 @@ def reconcile_exit(db: Session, pool: ExitPool, node: Node) -> dict:
                 with n.tunnel(node.xui_port) as lport:
                     xui = XUIClient(f"http://127.0.0.1:{lport}/{node.xui_path}", node.xui_token)
                     inbound = xui.find_vless_inbound()
-                    desired = pool_vless_configs(db, pool)
+                    desired = list(pool_vless_configs(db, pool))
+                    from . import speed  # the speed probes' service client, while they are on
+
+                    probe = speed.vless_probe_config(db, pool)
+                    if probe is not None:
+                        desired.append(probe)
                     desired_emails = {c.identifier for c in desired}
                     # Robust check: don't trust list_client_emails() for "present"
                     # (orphaned clients from an inbound recreate still appear there
@@ -749,6 +754,7 @@ def provision_gate_relay(db: Session, gate: Node) -> dict:
     with connect(gate) as g:
         provisioning.install_fleet_key(g, fleetkey.public_line(db))  # key-manage from here on
         info = relay.install(g, plan)
+        provisioning.ensure_mtr(g)  # for the speed monitor's path traces (optional)
     if not gate.key_installed:
         gate.key_installed = True
         db.commit()
