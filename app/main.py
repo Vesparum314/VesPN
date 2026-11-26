@@ -797,7 +797,8 @@ def admin_provision_node(request: Request, node_id: int, db: Session = Depends(g
                 info = pool_ops.provision_pool_exit(db, node)
                 rec = info.get("reconcile", {})
                 return (f"Развёрнут как клон пула: {', '.join(info['installed']) or '—'}; "
-                        f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
+                        f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}"
+                        + (f"; {info['relay']}" if info.get("relay") else ""))
             info = node_ops.provision_node(db, node)
             return (f"Развёрнута: 3x-ui (порт {info['xui_port']}) + "
                     f"AmneziaWG (UDP {info['awg_port']})")
@@ -822,7 +823,8 @@ def admin_converge_node(request: Request, node_id: int, db: Session = Depends(ge
             info = pool_ops.provision_pool_exit(db, node, only_missing=True)
             rec = info.get("reconcile", {})
             return (f"Приведён к пулу: {', '.join(info['installed']) or '—'}; "
-                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
+                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}"
+                    + (f"; {info['relay']}" if info.get("relay") else ""))
 
         if jobs.start_node_job(db, node, "provision", _do):
             flash(request, f"«{node.name}»: приведение к пулу запущено в фоне.", "success")
@@ -1561,7 +1563,8 @@ def admin_route_apply(request: Request, route_id: int, db: Session = Depends(get
             rec = info.get("reconcile", {})
             verb = "Приведён к маршруту" if deployed else "Развёрнут"
             return (f"{verb}: {', '.join(info['installed']) or '—'}; "
-                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}")
+                    f"синхронизация {'ok' if rec.get('ok') else rec.get('error', '—')}"
+                    + (f"; {info['relay']}" if info.get("relay") else ""))
 
         started, busy = [], []
         for n in pool.members:

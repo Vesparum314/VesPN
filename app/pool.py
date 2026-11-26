@@ -36,6 +36,7 @@ from .models import (
     PROTO_NAIVE,
     PROTO_VLESS,
     ROLE_EXIT,
+    SYNC_PENDING,
     SYNC_SYNCED,
     SYNC_UNREACHABLE,
     VLESS_XHTTP,
@@ -321,6 +322,8 @@ def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> 
     pool = db.get(ExitPool, node.pool_id)
     if pool is None:
         raise NodeOpError("пул не найден")
+    # Not yet in the gates' relay (see relay.ready_members) — refresh them once ready.
+    was_pending = node.sync_state == SYNC_PENDING
     protos = pool.protocols
     if not protos:
         raise NodeOpError(
@@ -410,7 +413,32 @@ def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> 
     db.commit()
 
     rec = reconcile_exit(db, pool, node)
-    return {"installed": installed, "reconcile": rec}
+    out = {"installed": installed, "reconcile": rec}
+    if was_pending and rec.get("ok"):
+        out["relay"] = refresh_pool_relays(db, pool)
+    return out
+
+
+def refresh_pool_relays(db: Session, pool: ExitPool) -> str:
+    """Re-push the relay to every gate in front of the pool (after one of its exits
+    became ready, so the gates start sending clients to it). Returns a short note
+    for the job message; a gate that fails is named, the others still get it."""
+    gates: dict[int, Node] = {}
+    for r in db.query(Route).filter(Route.pool_id == pool.id).all():
+        for g in r.gates:
+            gates.setdefault(g.id, g)
+    if not gates:
+        return ""
+    failed = []
+    for g in gates.values():
+        try:
+            provision_gate_relay(db, g)
+        except Exception as e:
+            log.warning("relay refresh on %s failed: %s", g.name, e)
+            failed.append(g.name)
+    ok = len(gates) - len(failed)
+    return f"релей обновлён на гейтах: {ok} из {len(gates)}" + (
+        f" (не удалось: {', '.join(failed)} — «Поднять релей»)" if failed else "")
 
 
 # --- reconcile ----------------------------------------------------------
