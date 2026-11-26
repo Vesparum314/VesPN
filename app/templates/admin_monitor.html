@@ -29,8 +29,8 @@
       {% for r in snap.routes %}
         <tr>
           <td data-label="Маршрут"><span class="cell-name">{{ r.route }}</span></td>
-          <td data-label="Гейт / демон">{{ r.gate }} {% if r.gate_up %}<span class="badge b-ok b-dot">демон ok</span>{% elif r.daemon %}<span class="badge b-bad b-dot">{{ r.daemon }}</span>{% else %}<span class="badge b-bad b-dot">недоступен</span>{% endif %}</td>
-          <td data-label="Активный">{% if r.active %}<span class="badge b-ok">{{ r.active|join(', ') }}</span>{% else %}<span class="badge b-bad">НЕТ</span>{% endif %}</td>
+          <td data-label="Гейт / демон">{{ r.gate }} {% if r.unknown %}<span class="badge b-warn b-dot" title="{{ r.unknown }}">не проверено</span>{% elif r.gate_up %}<span class="badge b-ok b-dot">демон ok</span>{% elif r.daemon %}<span class="badge b-bad b-dot">{{ r.daemon }}</span>{% else %}<span class="badge b-bad b-dot">недоступен</span>{% endif %}</td>
+          <td data-label="Активный">{% if r.unknown %}<span class="muted">{{ r.unknown }}</span>{% elif r.active %}<span class="badge b-ok">{{ r.active|join(', ') }}</span>{% else %}<span class="badge b-bad">НЕТ</span>{% endif %}</td>
           <td data-label="Выходы пула">
             {% for e in r.exits %}
               <div style="margin-bottom:4px">
