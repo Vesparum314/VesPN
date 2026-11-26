@@ -282,6 +282,29 @@ def _config_name(cfg: IssuedConfig) -> str:
 
 
 # --- provisioning a pool exit (clone) -----------------------------------
+def awg_identity_differs(n, pool: ExitPool) -> str:
+    """'' when the AmneziaWG server on the node already runs the pool's identity
+    (keys, PSK, port, subnet, obfuscation params); otherwise what differs. A server
+    moved in from another pool keeps that pool's AWG until it is replaced — its
+    clients' configs would not match this pool's."""
+    try:
+        srv = AWGManager(n).read_server()
+    except Exception as e:
+        return f"конфиг не прочитан ({str(e)[:80] or type(e).__name__})"
+    diff = []
+    if srv.server_pubkey != pool.awg_public or srv.psk != (pool.awg_psk or ""):
+        diff.append("ключи")
+    if srv.listen_port != pool.awg_port:
+        diff.append("порт")
+    if srv.subnet_prefix != pool.awg_subnet:
+        diff.append("подсеть")
+    want = {k: str(v) for k, v in (pool.awg_params or {}).items() if str(v)}
+    have = {k: str(v) for k, v in srv.params.items() if str(v)}
+    if want != have:
+        diff.append("параметры обфускации")
+    return ", ".join(diff)
+
+
 def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> dict:
     """Stand a node up as a CLONE in its pool: install what the pool's routes need
     — 3x-ui + the VLESS inbound (pool transport/masquerade), the AmneziaWG server,
@@ -290,8 +313,9 @@ def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> 
 
     `only_missing` («Привести к пулу») is the safe mode for a server that already
     serves clients: install only protocols that aren't there yet (3x-ui is not
-    reinstalled, the AWG container is not recreated), refresh NaiveProxy users and
-    certificates, ensure the VLESS inbound matches the pool, then reconcile."""
+    reinstalled), refresh NaiveProxy users and certificates, ensure the VLESS inbound
+    and the AmneziaWG server match the pool (a server moved in from another pool
+    still runs that pool's identity — it is replaced), then reconcile."""
     if node.pool_id is None:
         raise NodeOpError("нода не привязана к пулу")
     pool = db.get(ExitPool, node.pool_id)
@@ -348,7 +372,10 @@ def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> 
             )
             provisioning.harden_subscription(n)  # no public :2096 sub server
             installed.append(f"VLESS {pool.vless_transport.upper()} :{pool.vless_port}")
+        awg_differs = ""
         if PROTO_AWG in protos and only_missing and settings.awg_container in running:
+            awg_differs = awg_identity_differs(n, pool)
+        if PROTO_AWG in protos and only_missing and settings.awg_container in running and not awg_differs:
             installed.append("AmneziaWG (уже стоит)")
         elif PROTO_AWG in protos:
             provisioning.install_amneziawg(
@@ -356,7 +383,8 @@ def provision_pool_exit(db: Session, node: Node, only_missing: bool = False) -> 
                 priv=pool.awg_private, pub=pool.awg_public, psk=pool.awg_psk,
                 params=pool.awg_params, subnet_prefix=pool.awg_subnet,
             )
-            installed.append(f"AmneziaWG {pool.awg_version} UDP :{pool.awg_port}")
+            installed.append(f"AmneziaWG {pool.awg_version} UDP :{pool.awg_port}"
+                             + (f" (переустановлен — не совпадали: {awg_differs})" if awg_differs else ""))
         if PROTO_NAIVE in protos:
             if only_missing and naive.CONTAINER in running:
                 naive.sync(n, db, pool)

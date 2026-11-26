@@ -10,7 +10,9 @@
 Client connectivity goes client → gate → exit, so (а) is for ops only and never
 reflects what clients experience. Results are a JSON snapshot in
 Setting('monitor_state'); the admin page and the Telegram bot both render it.
-`problems` holds only client-impacting, alert-worthy issues.
+`problems` holds only client-impacting, alert-worthy issues. A gate whose relay
+state couldn't be READ (a timeout on the gate, not a failure) is shown as unknown
+(❔) and never raises «daemon down» / «route down» on its own.
 
 Checks run hourly (bot scheduler), on demand (page button / Telegram /check).
 """
@@ -95,18 +97,34 @@ def _daemon_view(g, pool_name: str | None = None) -> dict:
     view: dict = {"daemon": None, "active": [], "healthy": [], "flaps_1h": None}
     if g is None:
         return view
+    # The service state first: a slow journal must never read as «daemon down».
     try:
+        _rc, st, _ = g.run("systemctl is-active vespn-relay 2>&1", timeout=15)
+        view["daemon"] = (st or "").strip()
+    except Exception as e:
+        view["unknown"] = f"состояние релея не прочитано: {_why(e)}"
+        return view
+    if view["daemon"] != "active":
+        return view
+    try:
+        # Only the tail of the unit's log since boot: journalctl walks it from the
+        # end, so a big journal (or a cold disk cache) doesn't matter. The daemon
+        # logs its pools on start and on every change, so the last line is current.
         _rc, act, _ = g.run(
-            "journalctl -u vespn-relay --no-pager 2>/dev/null | grep active= | tail -300", timeout=15
+            "journalctl -u vespn-relay -b -n 2000 --no-pager 2>/dev/null | grep active= | tail -300",
+            timeout=30,
         )
         mine = [l for l in (act or "").splitlines() if _for_pool(l, pool_name)]
         m = _ACTIVE_RE.search(mine[-1]) if mine else None
         if m:
             view["active"] = _ips(m.group(1))
             view["healthy"] = _ips(m.group(2))
+        else:
+            view["unknown"] = "в журнале релея нет записи о выходах"
+            return view
         _rc, flaps, _ = g.run(
             "journalctl -u vespn-relay --no-pager --since '-1 hour' 2>/dev/null | grep active=",
-            timeout=15,
+            timeout=30,
         )
         # The v2 daemon re-logs EVERY pool on any change, so count only the lines
         # where this pool's active member actually changed.
@@ -120,11 +138,18 @@ def _daemon_view(g, pool_name: str | None = None) -> dict:
                 changes += 1
             prev = cur
         view["flaps_1h"] = changes
-        _rc, st, _ = g.run("systemctl is-active vespn-relay 2>&1", timeout=10)
-        view["daemon"] = (st or "").strip()
     except Exception as e:
-        view["error"] = str(e)[:100]
+        view["unknown"] = f"журнал релея не прочитан: {_why(e)}"
     return view
+
+
+def _why(e: Exception) -> str:
+    """A readable reason for a failed check (a timeout has an empty message)."""
+    import socket
+
+    if isinstance(e, (TimeoutError, socket.timeout)) or "timed out" in str(e).lower():
+        return "таймаут"
+    return (str(e) or type(e).__name__)[:100]
 
 
 def run_checks(db: Session) -> dict:
@@ -201,7 +226,7 @@ def run_checks(db: Session) -> dict:
             pool = r.pool
             if not pool or not r.gates or not r.enabled:
                 continue  # a route switched off on purpose is no alarm
-            working = 0
+            working = unknown = 0
             for gate in r.gates:
                 g = gate_g(gate)
                 view = _daemon_view(g, pool.name)
@@ -233,18 +258,22 @@ def run_checks(db: Session) -> dict:
                 gate_up = (g is not None) and view.get("daemon") == "active"
                 if gate_up and view.get("active"):
                     working += 1
+                elif g is not None and view.get("unknown"):
+                    unknown += 1
                 snap["routes"].append({
                     "route": r.name, "gate": gate.name,
                     "gate_up": gate_up, "daemon": view.get("daemon"),
                     "active": active,
                     "healthy": [names.get(ip, ip) for ip in view.get("healthy", [])],
                     "down": down, "exits": exits,
-                    "flaps_1h": view.get("flaps_1h"), "error": view.get("error"),
+                    "flaps_1h": view.get("flaps_1h"), "unknown": view.get("unknown"),
                 })
                 # alert-worthy (client-impacting) only:
                 where = f"маршрут «{r.name}», гейт {gate.name}"
                 if g is None:
                     snap["problems"].append(f"{where}: гейт недоступен с Hub")
+                elif view.get("unknown"):
+                    pass  # not read this time — shown as ❔, no alert on a slow check
                 elif view.get("daemon") != "active":
                     snap["problems"].append(f"{where}: релей-демон не работает ({view.get('daemon')})")
                 elif not view.get("active"):
@@ -253,7 +282,7 @@ def run_checks(db: Session) -> dict:
                     snap["problems"].append(
                         f"{where}: флаппинг выхода ({view['flaps_1h']} переключений/час)"
                     )
-            if working == 0:
+            if working == 0 and unknown == 0:
                 snap["problems"].append(f"маршрут «{r.name}»: НИ ОДНОГО рабочего гейта — маршрут лежит")
 
     _record_transitions(db, mgmt_state, HIST_MGMT)
@@ -325,8 +354,11 @@ def summarize(snap: dict | None) -> str:
     routes = snap.get("routes", [])
     if routes:
         for r in routes:
-            mark = "✅" if (r.get("gate_up") and r.get("active")) else "⛔"
+            mark = "✅" if (r.get("gate_up") and r.get("active")) else ("❔" if r.get("unknown") else "⛔")
             act = ", ".join(r.get("active") or []) or "—"
+            if r.get("unknown"):
+                lines.append(f"{mark} {r['route']} · {r.get('gate', '?')}: {r['unknown']}")
+                continue
             flaps = r.get("flaps_1h")
             extra = f" · флаппинг {flaps}/ч" if (flaps or 0) >= FLAP_ALERT else ""
             down = r.get("down") or []
