@@ -165,13 +165,14 @@ def run_checks(db: Session) -> dict:
         p = pools.get(node.pool_id)
         return p.name if p else None
 
-    # Which gate fronts a given pooled exit — the first gate of its route's gate
-    # pool (the one management goes through first).
-    gate_for_exit: dict[int, Node] = {}
+    # The gates in front of a pooled exit, in the order management tries them (the
+    # panel falls back to the next gate when one can't reach the exit).
+    gates_for_exit: dict[int, list[Node]] = {}
     for r in routes:
-        if r.primary_gate and r.pool:
+        if r.pool:
             for m in r.pool.members:
-                gate_for_exit.setdefault(m.id, r.primary_gate)
+                lst = gates_for_exit.setdefault(m.id, [])
+                lst.extend(g for g in r.gates if g not in lst)
 
     mgmt_state: dict[int, bool] = {}    # node_id -> Hub→node management reachable
     client_state: dict[int, bool] = {}  # exit node_id -> gate→exit (VLESS) reachable
@@ -197,8 +198,8 @@ def run_checks(db: Session) -> dict:
                     "mgmt_ok": g_ok, "via": "Хаб→гейт напрямую",
                 })
             else:
-                gate = gate_for_exit.get(n.id)
-                if gate is None:
+                gates = gates_for_exit.get(n.id) or []
+                if not gates:
                     snap["nodes"].append({
                         "name": n.name, "role": "exit",
                         "pool": _pool_name(n), "sync": n.sync_state,
@@ -209,13 +210,19 @@ def run_checks(db: Session) -> dict:
                             f"выход «{n.name}»: нет гейта — управление невозможно (только через гейт)"
                         )
                 else:
-                    g = gate_g(gate)
-                    mgmt = bool((g is not None) and _probe_tcp(g, n.ssh_host, n.ssh_port or 22))
+                    gate, mgmt = gates[0], False
+                    for cand in gates:
+                        g = gate_g(cand)
+                        if g is not None and _probe_tcp(g, n.ssh_host, n.ssh_port or 22):
+                            gate, mgmt = cand, True
+                            break
                     mgmt_state[n.id] = mgmt
+                    via = f"через {gate.name}" if mgmt or len(gates) == 1 else \
+                        f"ни через один гейт ({', '.join(x.name for x in gates)})"
                     snap["nodes"].append({
                         "name": n.name, "role": "exit",
                         "pool": _pool_name(n), "sync": n.sync_state,
-                        "gate": gate.name, "mgmt_ok": mgmt, "via": f"через {gate.name}",
+                        "gate": gate.name, "mgmt_ok": mgmt, "via": via,
                     })
 
         # --- view (б): client path (gate → pool exits on traffic ports) ----

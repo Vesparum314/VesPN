@@ -88,6 +88,20 @@ def route_services(route) -> list[Service]:
     return out
 
 
+def ready_members(pool) -> list:
+    """The pool's exits the gates may send clients to. One still «ожидает
+    синхронизации» — new, or moved in from another pool and not yet provisioned (it
+    may still run the old pool's keys and has no client accounts) — is left out
+    until its provisioning succeeds; its open port alone would make the daemon
+    pick it. If no exit is ready yet (a fresh pool), all are used: nothing works
+    yet that could be protected."""
+    from .models import SYNC_PENDING
+
+    members = list(pool.members)
+    ready = [m for m in members if m.sync_state != SYNC_PENDING]
+    return ready or members
+
+
 def build_plan(routes) -> dict:
     """Turn the routes of a gate pool into the daemon's config, or raise
     RelayConflict naming the routes that clash and what to change."""
@@ -102,7 +116,7 @@ def build_plan(routes) -> dict:
         services.extend(svc)
         key = str(r.pool.id)
         if key not in groups:
-            members = sorted(r.pool.members, key=lambda m: (m.priority, m.id))
+            members = sorted(ready_members(r.pool), key=lambda m: (m.priority, m.id))
             groups[key] = {
                 "name": r.pool.name,
                 "exits": [m.public_host for m in members],
